@@ -20,7 +20,7 @@ there is no other way to reach the hooks.
   deterministic (no sleeps, no polling).
 - `GE_GC_QUIET_MS=0 GE_GC_GRACE_MS=0`: a ref commit's `gc_mark` is due
   immediately and every live pack is a candidate at once.
-- `GE_RATE_PUSHES_PER_MIN=0`: only needed by the 100-pack param-guard case.
+- `GE_RATE_PUSHES_PER_MIN=0`: only needed by test_f's ~100-push run.
 
 ## Run
 
@@ -33,12 +33,14 @@ alarm-driven sweep lands inside the deadline) and:
     GE_HOOKS_OFF=1 GE_URL=... tests/harness/run.sh   # runs only test_hooks_off.py
 
 `run.sh` exports `GE_SERVER_LOG` (default `/tmp/ge-dev.log`) pointing at the
-server's log. `test_f_a6_guard_rejects_101_param_clone` polls it — only text
-written after the test starts, for up to 10 s since wrangler flushes
-asynchronously — to confirm the failing clone was rejected by the A6
-bound-param guard (`sql: N bound params > 100 (A6)`; the message is
-`Error::Internal`, sanitized to "internal error" on the wire, so the literal
-string exists only in the log). The test fails if the file is missing.
+server's log — handy for debugging; no test reads it.
+`test_f_clone_over_101_live_packs` (G2) pushes a repo past 100 live packs —
+three of them holding identical objects. Every commit is pinned to a fixed
+timestamp so the sha ordering the dedup scan walks is deterministic, and the
+test asserts locally that a sha's 3-row duplicate run straddles the 5,000-row
+page before cloning. It then asserts a plain clone succeeds, `git fsck
+--strict` is clean, and the emitted pack's object count equals the unique-sha
+count. Before G2 that clone hit the A6 bound-param guard and 500'd.
 
 ## Hooks (all write-token gated)
 

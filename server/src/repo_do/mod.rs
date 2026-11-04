@@ -2317,27 +2317,29 @@ impl RepoDo {
         }
         let mut set = generate::SendSet::default();
         let mut by_pack: HashMap<String, usize> = HashMap::new();
-        let mut args: Vec<V> = Vec::with_capacity(live.len() + 1);
-        let marks = live.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // two parameters at any pack count (A6); one global sha cursor keeps
+        // cross-pack and cross-page dedup; chunking is rejected because each
+        // chunk would run its own cursor. The unary + keeps SQLite off the
+        // objects_pack index, so it walks the PK from sha > ?2 in order with
+        // no temp sort — without it every page re-scans every live row
+        // (quadratic).
+        let pack_ids = serde_json::to_string(&live.iter().map(|p| p.id.as_str()).collect::<Vec<_>>())
+            .map_err(|e| Error::Internal(e.to_string()))?;
         for p in &live {
             let count = u32::try_from(p.count).map_err(|_| Error::Internal("count".into()))?;
             let bytes = u64::try_from(p.bytes).map_err(|_| Error::Internal("bytes".into()))?;
             let bits = usize::try_from(count).map_err(|_| Error::Internal("count".into()))?.div_ceil(8);
             by_pack.insert(p.id.clone(), set.packs.len());
-            args.push(V::from(p.id.as_str()));
             set.packs.push(generate::PackSlice { pack: PackId(p.id.clone()), count, bytes, bitmap: vec![0; bits] });
         }
         let mut last = String::new();
         loop {
-            let mut page = args.clone();
-            page.push(V::from(last.as_str()));
             let rows = self
                 .q(
-                    &format!(
-                        "SELECT sha, pack_id, idx FROM objects \
-                         WHERE pack_id IN ({marks}) AND sha > ? ORDER BY sha LIMIT 5000"
-                    ),
-                    page,
+                    "SELECT sha, pack_id, idx FROM objects \
+                     WHERE +pack_id IN (SELECT value FROM json_each(?1)) AND sha > ?2 \
+                     ORDER BY sha LIMIT 5000",
+                    vec![V::from(pack_ids.as_str()), V::from(last.as_str())],
                 )?
                 .to_array::<DedupRow>()?;
             let n = rows.len();
