@@ -6,6 +6,7 @@ credential rides an Authorization header instead; git(1) gets the URL verbatim.
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -103,6 +104,16 @@ def knob(repo, name, value):
     return admin(repo, "POST", "knob", {"name": name, "value": value})
 
 
+def meta(repo, key, value):
+    """Set one meta row directly; value=None deletes it (legacy-state jig)."""
+    return admin(repo, "POST", "meta", {"key": key, "value": value})
+
+
+def enqueue(repo, kind, payload="{}"):
+    """Queue a job row the way repair resurrection does (dedups vs queued)."""
+    return admin(repo, "POST", "enqueue", {"kind": kind, "payload": payload})
+
+
 def state(repo):
     """The public /_state probe — (status, dict|None)."""
     st, data = http("GET", "/%s/_state" % repo)
@@ -140,8 +151,17 @@ def pack_file(repo):
     """Bytes of a pack holding HEAD's closure (pack-objects --stdout, REF
     deltas like the conformance import) — the _admin/import stage payload."""
     listing = git("-C", repo.dir, "rev-list", "--objects", "HEAD").stdout
+    return pack_objects(repo.dir, listing)
+
+
+def pack_objects(repo_dir, listing):
+    """pack-objects --stdout over an explicit object list — exactly the listed
+    objects, no closure. `listing` is either the raw stdin text or a list of
+    lines ("<sha>[ <name>]" — the same shape rev-list --objects emits)."""
+    if not isinstance(listing, str):
+        listing = "\n".join(listing) + "\n"
     p = subprocess.run(
-        ["git", "-C", repo.dir, "pack-objects", "--stdout"],
+        ["git", "-C", repo_dir, "pack-objects", "--stdout"],
         input=listing.encode(),
         capture_output=True,
         env=_GIT_ENV,
@@ -149,6 +169,32 @@ def pack_file(repo):
     if p.returncode != 0:
         raise AssertionError("pack-objects -> %d: %s" % (p.returncode, redact(p.stderr.decode("utf-8", "replace"))))
     return p.stdout
+
+
+# --- raw smart-HTTP receive-pack (C2's minimal/empty-pack pushes) ---
+
+
+def pkt_line(payload):
+    """One pkt-line: 4-hex length prefix (itself counted) + payload bytes."""
+    return b"%04x" % (len(payload) + 4) + payload
+
+
+def empty_pack():
+    """A legal 0-object pack: PACKv2 header + sha1 trailer — a ref-only push."""
+    head = b"PACK" + (2).to_bytes(4, "big") + (0).to_bytes(4, "big")
+    return head + hashlib.sha1(head).digest()
+
+
+def receive_pack(repo, commands, pack, caps=("report-status",)):
+    """Raw POST /<o>/<r>/git-receive-pack — pkt-line commands + flush + pack
+    bytes. commands = [(old_hex, new_hex, refname)]; -> (status, body)."""
+    out = []
+    for i, (old, new, name) in enumerate(commands):
+        line = ("%s %s %s" % (old, new, name)).encode()
+        if i == 0:
+            line += b"\0" + " ".join(caps).encode()
+        out.append(pkt_line(line))
+    return http("POST", "/%s/git-receive-pack" % repo, raw=b"".join(out) + b"0000" + pack)
 
 
 # --- git over subprocess: a real client over real smart-HTTP ---

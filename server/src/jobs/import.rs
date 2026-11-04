@@ -113,6 +113,15 @@ struct Cursor {
     st: Option<WriterCkpt>,
     // 2.5 sweep
     check_after: String,
+    /// gc_epoch pinned when the check phase started (C1): commit_slice and
+    /// commit_meta compare it to the live epoch — a GC sweep between check and
+    /// commit means the connectivity verdicts are stale and the check re-runs
+    check_epoch: Option<i64>,
+    /// set when a commit guard sent the job back through check after a sweep:
+    /// inside such a re-check a still-missing link was swept, not merely
+    /// pending inside another open push — reject with the reason instead of
+    /// retrying (C1); a first-run missing link keeps the old retry behaviour
+    recheck: bool,
     // resolve queue position: entries at or below it are done (objects row),
     // parked (c.parked), or non-durable (requeue set rebuilt per slice) —
     // the scan is monotonic and never re-walks them
@@ -134,6 +143,8 @@ impl Default for Cursor {
             upload: String::new(),
             st: None,
             check_after: String::new(),
+            check_epoch: None,
+            recheck: false,
             scan_after: -1,
             tail: 0,
         }
@@ -153,6 +164,25 @@ fn continue_(c: &Cursor) -> Result<SliceOutcome, Error> {
     Ok(SliceOutcome::Continue {
         cursor: serde_json::to_string(c).map_err(|e| Error::Internal(e.to_string()))?,
     })
+}
+
+/// C1: send the job back through the connectivity check — the live gc_epoch
+/// moved since the check pinned its own, so its link verdicts are stale. The
+/// re-run re-pins the epoch and rejects a still-missing link outright.
+fn reset_to_check(c: &mut Cursor) {
+    c.phase = "check".into();
+    c.check_after.clear();
+    c.check_epoch = None;
+    c.recheck = true;
+}
+
+/// True for a legacy (pre-check_epoch) cursor caught mid-check: it carries
+/// check_after pages but pins no epoch, so the pages it already walked were
+/// verified under an unknown older epoch — pinning the live epoch now would
+/// let a sweep between those pages and the upgrade go unnoticed (C1). The
+/// check restarts from the front instead.
+fn check_needs_restart(check_epoch: Option<i64>, check_after: &str) -> bool {
+    check_epoch.is_none() && !check_after.is_empty()
 }
 
 pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<SliceOutcome, Error> {
@@ -206,7 +236,7 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         // server-side, or lost with the isolate. Retrying the same slice fails
         // forever: either commit the durable object complete() already landed,
         // or wipe the output state and rebuild it on a fresh upload.
-        Err(e) if dead_upload(&e) => recover_dead_upload(d, &sql, &p, &mut c, budget).await,
+        Err(e) if dead_upload(&e) => recover_dead_upload(d, job, &sql, &p, &mut c, budget).await,
         out => out,
     }
 }
@@ -216,7 +246,11 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
 /// Deterministic fetch-side failure — close the push so status surfaces the
 /// reason and Done retires the job. Retrying a 404 or a scope miss forever
 /// would just burn attempts.
-async fn reject_push(sql: &SqlStorage, push: &str, why: &str) -> Result<SliceOutcome, Error> {
+async fn reject_push(sql: &SqlStorage, job: &Job, push: &str, why: &str) -> Result<SliceOutcome, Error> {
+    // CAS before write: a stale slice must not land the rejection (A19)
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
     worker::console_log!("import {push} rejected: {why}");
     exec(
         sql,
@@ -257,22 +291,26 @@ async fn fetch_slice(
         .ok_or_else(|| Error::Internal("fetch phase without url".into()))?;
     let adv = match remote::ls_refs(url).await {
         Ok(a) => a,
-        Err(e) if deterministic(&e) => return reject_push(sql, &p.push, &e.message()).await,
+        Err(e) if deterministic(&e) => return reject_push(sql, job, &p.push, &e.message()).await,
         Err(e) => return Err(e),
     };
     if adv.refs.is_empty() {
-        return reject_push(sql, &p.push, "remote advertises no refs").await;
+        return reject_push(sql, job, &p.push, "remote advertises no refs").await;
+    }
+    // CAS before write: a stale slice must not pin the repo format (A19)
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
     }
     // pin the repo to the remote's format before anything lands — a conflict
     // means the repo was already written under the other algorithm
     if let Err(e) = d.pin_obj_format(adv.format) {
-        return reject_push(sql, &p.push, &e.message()).await;
+        return reject_push(sql, job, &p.push, &e.message()).await;
     }
     let zero = ObjectId::null(adv.format).to_string();
     // every advertised ref becomes a command row — cap so a hostile or spammed
     // remote can't write an unbounded command list into the job payload
     if adv.refs.len() > 100_000 {
-        return reject_push(sql, &p.push, &format!("remote advertises {} refs (cap 100k)", adv.refs.len())).await;
+        return reject_push(sql, job, &p.push, &format!("remote advertises {} refs (cap 100k)", adv.refs.len())).await;
     }
     // same gate import_start applies to client commands — the token scope a
     // url import runs under covers every derived ref or the import refuses
@@ -289,7 +327,7 @@ async fn fetch_slice(
     let mut wants: Vec<ObjectId> = Vec::with_capacity(adv.refs.len());
     for r in &adv.refs {
         if !scope_allows(scope.as_deref(), &r.name) {
-            return reject_push(sql, &p.push, &format!("ref {} outside token scope", r.name)).await;
+            return reject_push(sql, job, &p.push, &format!("ref {} outside token scope", r.name)).await;
         }
         commands.push(serde_json::json!({
             "old": zero,
@@ -303,7 +341,7 @@ async fn fetch_slice(
     }
     let mut resp = match remote::fetch_open(url, &wants, adv.format).await {
         Ok(r) => r,
-        Err(e) if deterministic(&e) => return reject_push(sql, &p.push, &e.message()).await,
+        Err(e) if deterministic(&e) => return reject_push(sql, job, &p.push, &e.message()).await,
         Err(e) => return Err(e),
     };
     let mut stream = resp.stream().map_err(Error::from)?;
@@ -371,13 +409,13 @@ async fn fetch_slice(
     }
     if let Some(e) = fatal {
         out.abort().await;
-        return if deterministic(&e) { reject_push(sql, &p.push, &e.message()).await } else { Err(e) };
+        return if deterministic(&e) { reject_push(sql, job, &p.push, &e.message()).await } else { Err(e) };
     }
     let ok = hold.len() == ds
         && matches!(h.try_finalize(), Ok(id) if id.as_bytes() == hold.as_slice());
     if !ok {
         out.abort().await;
-        return reject_push(sql, &p.push, "remote pack trailer mismatch").await;
+        return reject_push(sql, job, &p.push, "remote pack trailer mismatch").await;
     }
     out.finish(&mut budget.req).await?;
     // verified pack staged — rewrite the payload into the staged shape so the
@@ -390,6 +428,10 @@ async fn fetch_slice(
         "head": adv.head,
         "format": if adv.format == gix_hash::Kind::Sha256 { "sha256" } else { "sha1" },
     });
+    // CAS before write: a stale slice must not rewrite the payload (A19)
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
     exec(
         sql,
         "UPDATE jobs SET payload=? WHERE id=?",
@@ -411,6 +453,7 @@ fn dead_upload(e: &Error) -> bool {
 /// already-durable object or wipe the output tables and reslice the rebuild.
 async fn recover_dead_upload(
     d: &RepoDo,
+    job: &Job,
     sql: &SqlStorage,
     p: &Payload,
     c: &mut Cursor,
@@ -426,10 +469,14 @@ async fn recover_dead_upload(
         if let Some(h) = bucket.inner.head(&key).await? {
             worker::console_log!("import {} output already landed; committing", p.push);
             let meta = meta_from_tables(sql, &p.push, &pack, h.size())?;
-            return commit_meta(d, sql, p, &bucket, meta).await;
+            return commit_meta(d, job, sql, p, c, &bucket, meta).await;
         }
     }
     worker::console_log!("import {} output upload dead — wiping output state, rebuild follows", p.push);
+    // CAS before write: a stale slice must not wipe the output state (A19)
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
     wipe_output(sql, &p.push, &pack, c)?;
     continue_(c)
 }
@@ -446,6 +493,8 @@ fn wipe_output(sql: &SqlStorage, push: &str, pack: &PackId, c: &mut Cursor) -> R
     c.tail = 0;
     c.scan_after = -1;
     c.check_after.clear(); // a mid-check wipe must re-verify the whole link set
+    c.check_epoch = None; // the next check run pins a fresh epoch
+    c.recheck = false;
     c.phase = "resolve".into();
     Ok(())
 }
@@ -645,14 +694,16 @@ async fn toc_slice(
             e.decompressed_size,
         ));
         idx += 1;
+        // CAS heartbeat after the entry's fills and before the batch lands — a
+        // stale slice must not write TOC rows under a dead lease (A19)
+        if !super::heartbeat(sql, job)? {
+            return Err(super::stale_lease());
+        }
         if rows.len() >= TOC_FANOUT {
             // rows[0].idx == next_idx: rows buffer contiguous entries in order
             toc_insert(sql, &p.push, c.next_idx, &rows)?;
             c.next_idx = idx;
             rows.clear();
-        }
-        if !super::heartbeat(sql, job)? {
-            return Err(super::stale_lease());
         }
     }
     if !rows.is_empty() {
@@ -723,8 +774,8 @@ struct Drain<'a> {
 /// bytes not yet durable are the live writer's <PART tail, which `finish` uploads.
 #[allow(clippy::too_many_arguments)]
 async fn resume_drain<'a>(
-    d: &RepoDo,
-    job: &Job,
+    d: &'a RepoDo,
+    job: &'a Job,
     sql: &'a SqlStorage,
     p: &'a Payload,
     c: &mut Cursor,
@@ -739,6 +790,10 @@ async fn resume_drain<'a>(
     if !c.upload.is_empty() && c.st.is_none() {
         if let Ok(mpu) = bucket.inner.resume_multipart_upload(&key, &c.upload) {
             let _ = mpu.abort().await;
+        }
+        // CAS before write: a stale slice must not wipe the output rows (A19)
+        if !super::heartbeat(sql, job)? {
+            return Err(super::stale_lease());
         }
         for t in ["import_parts", "import_open", "import_tail"] {
             exec(sql, &format!("DELETE FROM {t} WHERE push_id=?"), vec![V::from(p.push.as_str())])?;
@@ -766,6 +821,13 @@ async fn resume_drain<'a>(
         let etags: Vec<String> = part_etags(sql, &p.push)?.into_iter().take(live_parts).collect();
         PackWriter::resume(&bucket, &key, &c.upload, &etags, st, &mut budget.req).await?
     };
+    crate::testhooks::failpoint_async(d, "import.drain.after_create").await?;
+    // CAS before write: the create/resume awaits are behind us — the tail and
+    // object-row deletes, the shadow-row re-seals and every later write of
+    // this span must not land under a dead lease (A19)
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
     let part_tuples: Vec<(String, u64)> = p.parts.iter().map(|x| (x.key.clone(), x.bytes)).collect();
     let pack_len = part_tuples.iter().fold(0u64, |a, x| a.saturating_add(x.1));
     let src = if part_tuples.len() == 1 {
@@ -801,6 +863,8 @@ async fn resume_drain<'a>(
         sql,
         pack: pack.clone(),
         push: &p.push,
+        job,
+        d,
         links_buf: Vec::new(),
         links_total: 0,
         tags: HashMap::new(),
@@ -892,6 +956,12 @@ async fn resume_drain<'a>(
         );
         let entry_end = wend.into_iter().chain(wnext).min().unwrap_or(u64::MAX);
         if entry_end <= durable {
+            // CAS before write: an awaited straddler re-run in an earlier
+            // iteration split the span — a stale slice must not land these
+            // shadow rows under a dead lease (A19)
+            if !super::heartbeat(sql, job)? {
+                return Err(super::stale_lease());
+            }
             // fully durable, row lost: post the shadow row — the bytes are already
             // uploaded, only the index entry is missing
             let sha = w
@@ -1082,6 +1152,7 @@ async fn resume_drain<'a>(
                 }
             }
             if rows.len() >= 10_000 {
+                // JobSink::post CASes the lease itself before writing (A19)
                 any.post(&rows, &mut budget.req).await?;
                 rows.clear();
             }
@@ -1146,6 +1217,7 @@ async fn resume_drain<'a>(
             }
             scan_after = i64_i;
             if rows.len() >= 10_000 {
+                // JobSink::post CASes the lease itself before writing (A19)
                 any.post(&rows, &mut budget.req).await?;
                 rows.clear();
             }
@@ -1188,7 +1260,7 @@ async fn resolve_slice(
     if dr.done {
         c.phase = "check".into();
     }
-    flush_ckpt(sql, &mut dr.out, &p.push, &mut dr.sink, &mut dr.rows, c, budget).await?;
+    flush_ckpt(sql, job, &mut dr.out, &p.push, &mut dr.sink, &mut dr.rows, c, budget).await?;
     continue_(c)
 }
 
@@ -1247,6 +1319,7 @@ fn part_etags(sql: &SqlStorage, push: &str) -> Result<Vec<String>, Error> {
 #[allow(clippy::too_many_arguments)]
 async fn flush_ckpt(
     sql: &SqlStorage,
+    job: &Job,
     out: &mut PackWriter,
     push: &str,
     sink: &mut JobSink<'_>,
@@ -1254,18 +1327,26 @@ async fn flush_ckpt(
     c: &mut Cursor,
     budget: &mut SliceBudget,
 ) -> Result<(), Error> {
+    // collect first, write after the CAS — the upload awaits must not be
+    // followed by writes a stale slice could land under the replacement lease
+    let mut news = Vec::new();
     while out.buffered() >= PART as u64 {
         match out.checkpoint(&mut budget.req).await? {
-            Some((n, e, s)) => {
-                exec(
-                    sql,
-                    "INSERT OR REPLACE INTO import_parts(push_id,part_no,etag) VALUES(?,?,?)",
-                    vec![V::from(push), V::from(i64::from(n)), V::from(e)],
-                )?;
-                c.st = Some(s);
-            }
+            Some((n, e, s)) => news.push((n, e, s)),
             None => break,
         }
+    }
+    // CAS before write (A19)
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
+    for (n, e, s) in news {
+        exec(
+            sql,
+            "INSERT OR REPLACE INTO import_parts(push_id,part_no,etag) VALUES(?,?,?)",
+            vec![V::from(push), V::from(i64::from(n)), V::from(e)],
+        )?;
+        c.st = Some(s);
     }
     // flush_if_full inside one_entry uploads too — fold every uploaded part into
     // the table so resume's etag list is always complete, and drop rows for parts
@@ -1301,6 +1382,8 @@ async fn flush_ckpt(
     // resume-time DELETE >durable at slice start is where crash correction lives —
     // by then the undurable tail is genuinely gone (never uploaded).
     if !rows.is_empty() {
+        // JobSink::post fences the lease itself before writing (A19); its
+        // body never awaits, so this span is unbroken — no CAS needed here
         sink.post(rows, &mut budget.req).await?;
         rows.clear();
     }
@@ -1350,6 +1433,16 @@ async fn check_slice(
 ) -> Result<SliceOutcome, Error> {
     let idx = Index(sql);
     let pack = PackId(p.pack.clone());
+    // C1: pin the epoch this check run verifies under — commit_meta re-runs
+    // the whole phase when the live epoch has moved since (a sweep ran). A
+    // legacy cursor mid-check restarts from the front first: its earlier
+    // pages predate any epoch it could pin.
+    if check_needs_restart(c.check_epoch, &c.check_after) {
+        c.check_after.clear();
+    }
+    if c.check_epoch.is_none() {
+        c.check_epoch = Some(d.meta_i64("gc_epoch")?);
+    }
     loop {
         if budget.spent_80pct() {
             return continue_(c);
@@ -1381,9 +1474,41 @@ async fn check_slice(
             page.iter().map(|h| crate::repo_do::oid(h)).collect::<Result<_, Error>>()?;
         let locs = idx.lookup(&ids)?;
         for (id, loc) in ids.iter().zip(locs.iter()) {
-            // links - {this pack} must be live; this pack's own rows count (2.5)
+            // links - {this pack} must be live; this pack's own rows count (2.5).
+            // A missing link rejects only once a GC actually ran — either this
+            // is the post-sweep re-check (recheck) or the epoch moved mid-run —
+            // because then "missing" means swept, never pending inside another
+            // still-open push. Before that it may yet arrive: keep the old
+            // retry (C1).
             if loc.is_none() && idx.lookup_in_pack(id, &pack)?.is_none() {
-                return Err(unpack(format!("missing object {id}")));
+                if !c.recheck && c.check_epoch == Some(d.meta_i64("gc_epoch")?) {
+                    return Err(unpack(format!("missing object {id}")));
+                }
+                // CAS before the abort's await: the c.upload MPU may belong to
+                // a NEW lease-owner's slice by the time abort lands — a stale
+                // slice must fail the lease check and touch nothing (A19).
+                // reject_push CASes again after the await.
+                if !super::heartbeat(sql, job)? {
+                    return Err(super::stale_lease());
+                }
+                // reject_push retires the job Done and the janitor only reaps
+                // uploads of *dead* jobs — abort the output MPU first or it
+                // leaks until R2's own expiry. A transient abort failure
+                // propagates instead: retiring the job would delete the
+                // cursor that holds the upload id and strand it for good;
+                // an already-absent upload is what abort wanted anyway.
+                if !c.upload.is_empty() {
+                    let bucket = d.bucket()?;
+                    let key = keys::pack(&bucket.repo, &pack);
+                    if let Ok(mpu) = bucket.inner.resume_multipart_upload(&key, &c.upload) {
+                        if let Err(e) = mpu.abort().await.map_err(Error::from) {
+                            if !dead_upload(&e) {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                return reject_push(sql, job, &p.push, &format!("missing object {id}")).await;
             }
         }
         c.check_after = page.last().cloned().unwrap_or_default();
@@ -1406,8 +1531,16 @@ async fn commit_slice(
     c: &mut Cursor,
     budget: &mut SliceBudget,
 ) -> Result<SliceOutcome, Error> {
+    // C1: a sweep since the check pinned its epoch makes the link verdicts
+    // stale — reset to the check phase BEFORE draining/finishing the upload
+    // (the re-run used to finish first and had to recover a spent MPU).
+    // commit_meta keeps the same-span compare as the final guard.
+    if c.check_epoch != Some(d.meta_i64("gc_epoch")?) {
+        reset_to_check(c);
+        return continue_(c);
+    }
     let mut dr = resume_drain(d, job, sql, p, c, budget).await?;
-    flush_ckpt(sql, &mut dr.out, &p.push, &mut dr.sink, &mut dr.rows, c, budget).await?;
+    flush_ckpt(sql, job, &mut dr.out, &p.push, &mut dr.sink, &mut dr.rows, c, budget).await?;
     if !dr.done {
         return continue_(c);
     }
@@ -1415,20 +1548,43 @@ async fn commit_slice(
     // finish_resumable: a mid-finish failure keeps the MPU alive so the retry
     // resumes and re-finishes — aborting here would force a full re-emit
     let meta = dr.out.finish_resumable(&mut budget.req).await?;
-    commit_meta(d, sql, p, &bucket, meta).await
+    // pause probe for the post-finish C1 arm: a sweep landing HERE — after
+    // finish consumed the MPU, before commit_meta's epoch compare — must
+    // reset the job to check; the re-commit's finish then fails dead-upload
+    // and recover_dead_upload's HEAD arm commits the durable object
+    crate::testhooks::failpoint_async(d, "import.commit.after_finish").await?;
+    commit_meta(d, job, sql, p, c, &bucket, meta).await
 }
 
-/// Terminal commit span: post the real pack meta, refresh the epoch guard, run
-/// commit_push, and drop every trace of staging. Shared by commit_slice and the
-/// already-durable recovery in recover_dead_upload.
+/// Terminal commit span: post the real pack meta, run commit_push, and drop
+/// every trace of staging. Shared by commit_slice and the already-durable
+/// recovery in recover_dead_upload.
 async fn commit_meta(
     d: &RepoDo,
+    job: &Job,
     sql: &SqlStorage,
     p: &Payload,
+    c: &mut Cursor,
     bucket: &Bucket,
     meta: PackMeta,
 ) -> Result<SliceOutcome, Error> {
     crate::testhooks::failpoint(d, "import.commit.before")?;
+    // C1: the check phase's connectivity verdicts are only valid while no GC
+    // sweep has run — gc_epoch bumps inside the sweep's span. A moved epoch
+    // means links verified live may be dead now: reset to the start of the
+    // check phase and re-verify against the post-GC index instead of
+    // committing a possibly-dangling ref. The gate and the ref update are in
+    // the same synchronous span, so nothing can interleave between them.
+    let epoch = d.meta_i64("gc_epoch")?;
+    if c.check_epoch != Some(epoch) {
+        reset_to_check(c);
+        return continue_(c);
+    }
+    // CAS before the commit span's writes — a stale slice must not land pack
+    // meta, ref updates or staging cleanup under a dead lease (A19)
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
     let pack = PackId(p.pack.clone());
     // post real pack meta over the 'ingesting' placeholder (push_index parity)
     exec(
@@ -1442,13 +1598,13 @@ async fn commit_meta(
             V::from(pack.0.as_str()),
         ],
     )?;
-    // the import reads the index lazily across slices, so the pushes row's captured
-    // gc_epoch is stale by construction — refresh it in the commit span; the epoch
-    // guard exists for edge pushes whose base lookups all happened pre-commit
+    // the epoch guard exists to catch a commit whose connectivity verdicts
+    // predate a sweep — advancing the captured epoch is honest only because
+    // the gate above proved the check ran inside this very epoch
     exec(
         sql,
-        "UPDATE pushes SET gc_epoch=(SELECT value FROM meta WHERE key='gc_epoch') WHERE id=?",
-        vec![V::from(p.push.as_str())],
+        "UPDATE pushes SET gc_epoch=? WHERE id=?",
+        vec![V::from(epoch), V::from(p.push.as_str())],
     )?;
     let r = d.commit_push(&CommitRequest {
         push_id: p.push.clone(),
@@ -1457,9 +1613,10 @@ async fn commit_meta(
         commands: p.commands.clone(),
         atomic: true,
     });
-    // Every commit outcome is terminal — the MPU is consumed either way and the
-    // pushes row records the truth (committed, or rejected + per-ref reasons that
-    // import_status surfaces). A retry could only fail on the spent MPU.
+    // Whatever commit_push decided is terminal — the pushes row records the
+    // truth (committed, or rejected + per-ref reasons import_status surfaces).
+    // A spent-MPU retry is not a dead end but the designed path: a post-finish
+    // epoch reset re-commits through recover_dead_upload's HEAD arm instead.
     match &r {
         Ok(resp) => {
             if let Some((name, err)) = resp.results.iter().find(|(_, e)| e.is_some()) {
@@ -1495,8 +1652,19 @@ async fn commit_meta(
 
 #[cfg(test)]
 mod tests {
-    use super::{dead_upload, Cursor};
+    use super::{check_needs_restart, dead_upload, Cursor};
     use crate::error::Error;
+
+    /// The legacy-cursor decision: only a mid-check cursor with no pinned
+    /// epoch restarts. A fresh check ("") pins straight away; a pinned one
+    /// resumes its pages — clearing either would rescan for no reason.
+    #[test]
+    fn check_needs_restart_truth_table() {
+        assert!(check_needs_restart(None, "abc")); // legacy mid-check
+        assert!(!check_needs_restart(None, "")); // fresh: nothing walked yet
+        assert!(!check_needs_restart(Some(7), "abc")); // pinned: resume pages
+        assert!(!check_needs_restart(Some(7), ""));
+    }
 
     /// A cursor persisted before scan_after/tail existed must still load —
     /// serde defaults or a live import's saved state fails to deserialize and

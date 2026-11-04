@@ -316,10 +316,12 @@ Ordering, strictly: (1) pack durable in R2 (`finish` returned); (2) all `objects
    ok  <=> changes() == 1, read by the statement issued immediately after, in the same span.
    ng reason: "failed to update ref" (git's own string).
    on ok: INSERT INTO reflog(...)
-5. if any ok: UPDATE meta SET value=value+1 WHERE key='refs_version'
+5. if any ok or a pack went live at step 3: UPDATE meta SET value=value+1 WHERE key='refs_version'
 6. UPDATE pushes SET state='committed', ended_at=?, result=? WHERE id=?
 7. if any ok: jobs::enqueue(GcMark, now + 10 min)   (dedups: at most one pending GcMark)
 ```
+
+Step 5's pack arm: a non-atomic push whose every command loses still promotes its pack at step 3 (the atomic all-fail path demotes it instead). That pack joined the live set a running GC snapshotted, so `refs_version` must move or the chain's guards never abort — a kept young pack could then link into swept objects (C2). A bump without a ref move costs only an A28 memo rebuild.
 
 `SqlCursor::rows_written` is never read, by anyone, for any decision. Measured (`research/platform-facts.md` #1): `INSERT` into a `PRIMARY KEY` table reports `rowsWritten = 2` because the autoindex row is counted; on a `WITHOUT ROWID` table it reports 1; `SELECT changes()` reports 1 / 0 / 1 correctly in every case, including inside `transactionSync`. `changes()` is the CAS outcome. `RETURNING` is not used, so the contract does not depend on the SQLite version workerd ships. CI greps the crate for `rows_written` and fails on a hit outside tests.
 
@@ -363,7 +365,7 @@ Constants: `GRACE = 1 h`, `PUSH_TIMEOUT = 1 h`, `GC_QUIET = 10 min`.
 The list of keys in step 3 is built from SQLite rows in the same slice, but each deleted key has been `dead`/not-`open` for at least GRACE, which is longer than any request can live. "Never delete in the same slice that listed" therefore means: **R2 deletion only ever targets rows that a previous slice, at least GRACE earlier, marked dead.** Marking and deleting never happen in one slice.
 
 **GC** (`GcMark` -> `GcConsolidate` -> `GcSweep`), enqueued 10 min after a ref change:
-1. `GcMark`: records `gc.refs_version` and `gc.started_at` in `meta` on its first slice. Walks from all `refs` targets using the round loop of section 9, but marks whole entries: a bitmap per live pack (`marked` table: `pack_id, bitmap BLOB`), one bit per `idx`. Cursor = frontier of unvisited ids, stored in the job row (capped at 50,000 ids; larger frontiers are spilled to a `gc_frontier` table). Only packs with `created_at < gc.started_at - GRACE` are candidates; younger packs are exempt from this GC entirely.
+1. `GcMark`: records `gc.refs_version`, `gc.started_at` and a fresh `gc.chain` id in `meta` on its first slice. Walks from all `refs` targets using the round loop of section 9, but marks whole entries: a bitmap per live pack (`marked` table: `pack_id, bitmap BLOB`), one bit per `idx`. Cursor = the `gc_frontier` table's unvisited ids. Only packs with `created_at < gc.started_at - GRACE` are candidates; younger packs are exempt from deletion but not from the walk — every non-blob object of every live non-candidate seeds `gc_frontier` at init, so links out of a kept young pack still mark candidate entries (C2). `gc.phase` tracks the chain (`build` when the frontier drains, `sweep` when the build finishes or is unneeded): a row whose payload chain id no longer matches `gc.chain` is a no-op, and a chain-less resurrected row may only run inside its matching phase (C3).
 2. `GcConsolidate`: if candidate packs number >= 2 or any candidate has unmarked entries: write one new pack `packs/<new>.pack` containing exactly the marked entries of all candidate packs, copied verbatim via `read_entries` (section 7.2), `PackWriter` with `resume_multipart_upload` between slices (cursor = upload id, parts so far, position). The new pack is inserted `live` with its `objects` rows in the slice that completes it; from that moment every marked object has two live rows.
 3. `GcSweep`, **one sync span**: `SELECT value FROM meta WHERE key='refs_version'`; if it differs from `gc.refs_version`, abort the GC (drop `marked`, delete the new pack's rows and mark that pack `dead`, enqueue a fresh `GcMark`) and return. Otherwise: `UPDATE packs SET state='dead', dead_at=now WHERE id IN (candidates)`; `DELETE FROM objects WHERE pack_id IN (candidates)`; `UPDATE meta SET value=value+1 WHERE key='gc_epoch'`; drop `marked`. The R2 keys are removed by the Janitor after GRACE.
 
@@ -1044,13 +1046,16 @@ Continuing the audit-fix numbering (last: A16).
     links cap at 8M staged rows).
   - The `commit` slice drains whatever the resolve tail left undurable
     (the <PART buffer no mid-run checkpoint can upload), finishes the MPU,
-    posts real pack meta over the `ingesting` placeholder, refreshes the
-    push's `gc_epoch` (import reads are lazy across slices, so the
-    begin-time capture is stale by construction), and calls `commit_push`.
-    Every commit outcome is terminal: the MPU is consumed either way and
-    the `pushes` row records the truth; cleanup of `push_links` /
-    `import_toc` / `import_parts` / `import_open` / staged parts runs on
-    acceptance and rejection alike.
+    posts real pack meta over the `ingesting` placeholder, stamps the
+    check phase's pinned `gc_epoch` onto the pushes row, and calls
+    `commit_push`. The epoch is re-compared before the finish and again
+    inside the commit span — a moved epoch (a sweep ran) resets the job
+    to re-check rather than commit stale link verdicts, and a post-finish
+    reset re-commits the already-durable object through dead-upload
+    recovery. The pushes row records the outcome (committed, or rejected
+    + per-ref reasons); cleanup of `push_links` / `import_toc` /
+    `import_parts` / `import_open` / staged parts runs on acceptance and
+    rejection alike.
   - Each slice heartbeats `pushes.began_at`; the janitor's orphan reaper
     keys on `packs.push_id` (NULL `pushes.pack_id` would flag an active
     import's pack abandoned). A dead job's MPU is aborted and its staging

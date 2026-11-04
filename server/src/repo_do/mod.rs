@@ -245,6 +245,8 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/test/repair") if crate::testhooks::enabled(self) => crate::testhooks::repair(self),
                 (Method::Post, "/_do/test/drop_object") if crate::testhooks::enabled(self) => crate::testhooks::drop_object(self, &body),
                 (Method::Post, "/_do/test/knob") if crate::testhooks::enabled(self) => crate::testhooks::set_knob(self, &body),
+                (Method::Post, "/_do/test/meta") if crate::testhooks::enabled(self) => crate::testhooks::set_meta(self, &body),
+                (Method::Post, "/_do/test/enqueue") if crate::testhooks::enabled(self) => crate::testhooks::enqueue_job(self, &body),
                 _ => return Ok(None),
             }
             .map(Some)
@@ -1760,8 +1762,16 @@ impl RepoDo {
             any_ok |= r.is_none();
             results.push((c.name.clone(), r));
         }
+        // step 5: the version moves when a ref landed OR a pack went live
+        // without one — a non-atomic push whose every command lost still
+        // promoted its pack at step 3, so the live set a running GC
+        // snapshotted changed either way and its refs_version guards must
+        // abort it (C2). The atomic all-fail arm above already demoted its
+        // pack, so `pack_id` here means "live now".
+        if any_ok || req.pack_id.is_some() {
+            self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?;
+        }
         if any_ok {
-            self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?; // step 5
             // a repo created by pushing a non-main history (e.g. master-first) leaves
             // meta.head dangling — adopt an existing branch or clones can't check out
             self.q(

@@ -16,6 +16,8 @@
 //!   POST /_do/test/drop_object {"sha","action"?:"drop"|"corrupt"} — index corruption jig
 //!   POST /_do/test/drop_pack   {"pack"} — delete the pack's R2 object (fsck must notice)
 //!   POST /_do/test/knob        {"name","value"?} — integer knobs (slice_subreqs, gc_part_bytes)
+//!   POST /_do/test/meta        {"key","value"|null} — set/delete a meta row (legacy-state jig)
+//!   POST /_do/test/enqueue     {"kind","payload"?} — insert a job row like repair resurrection
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -67,7 +69,10 @@ pub fn failpoint(d: &RepoDo, name: &str) -> Result<(), Error> {
     }
     d.q(DDL, vec![])?;
     d.q(
-        "UPDATE test_failpoints SET remaining=remaining-1 WHERE name=? AND remaining>0",
+        // "pause" rows belong to failpoint_async — a sync call site cannot
+        // await, so it must leave the arm untouched rather than eat the count
+        "UPDATE test_failpoints SET remaining=remaining-1 \
+         WHERE name=? AND action<>'pause' AND remaining>0",
         vec![V::from(name)],
     )?;
     if d.changes()? != 1 {
@@ -104,6 +109,49 @@ pub fn is_crash(e: &Error) -> bool {
     matches!(e, Error::Internal(m) if m.starts_with(CRASH_MARK))
 }
 
+/// The async sibling of [`failpoint`] — identical armed-count semantics for
+/// "error"/"crash" (delegated), plus action "pause": the arm is consumed, then
+/// the slice awaits, polling the row every 100 ms until `off` deletes it or
+/// 30 s pass. The `Delay` await is the point where a DO interleaves other
+/// requests — a test uses that window to strand and reclaim the paused slice's
+/// job row underneath it (C7). Armed at a site that never calls this fn, a
+/// "pause" row simply stays armed and inert.
+pub async fn failpoint_async(d: &RepoDo, name: &str) -> Result<(), Error> {
+    if !enabled(d) {
+        return Ok(());
+    }
+    d.q(DDL, vec![])?;
+    // the pause arm decrements here and the row survives so the poll can see
+    // it still says "pause" — set_failpoint "off" deletes it to release
+    d.q(
+        "UPDATE test_failpoints SET remaining=remaining-1 \
+         WHERE name=? AND action='pause' AND remaining>0",
+        vec![V::from(name)],
+    )?;
+    if d.changes()? != 1 {
+        return failpoint(d, name);
+    }
+    #[derive(serde::Deserialize)]
+    struct A {
+        action: String,
+    }
+    let deadline = crate::platform::now_ms() + 30_000;
+    while crate::platform::now_ms() < deadline {
+        let armed = d
+            .q("SELECT action FROM test_failpoints WHERE name=?", vec![V::from(name)])?
+            .to_array::<A>()?
+            .into_iter()
+            .next()
+            .map(|a| a.action == "pause")
+            .unwrap_or(false);
+        if !armed {
+            return Ok(());
+        }
+        worker::Delay::from(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
 // ---- jobs/gc_meta/packs view (embedded in the step response too) ----
 
 #[derive(serde::Deserialize)]
@@ -116,6 +164,7 @@ struct JobRow {
     strands: i64,
     last_error: Option<String>,
     cursor_present: i64,
+    cursor: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct KV {
@@ -129,12 +178,13 @@ struct PackRow {
     count: i64,
     created_at: i64,
     push_id_null: i64,
+    marked: i64,
 }
 
 fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
     let jobs = d
         .q(
-            "SELECT id,kind,state,run_at,attempts,strands,last_error, \
+            "SELECT id,kind,state,run_at,attempts,strands,last_error,cursor, \
              (cursor IS NOT NULL) AS cursor_present FROM jobs ORDER BY id",
             vec![],
         )?
@@ -150,22 +200,85 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
         .collect();
     let packs = d
         .q(
-            "SELECT id,state,count,created_at,(push_id IS NULL) AS push_id_null FROM packs ORDER BY id",
+            "SELECT id,state,count,created_at,(push_id IS NULL) AS push_id_null, \
+             EXISTS(SELECT 1 FROM marked m WHERE m.pack_id=packs.id) AS marked \
+             FROM packs ORDER BY id",
             vec![],
         )?
         .to_array::<PackRow>()?;
+    #[derive(serde::Deserialize)]
+    struct Fp {
+        name: String,
+        action: String,
+        remaining: i64,
+    }
+    // the table is lazily created by set_failpoint/failpoint — a repo that
+    // never armed one just reports an empty list
+    let failpoints = match d.q("SELECT name,action,remaining FROM test_failpoints ORDER BY name", vec![]) {
+        Ok(c) => c.to_array::<Fp>().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
     Ok(serde_json::json!({
         "jobs": jobs.iter().map(|j| serde_json::json!({
             "id": j.id, "kind": j.kind, "state": j.state, "run_at": j.run_at,
             "attempts": j.attempts, "strands": j.strands, "last_error": j.last_error,
-            "cursor_present": j.cursor_present != 0,
+            "cursor_present": j.cursor_present != 0, "cursor": j.cursor,
         })).collect::<Vec<_>>(),
         "gc_meta": gc_meta,
+        // counts + a content digest per GC scratch table — the C7 stale-lease
+        // oracle: compare snapshots across the lease hand-off and any write a
+        // stale slice managed to land shows up
+        "gc_tables": serde_json::json!({
+            "marked": table_digest(d, "marked", "pack_id || ':' || hex(bitmap)")?,
+            "gc_seen": table_digest(d, "gc_seen", "sha")?,
+            "gc_frontier": table_digest(d, "gc_frontier", "sha")?,
+            // the import side's write targets — the C7 stale-lease test
+            // snapshots a stale import slice against these the same way
+            "objects": table_digest(d, "objects",
+                "sha || ':' || pack_id || ':' || idx || ':' || offset || ':' || len || ':' || kind || ':' || size")?,
+            "push_links": table_digest(d, "push_links", "push_id || ':' || sha")?,
+            "import_open": table_digest(d, "import_open",
+                "push_id || ':' || idx || ':' || off || ':' || COALESCE(sha,'') || ':' || kind || ':' || size || ':' || COALESCE(end,'')")?,
+            "import_parts": table_digest(d, "import_parts", "push_id || ':' || part_no || ':' || etag")?,
+            "import_tail": table_digest(d, "import_tail", "push_id || ':' || seq || ':' || hex(blob)")?,
+        }),
+        "failpoints": failpoints.iter().map(|f| serde_json::json!({
+            "name": f.name, "action": f.action, "remaining": f.remaining,
+        })).collect::<Vec<_>>(),
         "packs": packs.iter().map(|p| serde_json::json!({
             "id": p.id, "state": p.state, "count": p.count,
             "created_at": p.created_at, "push_id_null": p.push_id_null != 0,
+            "marked": p.marked != 0,
         })).collect::<Vec<_>>(),
     }))
+}
+
+/// One GC scratch table's (row count, content digest). `expr` renders each row
+/// as one string; the ORDER BY makes the digest deterministic.
+fn table_digest(d: &RepoDo, table: &str, expr: &str) -> Result<serde_json::Value, Error> {
+    #[derive(serde::Deserialize)]
+    struct R {
+        v: String,
+    }
+    let rows = d
+        .q(&format!("SELECT {expr} AS v FROM {table} ORDER BY v"), vec![])?
+        .to_array::<R>()?;
+    Ok(serde_json::json!({
+        "n": rows.len(),
+        "hash": rows_digest(rows.iter().map(|r| r.v.as_str())),
+    }))
+}
+
+/// FNV-1a over the row strings with a per-row separator, so ["ab","c"] and
+/// ["a","bc"] hash differently. Pure — unit-tested below.
+fn rows_digest<'a>(rows: impl Iterator<Item = &'a str>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for r in rows {
+        for b in r.bytes().chain(std::iter::once(0xff)) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
 }
 
 pub fn jobs_view(d: &RepoDo) -> Result<Response, Error> {
@@ -225,6 +338,33 @@ pub fn set_knob(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
     json(serde_json::json!({ "knob": b.name, "value": b.value }))
 }
 
+/// POST /_do/test/meta {"key","value"} — write one meta row directly (a
+/// legacy-GC-chain fixture deletes gc.phase/gc.chain this way); null deletes.
+pub fn set_meta(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        key: String,
+        value: Option<String>,
+    }
+    let b: B = parse(body)?;
+    if b.key.is_empty() || b.key.len() > 128 {
+        return Err(Error::Protocol("bad meta key".into()));
+    }
+    match &b.value {
+        None => {
+            d.q("DELETE FROM meta WHERE key=?", vec![V::from(b.key.as_str())])?;
+        }
+        Some(v) => {
+            d.q(
+                "INSERT INTO meta(key,value) VALUES(?,?) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                vec![V::from(b.key.as_str()), V::from(v.as_str())],
+            )?;
+        }
+    }
+    json(serde_json::json!({ "key": b.key, "value": b.value }))
+}
+
 pub fn set_failpoint(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
     #[derive(serde::Deserialize)]
     struct B {
@@ -242,7 +382,7 @@ pub fn set_failpoint(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
         "off" => {
             d.q("DELETE FROM test_failpoints WHERE name=?", vec![V::from(b.name.as_str())])?;
         }
-        a @ ("error" | "crash") => {
+        a @ ("error" | "crash" | "pause") => {
             let n = b.count.unwrap_or(1);
             if !(0..=1_000_000).contains(&n) {
                 return Err(Error::Protocol("count must be 0..=1000000".into()));
@@ -253,9 +393,30 @@ pub fn set_failpoint(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
                 vec![V::from(b.name.as_str()), V::from(a), V::from(n)],
             )?;
         }
-        _ => return Err(Error::Protocol("action must be error|crash|off".into())),
+        _ => return Err(Error::Protocol("action must be error|crash|pause|off".into())),
     }
     json(serde_json::json!({ "armed": b.name, "action": b.action }))
+}
+
+/// POST /_do/test/enqueue {"kind","payload"?} — queue a job row exactly the
+/// way repair resurrection does (jobs::enqueue still dedups against queued
+/// rows of the kind). The GC phase-guard test inserts a chain-less "{}"
+/// consolidate mid-mark; default payload is "{}", like a resurrected row.
+pub fn enqueue_job(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        kind: String,
+        #[serde(default)]
+        payload: Option<String>,
+    }
+    let b: B = parse(body)?;
+    jobs::enqueue(
+        &d.sql(),
+        JobKind::of(&b.kind)?,
+        crate::platform::now_ms(),
+        b.payload.as_deref().unwrap_or("{}"),
+    )?;
+    jobs_view(d)
 }
 
 /// Turn a simulated crash into a requeue deterministically: age every 'running'
@@ -805,5 +966,17 @@ mod tests {
             assert!(!super::flag_on(v), "{v:?}");
         }
         assert!(super::flag_on(Some("1")));
+    }
+
+    /// rows_digest: deterministic for an ordered row set, and the per-row
+    /// separator keeps ["x","y"], ["xy"] and ["y","x"] distinct — the C7
+    /// snapshot compare relies on both properties.
+    #[test]
+    fn rows_digest_properties() {
+        let a = super::rows_digest(["x", "y"].into_iter());
+        assert_eq!(a, super::rows_digest(["x", "y"].into_iter()));
+        assert_ne!(a, super::rows_digest(["xy"].into_iter()));
+        assert_ne!(a, super::rows_digest(["y", "x"].into_iter()));
+        assert_ne!(a, super::rows_digest([].into_iter()));
     }
 }
