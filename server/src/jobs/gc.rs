@@ -13,9 +13,10 @@ use super::{enqueue, Job, JobKind, SliceBudget, SliceOutcome};
 use crate::error::Error;
 use crate::pack::ingest::extract_links;
 use crate::platform::now_ms;
-use crate::repo_do::{oid, RepoDo};
+use crate::repo_do::RepoDo;
 use crate::store::{
-    codec, keys, Bucket, Index, ObjLoc, ObjRow, PackId, PackMeta, PackWriter, WriterCkpt, PART,
+    codec, keys, Bucket, Index, ObjLoc, ObjRow, ObjSqlRow, PackId, PackMeta, PackWriter, WriterCkpt,
+    PART, PART_MIN,
 };
 
 const ROUND: i64 = 512; // frontier ids per round
@@ -54,16 +55,6 @@ struct B {
 struct BM {
     #[serde(with = "serde_bytes")]
     bitmap: Vec<u8>,
-}
-#[derive(serde::Deserialize)]
-struct R {
-    sha: String,
-    pack_id: String,
-    idx: i64,
-    offset: i64,
-    len: i64,
-    kind: i64,
-    size: i64,
 }
 #[derive(serde::Deserialize)]
 struct PE {
@@ -122,7 +113,7 @@ struct Span {
 }
 
 fn exec(sql: &SqlStorage, q: &str, args: Vec<V>) -> Result<worker::SqlCursor, Error> {
-    sql.exec(q, Some(args)).map_err(|e| Error::Storage(e.to_string()))
+    crate::store::exec(sql, q, args)
 }
 fn js<T: serde::Serialize + ?Sized>(v: &T) -> Result<V, Error> {
     Ok(serde_json::to_string(v).map_err(|e| Error::Internal(e.to_string()))?.into())
@@ -135,23 +126,6 @@ fn put(d: &RepoDo, k: &str, v: impl Into<String>) -> Result<(), Error> {
     )?;
     Ok(())
 }
-fn loc(r: &R) -> Result<(ObjectId, ObjLoc), Error> {
-    let u = |n: i64| -> Result<u64, Error> {
-        u64::try_from(n).map_err(|_| Error::Internal("negative integer in objects".into()))
-    };
-    Ok((
-        oid(&r.sha)?,
-        ObjLoc {
-            pack: PackId(r.pack_id.clone()),
-            idx: u32::try_from(r.idx).map_err(|_| Error::Internal("idx".into()))?,
-            offset: u(r.offset)?,
-            len: u32::try_from(r.len).map_err(|_| Error::Internal("len".into()))?,
-            kind: crate::store::kind_of(u8::try_from(r.kind).map_err(|_| Error::Internal("kind".into()))?)?,
-            size: u(r.size)?,
-        },
-    ))
-}
-
 // ---- marked-bitmap helpers (one bit per entry idx) ----
 fn bm_set(bm: &mut Vec<u8>, i: u32) -> Result<(), Error> {
     let byte = usize::try_from(i / 8).unwrap_or(usize::MAX);
@@ -232,6 +206,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
              SELECT peeled FROM refs WHERE peeled IS NOT NULL",
             vec![],
         )?;
+        crate::testhooks::failpoint(d, "gc.mark.init")?;
     }
     let bucket = d.bucket()?;
     let cand: HashSet<String> = exec(&sql, "SELECT pack_id FROM marked", vec![])?
@@ -268,7 +243,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
              o.sha IN (SELECT value FROM json_each(?)) GROUP BY o.sha ORDER BY o.sha",
             vec![js(&batch)?],
         )?
-        .to_array::<R>()?;
+        .to_array::<ObjSqlRow>()?;
         let (mut loads, mut prev) = (Vec::<(ObjectId, ObjLoc)>::new(), String::new());
         let mut marked_sha = false;
         for r in &rows {
@@ -276,7 +251,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
                 prev = r.sha.clone();
                 marked_sha = false;
                 if r.kind != 3 {
-                    loads.push(loc(r)?); // blobs never read (5.1)
+                    loads.push(r.loc()?); // blobs never read (5.1)
                 }
             }
             if !marked_sha && cand.contains(&r.pack_id) {
@@ -298,8 +273,12 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
         let load_ids: HashSet<String> = loads.iter().map(|(id, _)| id.to_string()).collect();
         for chunk in chunks(&loads) {
             let ids: Vec<String> = chunk.iter().map(|(id, _)| id.to_string()).collect();
+            // await the whole chunk FIRST — after_read then sits between sync
+            // spans, where a crash can't bisect the kids-flush writes below
+            let entries = bucket.read_entries_chunked(&chunk, &mut budget.req).await?;
+            crate::testhooks::failpoint(d, "gc.mark.after_read")?;
             let mut kids: Vec<String> = Vec::new();
-            for (_id, entry) in bucket.read_entries_chunked(&chunk, &mut budget.req).await? {
+            for (_id, entry) in entries {
                 let (kind, data) = codec::decode_entry(&entry)?; // A7 cap inside
                 for l in extract_links(kind, &data, d.obj_kind()?)? {
                     kids.push(l.to_string());
@@ -318,6 +297,9 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             if !super::heartbeat(&sql, job)? {
                 return Err(super::stale_lease());
             }
+            // models a real death only while another await follows in the
+            // same slice — at the slice's true end nothing is left to roll back
+            crate::testhooks::failpoint(d, "gc.mark.after_commit")?;
             if budget.spent_80pct() {
                 break;
             }
@@ -328,6 +310,7 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             if !super::heartbeat(&sql, job)? {
                 return Err(super::stale_lease());
             }
+            crate::testhooks::failpoint(d, "gc.mark.after_commit")?;
         }
     }
 }
@@ -412,7 +395,16 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
                 serde_json::from_str::<Pos>(&j)
                     .map_err(|e| Error::Internal(format!("corrupt gc.pos: {e}")))?,
             ),
-            None => begin_build(d, &sql)?,
+            None => {
+                let p = begin_build(d, &sql)?;
+                // a crash means a build began — begin_build's None arm already
+                // committed the terminal "nothing to repack" writes and owns
+                // no crash point
+                if p.is_some() {
+                    crate::testhooks::failpoint(d, "gc.consolidate.begin")?;
+                }
+                p
+            }
         }) else {
             return Ok(SliceOutcome::Done); // nothing to repack: state already wiped
         };
@@ -458,6 +450,15 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
             )
             .await?
         };
+        // gc_part_bytes knob (testhooks): a shrunken uniform part makes
+        // consolidate multi-part on a tiny repo — after_part becomes reachable.
+        // Clamped: R2 refuses non-final parts under PART_MIN even in dev.
+        out.set_part_size(
+            crate::testhooks::knob(d, "gc_part_bytes")
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(PART)
+                .clamp(PART_MIN, PART),
+        );
         // Fold a yield-persisted tail back in. (bci,bidx,bfrag) is the durable
         // boundary recorded beside the scan cursor: a short/corrupt tail can't be
         // trusted, so the fallback rewinds the scan to it and replays — the rows
@@ -630,11 +631,12 @@ async fn build(
              AND idx IN (SELECT value FROM json_each(?)) ORDER BY idx",
             vec![cands.get(pos.ci as usize).cloned().unwrap_or_default().into(), js(&idxs)?],
         )?
-        .to_array::<R>()?;
+        .to_array::<ObjSqlRow>()?;
         if rows.len() != idxs.len() {
             return Err(Error::Internal("marked entry lacks objects row".into()));
         }
-        let locs: Vec<(ObjectId, ObjLoc)> = rows.iter().map(loc).collect::<Result<_, _>>()?;
+        let locs: Vec<(ObjectId, ObjLoc)> =
+            rows.iter().map(ObjSqlRow::loc).collect::<Result<_, _>>()?;
         for chunk in chunks(&locs) {
             if budget.spent_80pct() {
                 // the inner batch can run ~90 reads — still bounded; persist_tail
@@ -823,7 +825,7 @@ async fn flush(
 ) -> Result<Option<Flow>, Error> {
     let mut news: Vec<(u16, String)> = Vec::new();
     let mut st = None;
-    while out.buffered() >= PART as u64 {
+    while out.buffered() >= out.part_size() {
         match out.checkpoint(&mut budget.req).await {
             Ok(Some((n, e, s))) => {
                 news.push((n, e));
@@ -832,6 +834,7 @@ async fn flush(
             Ok(None) => break,
             Err(e) => return mpu_err(d, sql, bucket, key, pos, e, budget).await.map(Some),
         }
+        crate::testhooks::failpoint(d, "gc.consolidate.after_part")?;
     }
     // a yield persists even when nothing drained — the tail is the progress
     let mut st = match st {
@@ -853,7 +856,7 @@ async fn flush(
     exec(
         sql,
         "DELETE FROM gc_parts WHERE part_no > ?",
-        vec![V::from(i64::try_from(st.pos / PART as u64).unwrap_or(0))],
+        vec![V::from(i64::try_from(st.pos / out.part_size()).unwrap_or(0))],
     )?;
     // durable = last uploaded byte. If it falls short of appended, the boundary
     // lands inside an entry — mid-slice persists rewind to it; a yield keeps the
@@ -1049,6 +1052,8 @@ fn wipe_build(d: &RepoDo, sql: &SqlStorage) -> Result<(), Error> {
 }
 
 fn finish_build(d: &RepoDo, sql: &SqlStorage, pos: &Pos, meta: &PackMeta) -> Result<Flow, Error> {
+    // covers both callers — the normal finish path and mpu_err's HEAD-recovery
+    crate::testhooks::failpoint(d, "gc.consolidate.before_finish")?;
     exec(
         sql,
         "UPDATE packs SET state='live', count=?, bytes=?, commit_lo=?, commit_hi=? \
@@ -1071,6 +1076,9 @@ fn finish_build(d: &RepoDo, sql: &SqlStorage, pos: &Pos, meta: &PackMeta) -> Res
 /// GcSweep (5.3): the whole step is one sync span — the refs_version check, the row deletes and
 /// the gc_epoch bump are atomic — and it never touches R2: dead keys are the Janitor's, after GRACE.
 pub async fn gc_sweep(d: &RepoDo) -> Result<SliceOutcome, Error> {
+    // claim-only point: the slice never awaits, so a real death rolls the
+    // whole span back — "crashed here" == "died before the slice ran"
+    crate::testhooks::failpoint(d, "gc.sweep.before")?;
     let sql = d.sql();
     if d.meta_opt("gc.refs_version")?.is_none() {
         return Ok(SliceOutcome::Done);

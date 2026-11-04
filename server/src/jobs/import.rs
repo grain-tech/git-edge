@@ -141,7 +141,7 @@ impl Default for Cursor {
 }
 
 fn exec(sql: &SqlStorage, q: &str, args: Vec<V>) -> Result<worker::SqlCursor, Error> {
-    sql.exec(q, Some(args)).map_err(|e| Error::Storage(e.to_string()))
+    crate::store::exec(sql, q, args)
 }
 fn i64v(n: u64) -> Result<V, Error> {
     Ok(V::from(i64::try_from(n).map_err(|_| Error::Internal("u64 to i64".into()))?))
@@ -1348,7 +1348,6 @@ async fn check_slice(
     c: &mut Cursor,
     budget: &mut SliceBudget,
 ) -> Result<SliceOutcome, Error> {
-    let _ = d;
     let idx = Index(sql);
     let pack = PackId(p.pack.clone());
     loop {
@@ -1369,6 +1368,12 @@ async fn check_slice(
         .map(|s| s.sha)
         .collect();
         if page.is_empty() {
+            // claim-only point: the slice never awaits after this — a real
+            // death here is indistinguishable from dying before it ran.
+            // ONE divergence: run_slice's `UPDATE pushes SET began_at=?`
+            // lease refresh lands before the failpoint, so the simulated
+            // crash keeps it where a real death would roll it back
+            crate::testhooks::failpoint(d, "import.check.done")?;
             c.phase = "commit".into();
             return continue_(c);
         }
@@ -1423,6 +1428,7 @@ async fn commit_meta(
     bucket: &Bucket,
     meta: PackMeta,
 ) -> Result<SliceOutcome, Error> {
+    crate::testhooks::failpoint(d, "import.commit.before")?;
     let pack = PackId(p.pack.clone());
     // post real pack meta over the 'ingesting' placeholder (push_index parity)
     exec(

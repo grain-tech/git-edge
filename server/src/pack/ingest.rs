@@ -387,9 +387,7 @@ impl Toc<'_> {
             clen: i64,
             size: i64,
         }
-        let r = sql
-            .exec(q, Some(args))
-            .map_err(|e| Error::Storage(e.to_string()))?
+        let r = crate::store::exec(sql, q, args)?
             .to_array::<Row>()
             .map_err(|e| Error::Storage(e.to_string()))?
             .into_iter()
@@ -523,9 +521,11 @@ impl JobSink<'_> {
                 args.push(worker::SqlStorageValue::from(self.push));
                 args.push(worker::SqlStorageValue::from(id.to_string().as_str()));
             }
-            self.sql
-                .exec(&format!("INSERT OR IGNORE INTO push_links(push_id,sha) VALUES{marks}"), Some(args))
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            crate::store::exec(
+                self.sql,
+                &format!("INSERT OR IGNORE INTO push_links(push_id,sha) VALUES{marks}"),
+                args,
+            )?;
         }
         self.links_buf.clear();
         Ok(())
@@ -535,34 +535,32 @@ impl JobSink<'_> {
     /// attempt-order markers can't (a parked entry's prospective start collides
     /// with the entry that actually writes there).
     fn mark(&mut self, idx: usize, off: u64, sha: Option<ObjectId>, kind: Kind, size: u64) -> Result<(), Error> {
-        self.sql
-            .exec(
-                "INSERT OR REPLACE INTO import_open(push_id,idx,off,sha,kind,size) VALUES(?,?,?,?,?,?)",
-                vec![
-                    worker::SqlStorageValue::from(self.push),
-                    worker::SqlStorageValue::from(i64::try_from(idx).map_err(internal)?),
-                    worker::SqlStorageValue::from(i64::try_from(off).map_err(internal)?),
-                    sha.map(|s| worker::SqlStorageValue::from(s.to_string().as_str()))
-                        .unwrap_or(worker::SqlStorageValue::Null),
-                    worker::SqlStorageValue::from(i64::from(crate::store::git_kind(kind))),
-                    worker::SqlStorageValue::from(i64::try_from(size).map_err(internal)?),
-                ],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        crate::store::exec(
+            self.sql,
+            "INSERT OR REPLACE INTO import_open(push_id,idx,off,sha,kind,size) VALUES(?,?,?,?,?,?)",
+            vec![
+                worker::SqlStorageValue::from(self.push),
+                worker::SqlStorageValue::from(i64::try_from(idx).map_err(internal)?),
+                worker::SqlStorageValue::from(i64::try_from(off).map_err(internal)?),
+                sha.map(|s| worker::SqlStorageValue::from(s.to_string().as_str()))
+                    .unwrap_or(worker::SqlStorageValue::Null),
+                worker::SqlStorageValue::from(i64::from(crate::store::git_kind(kind))),
+                worker::SqlStorageValue::from(i64::try_from(size).map_err(internal)?),
+            ],
+        )?;
         Ok(())
     }
     fn seal(&mut self, idx: usize, end: u64, sha: ObjectId) -> Result<(), Error> {
-        self.sql
-            .exec(
-                "UPDATE import_open SET end=?, sha=? WHERE push_id=? AND idx=?",
-                vec![
-                    worker::SqlStorageValue::from(i64::try_from(end).map_err(internal)?),
-                    worker::SqlStorageValue::from(sha.to_string().as_str()),
-                    worker::SqlStorageValue::from(self.push),
-                    worker::SqlStorageValue::from(i64::try_from(idx).map_err(internal)?),
-                ],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        crate::store::exec(
+            self.sql,
+            "UPDATE import_open SET end=?, sha=? WHERE push_id=? AND idx=?",
+            vec![
+                worker::SqlStorageValue::from(i64::try_from(end).map_err(internal)?),
+                worker::SqlStorageValue::from(sha.to_string().as_str()),
+                worker::SqlStorageValue::from(self.push),
+                worker::SqlStorageValue::from(i64::try_from(idx).map_err(internal)?),
+            ],
+        )?;
         Ok(())
     }
 }
