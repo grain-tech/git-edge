@@ -9,7 +9,7 @@ use gix_hash::ObjectId;
 use gix_object::Kind;
 use worker::{SqlStorage, SqlStorageValue as V};
 
-use super::{enqueue, Job, JobKind, SliceBudget, SliceOutcome};
+use super::{compact, enqueue, Job, JobKind, SliceBudget, SliceOutcome};
 use crate::error::Error;
 use crate::pack::ingest::extract_links;
 use crate::platform::{hex16, now_ms};
@@ -40,8 +40,8 @@ struct S {
     sha: String,
 }
 #[derive(serde::Deserialize)]
-struct P {
-    pack_id: String,
+pub(crate) struct P {
+    pub pack_id: String,
 }
 #[derive(serde::Deserialize)]
 struct B {
@@ -118,7 +118,7 @@ fn exec(sql: &SqlStorage, q: &str, args: Vec<V>) -> Result<worker::SqlCursor, Er
 fn js<T: serde::Serialize + ?Sized>(v: &T) -> Result<V, Error> {
     Ok(serde_json::to_string(v).map_err(|e| Error::Internal(e.to_string()))?.into())
 }
-fn put(d: &RepoDo, k: &str, v: impl Into<String>) -> Result<(), Error> {
+pub(crate) fn put(d: &RepoDo, k: &str, v: impl Into<String>) -> Result<(), Error> {
     exec(
         &d.sql(),
         "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -132,7 +132,7 @@ fn put(d: &RepoDo, k: &str, v: impl Into<String>) -> Result<(), Error> {
 /// A missing gc.chain (repair-resurrected or a pre-field enqueue) degrades to the
 /// unguarded payload; the phase guards then decide — a legacy chain still
 /// mid-flight is aborted, anything else is Done.
-fn chain_payload(d: &RepoDo) -> Result<String, Error> {
+pub(crate) fn chain_payload(d: &RepoDo) -> Result<String, Error> {
     Ok(match d.meta_opt("gc.chain")? {
         Some(c) => format!("{{\"chain\":\"{c}\"}}"),
         None => "{}".into(),
@@ -163,7 +163,7 @@ fn stray(d: &RepoDo, job: &Job) -> Result<bool, Error> {
 /// or aborted chain wipes all three). The phase guards would Done its rows
 /// and strand gc.pos's MPU plus the ingesting build pack — the fix aborts it
 /// like any other broken chain: wipe gc.* and enqueue a fresh mark.
-fn legacy_chain(d: &RepoDo) -> Result<bool, Error> {
+pub(crate) fn legacy_chain(d: &RepoDo) -> Result<bool, Error> {
     Ok(d.meta_opt("gc.phase")?.is_none()
         && d.meta_opt("gc.chain")?.is_none()
         && d.meta_opt("gc.started_at")?.is_some())
@@ -173,7 +173,7 @@ fn legacy_chain(d: &RepoDo) -> Result<bool, Error> {
 /// in-flight build pack (a NULL-push_id row the janitor never reaps), empty
 /// the scratch tables and all gc.* meta. Shared by begin_build's
 /// nothing-to-repack out and the mark's all-young early exit.
-fn wipe_all(d: &RepoDo, sql: &SqlStorage) -> Result<(), Error> {
+pub(crate) fn wipe_all(d: &RepoDo, sql: &SqlStorage) -> Result<(), Error> {
     if let Some(p) = d.meta_opt("gc.new_pack")? {
         exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![p.clone().into()])?;
         exec(
@@ -246,6 +246,16 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
     // resumes or sets the phase.
     if legacy_chain(d)? {
         return abort(d, &sql);
+    }
+    // R1/T3: a compact chain owns gc.* — a live one reschedules the mark
+    // behind the quiet window; an orphaned one is aborted losslessly and the
+    // mark falls through to its normal init in this same slice.
+    if d.meta_opt("gc.mode")?.as_deref() == Some("compact") {
+        if compact::orphaned(d, &sql)? {
+            compact::orphan_abort(d, &sql)?;
+        } else {
+            return Ok(SliceOutcome::Reschedule { run_at: now_ms() + d.gc_quiet_ms() });
+        }
     }
     if d.meta_opt("gc.started_at")?.is_none() {
         // first slice: refuse to overlap a chain already mid-flight
@@ -463,9 +473,37 @@ fn commit_ids(
     Ok(())
 }
 
+/// S4's fence, shared by every post-await write in consolidate and its
+/// callees in both modes: the PR1 heartbeat CAS plus `gc.chain == captured`
+/// (compact mode additionally requires `gc.new_pack == pos.pack`). A chain
+/// that moved on answers `false` — the caller stops as Done with no writes; a
+/// lost lease still errors `stale_lease`.
+pub(crate) fn chain_fence(
+    d: &RepoDo,
+    sql: &SqlStorage,
+    job: &Job,
+    chain: Option<&str>,
+    pack: &str,
+) -> Result<bool, Error> {
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
+    if d.meta_opt("gc.chain")?.as_deref() != chain {
+        return Ok(false);
+    }
+    if d.meta_opt("gc.mode")?.as_deref() == Some("compact")
+        && d.meta_opt("gc.new_pack")?.as_deref() != Some(pack)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// The 5.3 abort, shared by every arm: kill the build pack if one exists, drop all gc state,
-/// enqueue a fresh mark after the quiet window.
+/// enqueue a fresh mark after the quiet window. A compact chain's abort is
+/// lossless — it enqueues nothing; the next trigger restarts compaction.
 fn abort(d: &RepoDo, sql: &SqlStorage) -> Result<SliceOutcome, Error> {
+    let compact = d.meta_opt("gc.mode")?.as_deref() == Some("compact");
     if let Some(p) = d.meta_opt("gc.new_pack")? {
         exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![p.clone().into()])?;
         exec(
@@ -478,11 +516,13 @@ fn abort(d: &RepoDo, sql: &SqlStorage) -> Result<SliceOutcome, Error> {
         exec(sql, &format!("DELETE FROM {t}"), vec![])?;
     }
     exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
-    enqueue(sql, JobKind::GcMark, now_ms() + d.gc_quiet_ms(), "{}")?;
+    if !compact {
+        enqueue(sql, JobKind::GcMark, now_ms() + d.gc_quiet_ms(), "{}")?;
+    }
     Ok(SliceOutcome::Done)
 }
 
-enum Flow {
+pub(crate) enum Flow {
     Yield,
     Done,
     Retry(Error),
@@ -508,6 +548,15 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
     // build while a live chain actually reached the build phase — building
     // off a younger chain's half-filled marks would repack a wrong set
     if d.meta_opt("gc.phase")?.as_deref() != Some("build") {
+        return Ok(SliceOutcome::Done);
+    }
+    // S4: the chain this slice serves — captured before the first await;
+    // chain_fence fences every post-await write on it from here down
+    let chain = d.meta_opt("gc.chain")?;
+    // R7: a compact slice whose frozen cohort already broke aborts losslessly
+    // on entry — a lossless abort beats "marked entry lacks objects row" retries
+    if d.meta_opt("gc.mode")?.as_deref() == Some("compact") && !compact::cohort_live(d, &sql)? {
+        wipe_all(d, &sql)?;
         return Ok(SliceOutcome::Done);
     }
     let bucket = d.bucket()?;
@@ -558,9 +607,9 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
         let mut out = if pos.upload.is_empty() {
             let w = PackWriter::create(&bucket, &key, pos.total, d.obj_kind()?, &mut budget.req).await?;
             pos.upload = w.upload_id().await;
-            // CAS before write: the gc.pos persist must not land under a dead lease (A19)
-            if !super::heartbeat(&sql, job)? {
-                return Err(super::stale_lease());
+            // S4: the gc.pos persist must not land under a dead lease or a moved chain
+            if !chain_fence(d, &sql, job, chain.as_deref(), &pos.pack)? {
+                return Ok(SliceOutcome::Done);
             }
             // persist immediately: a kill before the first checkpoint would otherwise
             // leave the id invisible, and the orphan MPU would sit in R2 (~7d) instead
@@ -602,9 +651,9 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
             .into_iter()
             .flat_map(|r| r.blob)
             .collect();
-        // CAS before write: a stale slice must not delete the persisted tail (A19)
-        if !super::heartbeat(&sql, job)? {
-            return Err(super::stale_lease());
+        // S4: a stale or chain-outlived slice must not delete the persisted tail
+        if !chain_fence(d, &sql, job, chain.as_deref(), &pos.pack)? {
+            return Ok(SliceOutcome::Done);
         }
         exec(&sql, "DELETE FROM gc_tail", vec![])?;
         if pos.tail > 0 {
@@ -663,7 +712,7 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
             }
             pos.tail = 0;
         }
-        match build(d, &sql, &bucket, &key, out, &mut pos, job, budget).await? {
+        match build(d, &sql, &bucket, &key, out, &mut pos, job, budget, chain.as_deref()).await? {
             Flow::Yield => return Ok(SliceOutcome::Continue { cursor: "{}".into() }),
             Flow::Done => return Ok(SliceOutcome::Done),
             Flow::Retry(e) => return Err(e), // 4.4 backoff; second failure -> Rebuild
@@ -684,6 +733,7 @@ async fn build(
     pos: &mut Pos,
     job: &Job,
     budget: &mut SliceBudget,
+    chain: Option<&str>,
 ) -> Result<Flow, Error> {
     let cands: Vec<String> = exec(sql, "SELECT pack_id FROM marked ORDER BY pack_id", vec![])?
         .to_array::<P>()?
@@ -709,7 +759,7 @@ async fn build(
             // gc.pos would replay the same span every slice forever
             if let Some(f) = flush(
                 d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
-                true,
+                true, chain,
             )
             .await?
             {
@@ -725,8 +775,15 @@ async fn build(
                     Index(sql).insert_objects(&PackId(pos.pack.clone()), &staged)?;
                     staged.clear();
                     return match out.finish(&mut budget.req).await {
-                        Ok(meta) => finish_build(d, sql, pos, &meta, job),
-                        Err(e) => mpu_err(d, sql, bucket, key, pos, e, budget, job).await,
+                        Ok(meta) => {
+                            // R12: after the MPU completes, before the swap's final
+                            // fence — the pause a push or clone interleaves through
+                            if d.meta_opt("gc.mode")?.as_deref() == Some("compact") {
+                                crate::testhooks::failpoint_async(d, "gc.compact.before_swap").await?;
+                            }
+                            finish_build(d, sql, pos, &meta, job, chain)
+                        }
+                        Err(e) => mpu_err(d, sql, bucket, key, pos, e, budget, job, chain).await,
                     };
                 }
                 Some(cid) => {
@@ -775,7 +832,7 @@ async fn build(
                 // carries the undrained buffer into the next slice
                 if let Some(f) = flush(
                     d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job,
-                    budget, true,
+                    budget, true, chain,
                 )
                 .await?
                 {
@@ -826,7 +883,7 @@ async fn build(
                             // frag bytes already buffered go to gc_tail
                             if let Some(f) = flush(
                                 d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
-                                job, budget, true,
+                                job, budget, true, chain,
                             )
                             .await?
                             {
@@ -850,7 +907,7 @@ async fn build(
                         pos.frag = p.saturating_sub(l.offset);
                         if let Some(f) = flush(
                             d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,
-                            job, budget, false,
+                            job, budget, false, chain,
                         )
                         .await?
                         {
@@ -900,7 +957,7 @@ async fn build(
             // whole 90-entry batch (~1.4 GiB of buffered pack bytes) and OOM the isolate
             if let Some(f) = flush(
                 d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
-                false,
+                false, chain,
             )
             .await?
             {
@@ -908,11 +965,11 @@ async fn build(
             }
         }
         // a multi-MiB chunk loop can run past the 60 s straggler window on slow R2 —
-        // CAS-heartbeat so repair doesn't requeue a live consolidate into a duplicate
-        // slice, and a duplicate that lost the row stops before its next write (A19).
-        // It runs BEFORE the staged rows land — a stale slice must not write at all.
-        if !super::heartbeat(sql, job)? {
-            return Err(super::stale_lease());
+        // chain_fence keeps repair from requeueing a live consolidate into a duplicate
+        // slice, and a duplicate that lost the row or outlived its chain stops before
+        // its next write (A19/S4). It runs BEFORE the staged rows land.
+        if !chain_fence(d, sql, job, chain, &pos.pack)? {
+            return Ok(Flow::Done);
         }
         if staged.len() >= ROWS {
             Index(sql).insert_objects(&PackId(pos.pack.clone()), &staged)?;
@@ -920,7 +977,7 @@ async fn build(
         }
         if let Some(f) = flush(
             d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur, job, budget,
-            false,
+            false, chain,
         )
         .await?
         {
@@ -942,6 +999,7 @@ async fn build(
 /// continues without replaying. Without it a sparse-mark pack (≈1 read per entry)
 /// can never buffer a whole part inside the request budget: every slice would
 /// re-copy the same undrained span forever.
+#[allow(clippy::too_many_arguments)]
 async fn flush(
     d: &RepoDo,
     sql: &SqlStorage,
@@ -955,6 +1013,7 @@ async fn flush(
     job: &Job,
     budget: &mut SliceBudget,
     persist_tail: bool,
+    chain: Option<&str>,
 ) -> Result<Option<Flow>, Error> {
     let mut news: Vec<(u16, String)> = Vec::new();
     let mut st = None;
@@ -965,7 +1024,7 @@ async fn flush(
                 st = Some(s);
             }
             Ok(None) => break,
-            Err(e) => return mpu_err(d, sql, bucket, key, pos, e, budget, job).await.map(Some),
+            Err(e) => return mpu_err(d, sql, bucket, key, pos, e, budget, job, chain).await.map(Some),
         }
         crate::testhooks::failpoint(d, "gc.consolidate.after_part")?;
     }
@@ -975,10 +1034,10 @@ async fn flush(
         None if persist_tail => out.snapshot(),
         None => return Ok(None),
     };
-    // CAS before the checkpoint span's writes — a stale slice must not land
-    // rows, etags or the cursor under the replacement lease (A19)
-    if !super::heartbeat(sql, job)? {
-        return Err(super::stale_lease());
+    // S4 before the checkpoint span's writes — a stale or chain-outlived slice
+    // must not land rows, etags or the cursor under the replacement lease
+    if !chain_fence(d, sql, job, chain, &pos.pack)? {
+        return Ok(Some(Flow::Done));
     }
     Index(sql).insert_objects(&PackId(pos.pack.clone()), staged)?; // OR IGNORE: replay-safe
     staged.clear();
@@ -1062,10 +1121,10 @@ async fn flush(
     while spans.front().map(|s| s.off + s.len <= durable) == Some(true) {
         spans.pop_front();
     }
-    // checkpoint span: refresh the repair lease — CAS on it, so a stale slice
-    // that lost the row stops instead of heartbeating the new owner's started_at
-    if !super::heartbeat(sql, job)? {
-        return Err(super::stale_lease());
+    // checkpoint span: refresh the repair lease — the same S4 fence, so a
+    // stale or chain-outlived slice stops instead of heartbeating onward
+    if !chain_fence(d, sql, job, chain, &pos.pack)? {
+        return Ok(Some(Flow::Done));
     }
     Ok(None)
 }
@@ -1082,15 +1141,26 @@ async fn mpu_err(
     e: Error,
     budget: &mut SliceBudget,
     job: &Job,
+    chain: Option<&str>,
 ) -> Result<Flow, Error> {
     budget.req.charge(1)?;
     let head = bucket.inner.head(key).await?;
-    // CAS before write: the fails counter and the HEAD-recovery finish alike (A19)
-    if !super::heartbeat(sql, job)? {
-        return Err(super::stale_lease());
+    // S4: the fails counter and the HEAD-recovery finish fence alike
+    if !chain_fence(d, sql, job, chain, &pos.pack)? {
+        return Ok(Flow::Done);
     }
     if let Some(h) = head {
-        // complete() had already won
+        // R12: the same pause as the normal finish path — after the head
+        // await, before the swap's final fence
+        if d.meta_opt("gc.mode")?.as_deref() == Some("compact") {
+            crate::testhooks::failpoint_async(d, "gc.compact.before_swap").await?;
+        }
+        // complete() had already won. pos.lo/hi are already the full commit
+        // span here: a HEAD hit follows only a completed upload, and a replay
+        // from the last checkpoint stays under one part because the part size
+        // is constant (PART in production; the gc_part_bytes knob is
+        // test-only), so every commit the pack holds has already folded into
+        // the in-memory pos.
         let meta = PackMeta {
             pack: PackId(pos.pack.clone()),
             push_id: None,
@@ -1100,7 +1170,7 @@ async fn mpu_err(
             commit_hi: u64::try_from(pos.hi).unwrap_or(0),
             created_at: now_ms(),
         };
-        return finish_build(d, sql, pos, &meta, job);
+        return finish_build(d, sql, pos, &meta, job, chain);
     }
     let f = d.meta_i64("gc.fails").unwrap_or(0).saturating_add(1);
     put(d, "gc.fails", f.to_string())?;
@@ -1111,15 +1181,20 @@ async fn mpu_err(
 /// entries — otherwise wipe gc state and Done, because sweeping without a new pack would
 /// delete reachable objects.
 fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
-    // C3: a missing gc.refs_version means the chain was aborted since this row
-    // was enqueued — the abort already wiped the state, so there is nothing to
-    // build (a Storage error here wedged the job: retry, backoff, dead)
-    if d.meta_opt("gc.refs_version")?.is_none() {
-        return Ok(None);
-    }
-    if d.meta_i64("refs_version")? != d.meta_i64("gc.refs_version")? {
-        abort(d, sql)?;
-        return Ok(None);
+    // §2: compact mode skips the refs_version checks outright — it sets no
+    // gc.refs_version, and a moved version must not read as "aborted" here
+    let compact = d.meta_opt("gc.mode")?.as_deref() == Some("compact");
+    if !compact {
+        // C3: a missing gc.refs_version means the chain was aborted since this row
+        // was enqueued — the abort already wiped the state, so there is nothing to
+        // build (a Storage error here wedged the job: retry, backoff, dead)
+        if d.meta_opt("gc.refs_version")?.is_none() {
+            return Ok(None);
+        }
+        if d.meta_i64("refs_version")? != d.meta_i64("gc.refs_version")? {
+            abort(d, sql)?;
+            return Ok(None);
+        }
     }
     let cands = exec(
         sql,
@@ -1135,12 +1210,17 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
         unmarked |= i64::from(n) < c.count;
     }
     if total == 0 && !cands.is_empty() {
-        // nothing reachable in any candidate: no repack to write — sweep deletes them outright
-        exec(sql, "DELETE FROM gc_parts", vec![])?;
-        exec(sql, "DELETE FROM gc_tail", vec![])?;
-        exec(sql, "DELETE FROM meta WHERE key IN ('gc.pos','gc.new_pack','gc.fails')", vec![])?;
-        put(d, "gc.phase", "sweep")?;
-        enqueue(sql, JobKind::GcSweep, now_ms(), &chain_payload(d)?)?;
+        if compact {
+            // S11: a compact chain never enters the sweep phase — wipe and stop
+            wipe_all(d, sql)?;
+        } else {
+            // nothing reachable in any candidate: no repack to write — sweep deletes them outright
+            exec(sql, "DELETE FROM gc_parts", vec![])?;
+            exec(sql, "DELETE FROM gc_tail", vec![])?;
+            exec(sql, "DELETE FROM meta WHERE key IN ('gc.pos','gc.new_pack','gc.fails')", vec![])?;
+            put(d, "gc.phase", "sweep")?;
+            enqueue(sql, JobKind::GcSweep, now_ms(), &chain_payload(d)?)?;
+        }
         return Ok(None);
     }
     if !(cands.len() >= 2 || unmarked) {
@@ -1193,13 +1273,25 @@ fn wipe_build(d: &RepoDo, sql: &SqlStorage) -> Result<(), Error> {
     Ok(())
 }
 
-fn finish_build(d: &RepoDo, sql: &SqlStorage, pos: &Pos, meta: &PackMeta, job: &Job) -> Result<Flow, Error> {
+fn finish_build(
+    d: &RepoDo,
+    sql: &SqlStorage,
+    pos: &Pos,
+    meta: &PackMeta,
+    job: &Job,
+    chain: Option<&str>,
+) -> Result<Flow, Error> {
     // covers both callers — the normal finish path and mpu_err's HEAD-recovery
     crate::testhooks::failpoint(d, "gc.consolidate.before_finish")?;
-    // CAS before the live flip + sweep enqueue — a stale slice must not land
-    // either under a dead lease (A19)
-    if !super::heartbeat(sql, job)? {
-        return Err(super::stale_lease());
+    // §5: a compact chain swaps in place of the phase=sweep handoff — N goes
+    // live, the cohort dies, scratch wipes, no epoch bump, no gc_sweep row
+    if d.meta_opt("gc.mode")?.as_deref() == Some("compact") {
+        return compact::swap(d, sql, &pos.pack, meta, job, chain);
+    }
+    // S4 before the live flip + sweep enqueue — a stale or chain-outlived
+    // slice must not land either (A19)
+    if !chain_fence(d, sql, job, chain, &pos.pack)? {
+        return Ok(Flow::Done);
     }
     exec(
         sql,
@@ -1234,6 +1326,10 @@ pub async fn gc_sweep(d: &RepoDo, job: &Job) -> Result<SliceOutcome, Error> {
     }
     // C3: a sweep row from an aborted chain must not delete anything
     if stray(d, job)? {
+        return Ok(SliceOutcome::Done);
+    }
+    // §2 defence in depth: a compact chain never has a sweep phase — Done now
+    if d.meta_opt("gc.mode")?.as_deref() == Some("compact") {
         return Ok(SliceOutcome::Done);
     }
     // claim-only point: the slice never awaits, so a real death rolls the

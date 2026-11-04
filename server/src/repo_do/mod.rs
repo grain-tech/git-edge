@@ -247,6 +247,9 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/test/knob") if crate::testhooks::enabled(self) => crate::testhooks::set_knob(self, &body),
                 (Method::Post, "/_do/test/meta") if crate::testhooks::enabled(self) => crate::testhooks::set_meta(self, &body),
                 (Method::Post, "/_do/test/enqueue") if crate::testhooks::enabled(self) => crate::testhooks::enqueue_job(self, &body),
+                (Method::Post, "/_do/test/objects") if crate::testhooks::enabled(self) => crate::testhooks::objects_view(self),
+                (Method::Post, "/_do/test/pack_state") if crate::testhooks::enabled(self) => crate::testhooks::pack_state(self, &body),
+                (Method::Post, "/_do/test/kill_job") if crate::testhooks::enabled(self) => crate::testhooks::kill_job(self, &body),
                 _ => return Ok(None),
             }
             .map(Some)
@@ -286,6 +289,9 @@ impl DurableObject for RepoDo {
                 }
                 (Method::Post, "/_do/test/drop_pack") => {
                     return test_resp(crate::testhooks::drop_pack(self, &body).await);
+                }
+                (Method::Post, "/_do/test/pack_check") => {
+                    return test_resp(crate::testhooks::pack_check(self, &body).await);
                 }
                 _ => Err(Error::NotFound),
             },
@@ -622,7 +628,7 @@ impl RepoDo {
         self.env_i64(name, default)
     }
     /// Any integer knob: compiled-in default, `env.var` override, unparseable falls back.
-    fn env_i64(&self, name: &str, default: i64) -> i64 {
+    pub(crate) fn env_i64(&self, name: &str, default: i64) -> i64 {
         self.env
             .var(name)
             .ok()
@@ -1723,6 +1729,12 @@ impl RepoDo {
             if self.changes()? != 1 {
                 return Err(Error::Conflict("pack not in state ingesting".into()));
             }
+            // G4a: a pack went live — a completed cohort queues gc_compact at
+            // the earliest moment (the job dedups against a queued row).
+            // Best-effort: maintenance must not break the push that fed it.
+            if let Err(e) = jobs::compact::trigger(self) {
+                worker::console_log!("commit_push: compact trigger: {e}");
+            }
         }
         let head = self.meta("head")?;
         let sql = self.sql();
@@ -2396,8 +2408,10 @@ impl RepoDo {
             return Ok(None);
         };
         // must not exceed the janitor's dead-pack grace (jobs/janitor.rs
-        // GRACE_MS), else a signed URL could outlive its R2 object
-        const TTL: i64 = 3600;
+        // GRACE_MS), else a signed URL could outlive its R2 object — S9/R10:
+        // derived from the constant with a 10-minute margin, since compaction
+        // retires the single live pack more often than GC did
+        const TTL: i64 = crate::jobs::janitor::GRACE_MS / 1000 - 600;
         let exp = platform::now_ms() / 1000 + TTL;
         // the signature binds the opaque repo_id (carried as r=) — stronger than
         // the route name: a deleted+recreated repo gets a fresh id, so old sigs die
