@@ -130,6 +130,15 @@ struct PackRow {
     created_at: i64,
     push_id_null: i64,
 }
+#[derive(serde::Deserialize)]
+struct PushRow {
+    id: String,
+    state: String,
+}
+#[derive(serde::Deserialize)]
+struct N {
+    n: i64,
+}
 
 fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
     let jobs = d
@@ -154,6 +163,10 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
             vec![],
         )?
         .to_array::<PackRow>()?;
+    let pushes = d
+        .q("SELECT id,state FROM pushes ORDER BY id", vec![])?
+        .to_array::<PushRow>()?;
+    let rate_rows = d.q("SELECT COUNT(*) AS n FROM rate", vec![])?.one::<N>()?.n;
     Ok(serde_json::json!({
         "jobs": jobs.iter().map(|j| serde_json::json!({
             "id": j.id, "kind": j.kind, "state": j.state, "run_at": j.run_at,
@@ -165,6 +178,10 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
             "id": p.id, "state": p.state, "count": p.count,
             "created_at": p.created_at, "push_id_null": p.push_id_null != 0,
         })).collect::<Vec<_>>(),
+        "pushes": pushes.iter().map(|p| serde_json::json!({
+            "id": p.id, "state": p.state,
+        })).collect::<Vec<_>>(),
+        "rate_rows": rate_rows,
     }))
 }
 
@@ -175,8 +192,8 @@ pub fn jobs_view(d: &RepoDo) -> Result<Response, Error> {
 /// Lazily created by set_knob — deliberately NOT in the production schema list.
 const KNOBS_DDL: &str = "CREATE TABLE IF NOT EXISTS test_knobs(name TEXT PRIMARY KEY, value INTEGER)";
 
-/// Named integer knobs (slice_subreqs, gc_part_bytes) — read ONLY when the
-/// hooks flag is on; hooks off means no SQL at all (and no lazy table).
+/// Named integer knobs (slice_subreqs, gc_part_bytes, max_live_packs) — read
+/// ONLY when the hooks flag is on; hooks off means no SQL at all (and no lazy table).
 pub(crate) fn knob(d: &RepoDo, name: &str) -> Option<i64> {
     if !enabled(d) {
         return None;

@@ -57,6 +57,25 @@ def http(method, path, body=None, auth=True, raw=None):
         return e.code, e.read()
 
 
+def http_h(method, path, raw=None, content_type=None):
+    """Raw request -> (status, headers, body); header names lowercased. Same
+    auth and never-raises contract as http(), but the caller picks the
+    Content-Type for a raw body (default application/octet-stream)."""
+    base, cred = _endpoint()
+    req = urllib.request.Request(base + path, method=method)
+    if cred:
+        req.add_header("Authorization", cred)
+    data = None
+    if raw is not None:
+        data = raw
+        req.add_header("Content-Type", content_type or "application/octet-stream")
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=120) as r:
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+
 def admin(repo, method, path, body=None):
     st, data = http(method, "/%s/_admin/test/%s" % (repo, path), body)
     if st != 200:

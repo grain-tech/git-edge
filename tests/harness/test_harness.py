@@ -8,6 +8,7 @@ Deterministic by construction: manual mode means jobs move only when _step is
 called — no sleeps, no polling.
 """
 
+import json
 import os
 import sys
 import time
@@ -42,6 +43,34 @@ def drive_until_sweep(r, limit=12):
         if s["job"] and s["job"]["kind"] == "gc_sweep" and s["outcome"] == "done":
             return s
     raise AssertionError("GC chain never reached a completed gc_sweep")
+
+
+def stage_import(r):
+    """The conformance _admin/import flow: stage a local pack, begin the
+    import — queues import_pack; check/commit then run under step."""
+    r.commit_file("f", "import\n", "import")
+    tip = ge.git("rev-parse", "HEAD", cwd=r.dir).stdout.strip()
+    st = ge.import_stage(r.name, ge.pack_file(r))
+    body = ge.import_begin(
+        r.name,
+        st["push"],
+        [{"key": st["key"], "bytes": st["bytes"]}],
+        [{"old": "0" * len(tip), "new": tip, "name": "refs/heads/main"}],
+    )
+    assert b"queued" in body
+    return tip, st["push"]
+
+
+def step_until(r, kind, outcomes, limit=16, before_each=None):
+    for _ in range(limit):
+        if before_each is not None:
+            before_each()
+        s = ge.step(r.name, kind)
+        if s["outcome"] in outcomes:
+            return s
+    raise AssertionError(
+        "%s never reached %s in %d steps: %r" % (kind, outcomes, limit, s["jobs"])
+    )
 
 
 class HarnessTests(unittest.TestCase):
@@ -273,7 +302,7 @@ class HarnessTests(unittest.TestCase):
     def _failpoint_case(self, i, name, kind, how):
         r = repo("j-%d" % i)
         if how == "import":
-            tip, push = self._stage_import(r)
+            tip, push = stage_import(r)
         else:
             if how == "consolidate_parts":
                 # dev R2 enforces the real 5 MiB non-final part minimum — the
@@ -287,9 +316,9 @@ class HarnessTests(unittest.TestCase):
                 ge.git("commit", "-qm", "big", cwd=r.dir)
             tip = seed_gc_repo(r)
             if how in ("consolidate", "consolidate_parts", "presweep"):
-                self._step_until(r, "gc_mark", {"done"})
+                step_until(r, "gc_mark", {"done"})
             if how == "presweep":
-                self._step_until(r, "gc_consolidate", {"done"})
+                step_until(r, "gc_consolidate", {"done"})
         ge.failpoint(r.name, name, "crash", 1)
         # claim-only points never await inside the slice — a real death there
         # rolls the whole span back, so after the crash ONLY the job row may
@@ -304,7 +333,7 @@ class HarnessTests(unittest.TestCase):
                 snap["push_state"] = ge.import_status(r.name, push).get("push_state")
 
         claim_only = name in ("gc.sweep.before", "import.check.done")
-        s = self._step_until(
+        s = step_until(
             r, kind, {"crashed"}, before_each=take_snapshot if claim_only else None
         )
         self.assertIn("failpoint-crash:%s" % name, s["error"] or "")
@@ -331,7 +360,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(j["strands"], 1)
         ge.failpoint(r.name, name, "off")
         if kind == "import_pack":
-            self._step_until(r, kind, {"done"}, limit=100)
+            step_until(r, kind, {"done"}, limit=100)
             st = ge.import_status(r.name, push)
             self.assertEqual(st.get("push_state"), "committed", "%r" % st)
         else:
@@ -346,31 +375,235 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(ge.git("rev-parse", "main", cwd=clone).stdout.strip(), tip)
         ge.git("fsck", "--strict", cwd=clone)
 
-    def _stage_import(self, r):
-        """The conformance _admin/import flow: stage a local pack, begin the
-        import — queues import_pack; check/commit then run under step."""
-        r.commit_file("f", "import\n", "import")
-        tip = ge.git("rev-parse", "HEAD", cwd=r.dir).stdout.strip()
-        st = ge.import_stage(r.name, ge.pack_file(r))
-        body = ge.import_begin(
-            r.name,
-            st["push"],
-            [{"key": st["key"], "bytes": st["bytes"]}],
-            [{"old": "0" * len(tip), "new": tip, "name": "refs/heads/main"}],
-        )
-        self.assertIn(b"queued", body)
-        return tip, st["push"]
 
-    def _step_until(self, r, kind, outcomes, limit=16, before_each=None):
-        for _ in range(limit):
-            if before_each is not None:
-                before_each()
-            s = ge.step(r.name, kind)
-            if s["outcome"] in outcomes:
-                return s
-        raise AssertionError(
-            "%s never reached %s in %d steps: %r" % (kind, outcomes, limit, s["jobs"])
+class AdmissionTests(unittest.TestCase):
+    """PR3 (G2b): the live-pack admission cap.
+
+    When live+ingesting packs reach `max_live_packs` (hook-gated test knob;
+    GE_MAX_LIVE_PACKS env, default 1000), a NEW push begin or import start
+    must refuse with HTTP 503 + Retry-After: 60 and write nothing of its own.
+    An already-admitted operation (an open push re-begin, a queued import's
+    repeated start) is never refused, and a finished janitor re-queues a
+    gc_mark while the repo sits at the cap so the refusal can clear."""
+
+    def setUp(self):
+        self._repos = []
+
+    def tearDown(self):
+        for r in self._repos:
+            ge.knob(r.name, "max_live_packs", None)
+
+    def _repo(self, name):
+        r = repo(name)
+        self._repos.append(r)
+        return r
+
+    def live(self, r):
+        """Packs counted by the cap: state live or ingesting."""
+        return sum(1 for p in ge.jobs(r.name)["packs"] if p["state"] in ("live", "ingesting"))
+
+    def snapshot(self, r):
+        """(packs, jobs, pushes, rate_rows, ls-remote) — a refused request
+        must not move any of it."""
+        v = ge.jobs(r.name)
+        packs = sorted((p["id"], p["state"]) for p in v["packs"])
+        jobs = sorted((j["kind"], j["state"], j["run_at"]) for j in v["jobs"])
+        pushes = sorted((p["id"], p["state"]) for p in v["pushes"])
+        return packs, jobs, pushes, v["rate_rows"], ge.git("ls-remote", r.url).stdout
+
+    def test_push_at_cap_503_retry_after_no_state_change(self):
+        """Pins: at the cap, receive-pack is refused at push_begin with a real
+        HTTP 503 + Retry-After: 60 — before even the rate row is written — so
+        packs/jobs/refs are identical after a raw POST and after `git push`."""
+        r = self._repo("push-at-cap")
+        seed_gc_repo(r)
+        ge.knob(r.name, "max_live_packs", self.live(r))
+        tip = r.commit_file("f", "capped\n", "capped")
+        cmd = ("%s %s refs/heads/capped\0report-status object-format=sha1\n" % ("0" * 40, tip)).encode()
+        body = b"%04x" % (len(cmd) + 4) + cmd + b"0000" + ge.pack_file(r)
+        snap = self.snapshot(r)
+        st, hdrs, _ = ge.http_h(
+            "POST",
+            "/%s/git-receive-pack" % r.name,
+            raw=body,
+            content_type="application/x-git-receive-pack-request",
         )
+        self.assertEqual(st, 503)
+        self.assertEqual(hdrs.get("retry-after"), "60")
+        self.assertEqual(self.snapshot(r), snap)
+        res = ge.git("push", r.url, "HEAD:refs/heads/capped2", cwd=r.dir, check=False)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("HTTP 503", ge.redact(res.stderr + res.stdout))
+        self.assertEqual(self.snapshot(r), snap)
+
+    def test_import_at_cap_503_no_state_change(self):
+        """Pins: import start is capped like push begin — with the pack staged
+        BEFORE the cap is set, the _admin/import begin gets 503 + Retry-After;
+        no import_pack job is queued and no pack row appears."""
+        r = self._repo("import-at-cap")
+        r.commit_file("f", "seed\n", "seed")
+        r.push()
+        tip = r.commit_file("f", "import\n", "import")
+        st = ge.import_stage(r.name, ge.pack_file(r))  # staged before the cap
+        ge.knob(r.name, "max_live_packs", self.live(r))
+        snap = self.snapshot(r)
+        body = json.dumps(
+            {
+                "push": st["push"],
+                "parts": [{"key": st["key"], "bytes": st["bytes"]}],
+                "commands": [{"old": "0" * len(tip), "new": tip, "name": "refs/heads/main"}],
+            }
+        ).encode()
+        code, hdrs, _ = ge.http_h(
+            "POST",
+            "/%s/_admin/import" % r.name,
+            raw=body,
+            content_type="application/json",
+        )
+        self.assertEqual(code, 503)
+        self.assertEqual(hdrs.get("retry-after"), "60")
+        self.assertEqual(self.snapshot(r), snap)
+
+    def test_below_cap_push_succeeds(self):
+        """Pins the lower edge: one slot of headroom lets a push through and
+        adds exactly one live pack."""
+        r = self._repo("below-cap")
+        seed_gc_repo(r)
+        n = self.live(r)
+        ge.knob(r.name, "max_live_packs", n + 1)
+        r.commit_file("f", "more\n", "more")
+        r.push()
+        self.assertEqual(self.live(r), n + 1)
+
+    def test_delete_only_push_at_cap_refused(self):
+        """The delete-only exemption is gone (H13): at the cap even an
+        all-delete push gets the same 503 — the ref stays, nothing moves."""
+        r = self._repo("delete-at-cap")
+        r.commit_file("f", "seed\n", "seed")
+        r.push()
+        r.push("HEAD:refs/heads/side")
+        ge.knob(r.name, "max_live_packs", self.live(r))
+        snap = self.snapshot(r)
+        res = ge.git("push", r.url, ":refs/heads/side", cwd=r.dir, check=False)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("HTTP 503", ge.redact(res.stderr + res.stdout))
+        self.assertIn("refs/heads/side", ge.git("ls-remote", r.url).stdout)
+        self.assertEqual(self.snapshot(r), snap)
+
+    def test_janitor_requeues_gc_when_capped(self):
+        """H12: a capped repo writes nothing on refusal, so nothing else would
+        ever queue the GC that recovers it — a finished janitor must enqueue a
+        gc_mark while the count sits at/above the cap with none in flight."""
+        r = self._repo("janitor-requeue")
+        r.commit_file("f", "seed\n", "seed")
+        r.push()  # the ref commit queued a gc_mark
+        v = {}
+        for _ in range(40):
+            v = ge.jobs(r.name)
+            if not any(
+                j["kind"].startswith("gc_") and j["state"] in ("queued", "running")
+                for j in v["jobs"]
+            ):
+                break
+            ge.step(r.name)
+        else:
+            self.fail("gc_* jobs never drained: %r" % v["jobs"])
+        # uncapped, a finished janitor must not queue a gc_mark — the requeue
+        # is gated on at_pack_cap
+        step_until(r, "janitor", {"done"}, limit=8)
+        self.assertFalse(any(
+            j["kind"] == "gc_mark" and j["state"] in ("queued", "running")
+            for j in ge.jobs(r.name)["jobs"]))
+        # cap = 1: one live pack survives any GC, so the repo stays at the cap
+        ge.knob(r.name, "max_live_packs", 1)
+        self.assertFalse(any(
+            j["kind"] == "gc_mark" and j["state"] in ("queued", "running")
+            for j in ge.jobs(r.name)["jobs"]))
+        step_until(r, "janitor", {"done"}, limit=8)
+        self.assertTrue(any(
+            j["kind"] == "gc_mark" and j["state"] == "queued"
+            for j in ge.jobs(r.name)["jobs"]))
+
+    def test_rebegin_open_staged_push_at_cap_succeeds(self):
+        """I1: every part of a staged import re-begins ONE open push. A
+        re-begin is a no-op on an already-admitted push, so it passes even at
+        the cap — admission applies only to a NEW push row."""
+        r = self._repo("rebegin-at-cap")
+        r.commit_file("f", "seed\n", "seed")
+        r.push()  # one live pack, so live(r) is a real cap
+        st = ge.import_stage(r.name, ge.pack_file(r))  # first part, uncapped
+        ge.knob(r.name, "max_live_packs", self.live(r))
+        code, _, _ = ge.http_h(
+            "POST",
+            "/%s/_admin/import/stage?push=%s&part=p2" % (r.name, st["push"]),
+            raw=ge.pack_file(r),
+        )
+        self.assertEqual(code, 200)
+
+    def test_ingesting_pack_counts_toward_cap(self):
+        """An 'ingesting' pack consumes cap capacity: a staged import's planted
+        pack row (manual mode keeps it 'ingesting' — the job never runs unless
+        stepped) counts toward live+ingesting, so a new push is refused."""
+        r = self._repo("ingesting-counts")
+        stage_import(r)  # stage + begin while uncapped
+        v = ge.jobs(r.name)
+        self.assertEqual(
+            sum(1 for p in v["packs"] if p["state"] == "ingesting"),
+            1,
+            "%r" % v["packs"],
+        )
+        ge.knob(r.name, "max_live_packs", self.live(r))  # counts the ingesting row
+        res = ge.git("push", r.url, "HEAD:refs/heads/side", cwd=r.dir, check=False)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("HTTP 503", ge.redact(res.stderr + res.stdout))
+
+    def test_stage_at_cap_503(self):
+        """The stage route's push/begin is capped too: a raw POST to
+        _admin/import/stage at the cap is 503 + Retry-After: 60."""
+        r = self._repo("stage-at-cap")
+        r.commit_file("f", "seed\n", "seed")
+        r.push()
+        ge.knob(r.name, "max_live_packs", self.live(r))
+        code, hdrs, _ = ge.http_h("POST", "/%s/_admin/import/stage" % r.name, raw=b"pack")
+        self.assertEqual(code, 503)
+        self.assertEqual(hdrs.get("retry-after"), "60")
+
+    def test_large_push_at_cap_503(self):
+        """A push above http.postBuffer is streamed chunked — the 503 must
+        still reach git (the status is answered before the upload drains)."""
+        r = self._repo("large-at-cap")
+        r.commit_file("f", "seed\n", "seed")
+        r.push()
+        with open(os.path.join(r.dir, "big"), "wb") as f:
+            f.write(os.urandom(64 << 10))  # incompressible — the pack can't shrink
+        ge.git("add", "big", cwd=r.dir)
+        ge.git("commit", "-qm", "big", cwd=r.dir)
+        ge.knob(r.name, "max_live_packs", self.live(r))
+        res = ge.git(
+            "-c", "http.postBuffer=1024",
+            "push", r.url, "HEAD:refs/heads/big",
+            cwd=r.dir, check=False,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("HTTP 503", ge.redact(res.stderr + res.stdout))
+
+    def test_recovers_after_gc_drops_count(self):
+        """Pins that the cap is a count, not a ban: a push refused at the cap
+        succeeds unchanged once a GC cycle sweeps the dead pack below it, and
+        the fsck oracle stays ok."""
+        r = self._repo("cap-recovers")
+        seed_gc_repo(r)  # 2 live packs; commit "two" is the garbage
+        cap = self.live(r)
+        ge.knob(r.name, "max_live_packs", cap)
+        r.commit_file("f", "new\n", "new")
+        res = ge.git("push", r.url, "HEAD:main", cwd=r.dir, check=False)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("HTTP 503", ge.redact(res.stderr + res.stdout))
+        drive_until_sweep(r, limit=40)
+        self.assertLess(self.live(r), cap)
+        r.push()
+        f = ge.fsck(r.name, "all")
+        self.assertTrue(f["ok"], "%r %r" % (f["missing"], f["corrupt"]))
 
 
 if __name__ == "__main__":

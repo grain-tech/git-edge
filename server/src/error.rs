@@ -16,6 +16,9 @@ pub enum Error {
     Gone,
     /// Push rate limit (A27): carries the Retry-After hint in seconds.
     RateLimit(u32),
+    /// G2b live-pack admission cap: the server is shedding work for a while;
+    /// carries the Retry-After hint in seconds.
+    Busy(u32),
     Storage(String),
     Internal(String),
 }
@@ -33,6 +36,7 @@ impl std::fmt::Display for Error {
             Error::Limit(m) => write!(f, "limit exceeded: {m}"),
             Error::Gone => write!(f, "repository deleted"),
             Error::RateLimit(s) => write!(f, "rate limited, retry in {s}s"),
+            Error::Busy(s) => write!(f, "server busy, retry in {s}s"),
             Error::Storage(m) => write!(f, "storage error: {m}"),
             Error::Internal(m) => write!(f, "internal error: {m}"),
         }
@@ -77,6 +81,7 @@ impl Error {
             Error::Storage(_) => "storage",
             Error::Gone => "gone",
             Error::RateLimit(_) => "ratelimit",
+            Error::Busy(_) => "busy",
             Error::Internal(_) => "internal",
         }
     }
@@ -112,6 +117,7 @@ impl Error {
                     Some("budget") => Error::Budget,
                     Some("limit") => Error::Limit(msg),
                     Some("ratelimit") => Error::RateLimit(e.retry_after.unwrap_or(60)),
+                    Some("busy") => Error::Busy(e.retry_after.unwrap_or(60)),
                     _ => Error::Storage(msg),
                 }
             }
@@ -130,6 +136,7 @@ impl Error {
             Error::Budget => "request budget exhausted".into(),
             Error::Gone => "repository deleted".into(),
             Error::RateLimit(s) => format!("rate limit exceeded, retry in {s}s"),
+            Error::Busy(s) => format!("server busy, retry in {s}s"),
         }
     }
     /// The client-safe form: Internal/Storage details (R2 keys, SQL errors) stay in the
@@ -160,6 +167,7 @@ impl Error {
             Error::Conflict(_) => 409,
             Error::Budget | Error::Limit(_) => 413,
             Error::RateLimit(_) => 429,
+            Error::Busy(_) => 503,
             Error::Unpack(_) | Error::Storage(_) | Error::Internal(_) => 500,
         }
     }
@@ -204,7 +212,7 @@ pub fn respond(r: Result<Response, Error>, git_pkt: bool, subreqs: u32) -> worke
             if matches!(e, Error::Auth) {
                 resp.headers_mut().set("WWW-Authenticate", "Basic realm=\"git-edge\"").ok();
             }
-            if let Error::RateLimit(secs) = e {
+            if let Error::RateLimit(secs) | Error::Busy(secs) = e {
                 resp.headers_mut().set("Retry-After", &secs.max(1).to_string()).ok();
             }
             stamp_subrequests(&mut resp, subreqs);

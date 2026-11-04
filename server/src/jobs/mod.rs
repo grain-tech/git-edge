@@ -463,6 +463,24 @@ fn land_outcome(
             if fenced("DELETE FROM jobs WHERE id=? AND state='running' AND lease=?", vec![])? {
                 if job.kind == JobKind::Janitor {
                     enqueue(&d.sql(), JobKind::Janitor, now + 15 * 60 * 1000, "{}")?;
+                    // H12: a capped repo writes nothing on refusal, so nothing
+                    // else would ever queue the GC that recovers it — a finished
+                    // janitor tops up the chain while the cap holds.
+                    #[derive(serde::Deserialize)]
+                    struct N {
+                        n: i64,
+                    }
+                    let gc_in_flight = d
+                        .q(
+                            "SELECT COUNT(*) AS n FROM jobs WHERE kind=? AND state IN ('queued','running')",
+                            vec![V::from(JobKind::GcMark.as_str())],
+                        )?
+                        .one::<N>()?
+                        .n
+                        > 0;
+                    if d.at_pack_cap()? && !gc_in_flight {
+                        enqueue(&d.sql(), JobKind::GcMark, now, "{}")?;
+                    }
                 }
                 if job.kind == JobKind::GcSweep {
                     // chain completed — clear the resurrection counters repair uses

@@ -927,14 +927,31 @@ async fn import_begin(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
                 return Err(e);
             }
         }
-        let out: serde_json::Value = stub_json(
+        // a refused start must not leak the internal open push row — close it
+        // out exactly like an owner_claim failure above
+        let out: serde_json::Value = match stub_json(
             &stub,
             route,
             "/_do/import/start",
             &serde_json::json!({ "push": push.0, "pack": pack.0, "url": url }),
             &mut budget,
         )
-        .await?;
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let _: serde_json::Value = stub_json(
+                    &stub,
+                    route,
+                    "/_do/push/abort",
+                    &serde_json::json!({ "push_id": push.0 }),
+                    &mut budget,
+                )
+                .await
+                .unwrap_or_default();
+                return Err(e);
+            }
+        };
         return git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json");
     }
     let ok_id = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
@@ -1078,10 +1095,11 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
     match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, admin, spend).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
-            // A27: a throttled push answers a real HTTP 429 + Retry-After, not an
-            // in-band unpack error — and skips the drain, since shedding load is the
-            // point (a client still mid-upload may see a reset instead of the 429).
-            if matches!(e, Error::RateLimit(_)) {
+            // A27/G2b: a throttled or over-cap push answers a real HTTP
+            // 429/503 + Retry-After, not an in-band unpack error — and skips
+            // the drain, since shedding load is the point (a client still
+            // mid-upload may see a reset instead of the status).
+            if matches!(e, Error::RateLimit(_) | Error::Busy(_)) {
                 return Err(e);
             }
             body.drain().await; // finish the client's upload before answering (see drain)

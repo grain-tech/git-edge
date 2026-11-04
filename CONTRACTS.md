@@ -917,6 +917,30 @@ Continuing the audit-fix numbering (last: A16).
   load is the point (a client still mid-upload may see a reset instead).
   Counters are per repo per credential. This is abuse damping, not metering:
   zone-level Cloudflare rate-limit rules are the heavy hammer.
+- **A27b. Live-pack admission cap (new, G2b).** Before the push row exists —
+  ahead of even A27's rate insert, so a refusal writes nothing of its own
+  (boot's `jobs::repair` maintenance may still have run) — `/_do/push/begin`
+  counts `packs.state IN ('live','ingesting')`; at `GE_MAX_LIVE_PACKS` (default
+  1000; `<= 0` disables; an enabled env value is floored at 2) it returns
+  `busy` + `retry_after`, which surfaces as
+  HTTP 503 with `Retry-After: 60` and no drain, exactly like A27's arm.
+  Admission applies only to a NEW operation: re-beginning an existing open
+  push (a staged import's next part) allocates no push or pack, so it bypasses
+  G2b admission — it stays subject to A27's rate_check and can still see a
+  429 — and `/_do/import/start` runs the same check after its same-push
+  idempotency lookup, before its first write — an import plants an
+  `ingesting` pack. Ref-only creates make no pack row at all (`pack/run`
+  returns none for a count-0 pack) but are still capped, conservatively —
+  admission runs before the body is read. The cap is soft: pack rows appear
+  only at `/_do/push/index` and `import/start`, so concurrent begins may
+  overshoot by at most the 64-open-push bound, plus one GC build pack. The
+  count drops through a GC cycle or the janitor reaping stale ingesting
+  packs (the 1 h push timeout plus up to 15 min to the next pass), and a
+  finished janitor enqueues a `gc_mark` whenever the repo sits at the cap
+  with none queued or running — refused requests write nothing, so that
+  background pass is what guarantees recovery. `Retry-After: 60` is a
+  polling hint, not a recovery estimate. Tests steer it through the
+  hook-gated `max_live_packs` knob.
 - **A28. Advertisement memoization (extends 1.3).** The DO memoizes the refs
   snapshot — head, ref rows, and the rendered `/_do/refs` JSON body — keyed on
   `refs_version`, plus `/_do/ls-refs` response bytes per (refs_version, request

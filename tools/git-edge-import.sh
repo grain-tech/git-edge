@@ -152,7 +152,7 @@ est_slice() { # lo hi [prev-sha]
     | awk '{s+=$1; n++} END {print s+0, n+0}'
 }
 
-# push one slice with 429 retry; return 2 on non-fast-forward, 1 other failure
+# push one slice with 429/503 retry; return 2 on non-fast-forward, 1 other failure
 push_slice() { # sha branch
   local attempt=1
   while :; do
@@ -162,8 +162,12 @@ push_slice() { # sha branch
     if grep -qi 'non-fast-forward\|fetch first\|stale info' "$PLOG"; then
       return 2
     fi
-    if grep -q '429' "$PLOG" && [ "$attempt" -lt 4 ]; then
-      note "push rate-limited (HTTP 429) — sleeping 65s, retry $attempt/3"
+    # 429 = push rate limit, 503 = live-pack admission cap — both carry
+    # Retry-After, so the same wait-and-retry applies
+    if grep -q 'HTTP 429\|HTTP 503' "$PLOG" && [ "$attempt" -lt 4 ]; then
+      note "push throttled ($(grep -o 'HTTP 429\|HTTP 503' "$PLOG" | head -1)) — sleeping 65s, retry $attempt/3"
+      grep -q 'HTTP 503' "$PLOG" \
+        && note "the repo is at its live-pack cap — if the retries run out, re-run later"
       sleep 65; attempt=$((attempt + 1)); continue
     fi
     return 1
