@@ -51,6 +51,21 @@ const WINDOW: u64 = 8 << 20;
 const CACHE: usize = 48 << 20; // 16 MiB resolved LRU + 32 MiB external bases as one cache
 const MAX_DEPTH: usize = 64; // git's default delta depth is 50
 const MAX_CHAIN_BYTES: u64 = 64 << 20; // chain holds raw compressed delta bodies
+/// Rows per push_links INSERT; it keeps one statement at <= 90 bound params,
+/// A6's 90-batch headroom convention under the 100 guard (50 rows = 100 params
+/// was legal but had zero headroom).
+const LINKS_CHUNK: usize = 45;
+
+/// One chunked push_links statement + its bound args (push_id + sha per row).
+fn links_insert(push: &str, chunk: &[ObjectId]) -> (String, Vec<worker::SqlStorageValue>) {
+    let marks = std::iter::repeat("(?,?)").take(chunk.len()).collect::<Vec<_>>().join(",");
+    let mut args = Vec::with_capacity(chunk.len() * 2);
+    for id in chunk {
+        args.push(worker::SqlStorageValue::from(push));
+        args.push(worker::SqlStorageValue::from(id.to_string().as_str()));
+    }
+    (format!("INSERT OR IGNORE INTO push_links(push_id,sha) VALUES{marks}"), args)
+}
 
 fn unpack(m: impl Into<String>) -> Error {
     Error::Unpack(m.into())
@@ -514,18 +529,9 @@ impl JobSink<'_> {
         if self.links_buf.is_empty() {
             return Ok(());
         }
-        for chunk in self.links_buf.chunks(50) {
-            let marks = std::iter::repeat("(?,?)").take(chunk.len()).collect::<Vec<_>>().join(",");
-            let mut args = Vec::with_capacity(chunk.len() * 2);
-            for id in chunk {
-                args.push(worker::SqlStorageValue::from(self.push));
-                args.push(worker::SqlStorageValue::from(id.to_string().as_str()));
-            }
-            crate::store::exec(
-                self.sql,
-                &format!("INSERT OR IGNORE INTO push_links(push_id,sha) VALUES{marks}"),
-                args,
-            )?;
+        for chunk in self.links_buf.chunks(LINKS_CHUNK) {
+            let (q, args) = links_insert(self.push, chunk);
+            crate::store::exec(self.sql, &q, args)?;
         }
         self.links_buf.clear();
         Ok(())
@@ -1070,4 +1076,17 @@ pub fn extract_links(kind: Kind, data: &[u8], obj_kind: H) -> Result<Vec<ObjectI
         Kind::Blob => {}
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_chunk_respects_a6_batch() {
+        let chunk = vec![ObjectId::null(H::Sha1); LINKS_CHUNK];
+        let (q, args) = links_insert("push", &chunk);
+        assert!(args.len() <= 90);
+        assert_eq!(q.matches("(?,?)").count(), LINKS_CHUNK);
+    }
 }
