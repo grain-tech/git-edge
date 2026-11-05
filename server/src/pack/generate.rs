@@ -389,11 +389,11 @@ pub async fn send_set(
 }
 
 fn exec_refs_tags(sql: &worker::SqlStorage) -> Result<Vec<TagPair>, Error> {
-    sql.exec(
+    crate::store::exec(
+        sql,
         "SELECT target, peeled FROM refs WHERE name LIKE 'refs/tags/%' AND peeled IS NOT NULL",
-        None,
-    )
-    .map_err(|e| Error::Storage(e.to_string()))?
+        vec![],
+    )?
     .to_array::<TagPair>()
     .map_err(|e| Error::Storage(e.to_string()))
 }

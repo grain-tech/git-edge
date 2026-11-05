@@ -40,15 +40,14 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
     // Phase A — the R2 wipe. Skipped when the cursor says it finished, when a
     // crashed final span already removed `meta` (repo_id is the prefix source),
     // or when a completed delete_all took the schema with it.
-    let have_meta = !sql
-        .exec(
-            "SELECT 1 AS n FROM sqlite_master WHERE type='table' AND name='meta'",
-            Some(vec![]),
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?
-        .to_array::<N>()
-        .map_err(|e| Error::Storage(e.to_string()))?
-        .is_empty();
+    let have_meta = !crate::store::exec(
+        &sql,
+        "SELECT 1 AS n FROM sqlite_master WHERE type='table' AND name='meta'",
+        vec![],
+    )?
+    .to_array::<N>()
+    .map_err(|e| Error::Storage(e.to_string()))?
+    .is_empty();
     let r2_done =
         job.cursor.as_deref() == Some("wipe") || !have_meta || d.meta_opt("repo_id")?.is_none();
     if !r2_done {
@@ -110,12 +109,10 @@ async fn wipe(d: &RepoDo, job: &Job, sql: &SqlStorage) -> Result<SliceOutcome, E
     // before the fenced Done ran — recreate so the deletes below still parse
     schema::migrate(sql)?;
     for t in TABLES {
-        sql.exec(&format!("DELETE FROM {t}"), Some(vec![]))
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        crate::store::exec(sql, &format!("DELETE FROM {t}"), vec![])?;
     }
     // no janitor/gc row may resurrect into a half-wiped repo — every job but this one
-    sql.exec("DELETE FROM jobs WHERE id <> ?", Some(vec![V::from(job.id)]))
-        .map_err(|e| Error::Storage(e.to_string()))?;
+    crate::store::exec(sql, "DELETE FROM jobs WHERE id <> ?", vec![V::from(job.id)])?;
     // kill the pending alarm before the wipe: a re-fire after the schema is gone
     // would fail boot("no headers") and retry forever; rearm's no-queued-rows
     // delete_alarm covers the other orderings

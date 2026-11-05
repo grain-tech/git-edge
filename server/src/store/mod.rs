@@ -13,6 +13,8 @@ use crate::platform;
 use crate::ReqBudget;
 
 pub const PART: usize = 8 << 20; // 6.4: every part exactly 8 MiB except the last
+/// R2's minimum non-final part — a shrunken test part may approach, never pass below.
+pub const PART_MIN: usize = 5 << 20;
 pub const MAX_OBJECT: u64 = 16 << 20; // A7: single-object cap, inflated
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -100,6 +102,44 @@ pub fn kind_of(k: u8) -> Result<Kind, Error> {
         3 => Ok(Kind::Blob),
         4 => Ok(Kind::Tag),
         k => Err(Error::Internal(format!("bad kind {k} in objects"))),
+    }
+}
+
+/// hex -> ObjectId at a data boundary — bad hex is Protocol (client input and
+/// stored rows alike). Re-exported as repo_do::oid for its many call sites.
+pub fn oid(hex: &str) -> Result<ObjectId, Error> {
+    ObjectId::from_hex(hex.as_bytes()).map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// A row of the canonical objects(-join-packs) SELECT — sha,pack_id,idx,offset,
+/// len,kind,size as stored. `loc` is the single row -> (ObjectId, ObjLoc)
+/// converter for readers that need R2 locations (GC mark/build, test fsck).
+#[derive(Deserialize)]
+pub struct ObjSqlRow {
+    pub sha: String,
+    pub pack_id: String,
+    pub idx: i64,
+    pub offset: i64,
+    pub len: i64,
+    pub kind: i64,
+    pub size: i64,
+}
+impl ObjSqlRow {
+    pub fn loc(&self) -> Result<(ObjectId, ObjLoc), Error> {
+        let u = |n: i64| -> Result<u64, Error> {
+            u64::try_from(n).map_err(|_| Error::Internal("negative integer in objects".into()))
+        };
+        Ok((
+            oid(&self.sha)?,
+            ObjLoc {
+                pack: PackId(self.pack_id.clone()),
+                idx: u32::try_from(self.idx).map_err(|_| Error::Internal("idx".into()))?,
+                offset: u(self.offset)?,
+                len: u32::try_from(self.len).map_err(|_| Error::Internal("len".into()))?,
+                kind: kind_of(u8::try_from(self.kind).map_err(|_| Error::Internal("kind".into()))?)?,
+                size: u(self.size)?,
+            },
+        ))
     }
 }
 
@@ -202,19 +242,25 @@ pub mod codec {
         Ok((kind, e.decompressed_size, e.header_size()))
     }
     pub fn decode_entry(bytes: &[u8]) -> Result<(Kind, Vec<u8>), Error> {
+        decode_entry_counted(bytes).map(|(k, d, _)| (k, d))
+    }
+    /// (kind, data, consumed bytes incl. header): the fsck oracle verifies the
+    /// entry fills its indexed extent exactly — the loose form stays for
+    /// callers that only need the payload.
+    pub fn decode_entry_counted(bytes: &[u8]) -> Result<(Kind, Vec<u8>, usize), Error> {
         let (kind, size, hlen) = entry_header(bytes)?;
         if size > MAX_OBJECT {
             return Err(Error::Limit("object too large (16 MiB max)".into()));
         }
         let z = bytes.get(hlen..).ok_or_else(|| Error::Storage("truncated entry".into()))?;
         let mut out = vec![0u8; usize::try_from(size).map_err(|_| Error::Limit("size".into()))?];
-        let (status, _in, n) = gix_zlib::Inflate::default()
+        let (status, used, n) = gix_zlib::Inflate::default()
             .once(z, &mut out)
             .map_err(|e| Error::Storage(format!("inflate: {e}")))?;
         if status != gix_zlib::Status::StreamEnd || n != out.len() {
             return Err(Error::Storage("entry size does not match its header".into()));
         }
-        Ok((kind, out))
+        Ok((kind, out, hlen + used))
     }
 }
 
@@ -449,6 +495,9 @@ pub struct PackWriter {
     commit_lo: u64,
     commit_hi: u64,
     created_at: i64,
+    /// The uniform non-final part size — PART in production; GC's test knob
+    /// (gc_part_bytes) may shrink it. Must not change between checkpoints.
+    part_size: usize,
 }
 impl PackWriter {
     /// `expected` is pass A's verified entry count (2.4); the header is final from byte 0.
@@ -494,6 +543,7 @@ impl PackWriter {
             commit_lo: u64::MAX,
             commit_hi: 0,
             created_at,
+            part_size: PART,
         })
     }
     /// Sync; buffers. Returns (offset, len): the `objects` row and the range a reader asks for.
@@ -558,10 +608,10 @@ impl PackWriter {
         self.count = self.count.saturating_add(1);
         Ok((start, len))
     }
-    /// Uploads whole 8 MiB parts while the buffer holds that much.
+    /// Uploads whole uniform parts while the buffer holds that much.
     pub async fn flush_if_full(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
-        while self.part.len() >= PART {
-            let chunk: Vec<u8> = self.part.drain(..PART).collect();
+        while self.part.len() >= self.part_size {
+            let chunk: Vec<u8> = self.part.drain(..self.part_size).collect();
             let n = u16::try_from(self.parts.len().saturating_add(1))
                 .map_err(|_| Error::Limit("too many parts".into()))?;
             budget.charge(1)?;
@@ -673,10 +723,10 @@ impl PackWriter {
         &mut self,
         budget: &mut ReqBudget,
     ) -> Result<Option<(u16, String, WriterCkpt)>, Error> {
-        if self.part.len() < PART {
+        if self.part.len() < self.part_size {
             return Ok(None);
         }
-        let chunk: Vec<u8> = self.part.drain(..PART).collect();
+        let chunk: Vec<u8> = self.part.drain(..self.part_size).collect();
         let n = u16::try_from(self.parts.len().saturating_add(1))
             .map_err(|_| Error::Limit("too many parts".into()))?;
         budget.charge(1)?;
@@ -713,6 +763,16 @@ impl PackWriter {
         };
         ckpt.set_hash(&self.hash);
         ckpt
+    }
+    /// GC test knob (gc_part_bytes): shrink the uniform part so consolidate is
+    /// multi-part on a tiny repo. Set before the first checkpoint; production
+    /// never calls this.
+    pub fn set_part_size(&mut self, n: usize) {
+        self.part_size = n;
+    }
+    /// The uniform non-final part size this writer checkpoints at.
+    pub fn part_size(&self) -> u64 {
+        self.part_size as u64
     }
     /// Etags of all uploaded parts, in part order — the resume token.
     pub fn etags(&self) -> Vec<String> {
@@ -769,6 +829,7 @@ impl PackWriter {
             commit_lo: state.commit_lo,
             commit_hi: state.commit_hi,
             created_at,
+            part_size: PART,
         })
     }
 }
@@ -777,11 +838,31 @@ fn i(n: u64) -> Result<V, Error> {
     Ok(V::from(i64::try_from(n).map_err(|_| Error::Internal("u64 to i64".into()))?))
 }
 
+/// A6: DO SQLite refuses statements binding more than 100 parameters — check
+/// at the single choke point so an over-bound statement fails with a named
+/// error instead of a raw SQLite complaint.
+pub const MAX_BOUND_PARAMS: usize = 100;
+pub fn check_params(n: usize) -> Result<(), Error> {
+    if n > MAX_BOUND_PARAMS {
+        return Err(Error::Internal(format!(
+            "sql: {n} bound params > {MAX_BOUND_PARAMS} (A6)"
+        )));
+    }
+    Ok(())
+}
+
+/// The one `SqlStorage::exec` wrapper — every call site in the crate routes
+/// here so the A6 bound-param check cannot be bypassed.
+pub fn exec(sql: &SqlStorage, q: &str, args: Vec<V>) -> Result<worker::SqlCursor, Error> {
+    check_params(args.len())?;
+    sql.exec(q, Some(args)).map_err(|e| Error::Storage(e.to_string()))
+}
+
 /// Sync SQLite index, used only inside RepoDo and jobs (1.2).
 pub struct Index<'s>(pub &'s SqlStorage);
 impl<'s> Index<'s> {
     fn exec(&self, q: &str, args: Vec<V>) -> Result<worker::SqlCursor, Error> {
-        self.0.exec(q, Some(args)).map_err(|e| Error::Storage(e.to_string()))
+        exec(self.0, q, args)
     }
     /// The reader query of 2.3, verbatim. Rows of ingesting/dead packs are invisible.
     /// Batches `IN` lists at 90 bound params (A6).
@@ -1009,7 +1090,6 @@ impl<'s> Index<'s> {
 
 /// The complete schema (2.3, 3, 4, 8 + GC tables of section 5 / gc-and-repack-alarm's registry).
 pub mod schema {
-    use super::V;
     use crate::error::Error;
     use worker::SqlStorage;
 
@@ -1090,31 +1170,28 @@ pub mod schema {
     ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {
-            sql.exec(q, Some(Vec::<V>::new())).map_err(|e| Error::Storage(e.to_string()))?;
+            super::exec(sql, q, vec![])?;
         }
         #[derive(serde::Deserialize)]
         struct Col {
             name: String,
         }
         for (table, col, decl) in LATE_COLS {
-            let cols = sql
-                .exec(&format!("PRAGMA table_info({table})"), Some(Vec::<V>::new()))
-                .map_err(|e| Error::Storage(e.to_string()))?
+            let cols = super::exec(sql, &format!("PRAGMA table_info({table})"), vec![])?
                 .to_array::<Col>()
                 .map_err(|e| Error::Storage(e.to_string()))?;
             if !cols.iter().any(|c| c.name == *col) {
-                sql.exec(&format!("ALTER TABLE {table} ADD COLUMN {decl}"), Some(Vec::<V>::new()))
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                super::exec(sql, &format!("ALTER TABLE {table} ADD COLUMN {decl}"), vec![])?;
             }
         }
         // PR-3a: a NULL/blank token scope used to mean "all refs" and now denies.
         // Rewrite legacy rows to the explicit pattern so existing tokens keep the
         // access they were minted with. Idempotent; a no-op once every row is set.
-        sql.exec(
+        super::exec(
+            sql,
             "UPDATE tokens SET scope='refs/*' WHERE scope IS NULL OR trim(scope)=''",
-            Some(Vec::<V>::new()),
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+            vec![],
+        )?;
         Ok(())
     }
 }
@@ -1397,6 +1474,14 @@ mod tests {
             live.update(b"\x00\x00\x00\x02rest");
             assert_eq!(resumed.fin(), live.fin());
         }
+    }
+
+    /// A6: the bound-parameter guard — 100 binds is the documented ceiling.
+    #[test]
+    fn bound_param_guard() {
+        assert!(check_params(MAX_BOUND_PARAMS).is_ok());
+        let e = check_params(MAX_BOUND_PARAMS + 1).unwrap_err();
+        assert!(e.message().contains("bound params"), "{e}");
     }
 
     /// A pre-sha256 checkpoint (only `sha`) still parses and resumes.

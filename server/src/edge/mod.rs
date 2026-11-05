@@ -176,6 +176,16 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
             import_status(&req, &env, &route, &p["_admin/import/".len()..], &spend).await
         }
         (Method::Get, "_admin/export") => export_bundle(&req, &env, &route, &spend).await,
+        // PR0 test hooks: GE_TEST_HOOKS off = 404 exactly like an unknown route
+        // (checked inside test_forward before admin auth, never reaching the DO)
+        (Method::Post, "_admin/test/step") => test_forward(req, &env, &route, "/_do/test/step", &spend).await,
+        (Method::Post, "_admin/test/failpoint") => test_forward(req, &env, &route, "/_do/test/failpoint", &spend).await,
+        (Method::Post, "_admin/test/repair") => test_forward(req, &env, &route, "/_do/test/repair", &spend).await,
+        (Method::Post, "_admin/test/drop_object") => test_forward(req, &env, &route, "/_do/test/drop_object", &spend).await,
+        (Method::Post, "_admin/test/knob") => test_forward(req, &env, &route, "/_do/test/knob", &spend).await,
+        (Method::Post, "_admin/test/drop_pack") => test_forward(req, &env, &route, "/_do/test/drop_pack", &spend).await,
+        (Method::Get, "_admin/test/jobs") => test_forward(req, &env, &route, "/_do/test/jobs", &spend).await,
+        (Method::Get, "_admin/test/fsck") => test_forward(req, &env, &route, "/_do/test/fsck", &spend).await,
         _ => Err(Error::NotFound),
     };
     let resp = respond(r, git_pkt, spend.get());
@@ -982,6 +992,35 @@ async fn import_status(req: &Request, env: &Env, route: &RepoRoute, push: &str, 
     let out: serde_json::Value =
         stub_json(&stub, route, "/_do/import/status", &serde_json::json!({ "push": push }), &mut budget).await?;
     git_resp(serde_json::to_vec(&out).map_err(|e| Error::Internal(e.to_string()))?, "application/json")
+}
+
+/// PR0: `/:o/:r/_admin/test/*` — the deterministic GC harness (testhooks.rs).
+/// GE_TEST_HOOKS != "1" answers NotFound exactly like an unknown route, before
+/// auth even runs; on, the routes take the same global-write-token gate as the
+/// other _admin routes and forward verbatim to the DO's /_do/test/* handlers.
+/// fsck is a GET carrying ?mode= — the DO route reads it from a JSON body.
+async fn test_forward(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
+    if !crate::testhooks::env_flag(env, "GE_TEST_HOOKS") {
+        return Err(Error::NotFound);
+    }
+    auth::authenticate_admin(&req, env)?;
+    let body = if path == "/_do/test/fsck" {
+        let mode = req
+            .url()
+            .ok()
+            .and_then(|u| u.query_pairs().find(|(k, _)| k == "mode").map(|(_, v)| v.into_owned()))
+            .unwrap_or_else(|| "refs".into());
+        serde_json::to_vec(&serde_json::json!({ "mode": mode })).map_err(|e| Error::Internal(e.to_string()))?
+    } else {
+        req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?
+    };
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    let mut resp = stub_raw(&stub, route, path, body, &mut budget, None).await?;
+    if resp.status_code() != 200 {
+        return Err(Error::from_do_response(resp, &budget).await);
+    }
+    let bytes = resp.bytes().await.map_err(|e| Error::Internal(e.to_string()))?;
+    git_resp(bytes, "application/json")
 }
 
 /// GET /:owner/:repo/_admin/export — stream a v3 git bundle of every live ref.

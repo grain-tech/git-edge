@@ -185,6 +185,10 @@ footprint.
   GE_CONFORMANCE_URIS=1`, `GE_REPO` for owner prefix, `EDGE_BASE`,
   `EDGE_TOKEN`. URIS needs `GE_URL_SIGNING_KEY` in `.dev.vars` and git >= 2.40
   as `GE_GITBIN` (Apple git 2.39 lacks packfile-uris; Homebrew git works).
+- GC test harness (PR0): `tests/harness/` — deterministic job stepping,
+  failpoints, server-side fsck over index+R2. Dev server needs
+  `GE_TEST_HOOKS=1 GE_TEST_MANUAL_JOBS=1 GE_GC_QUIET_MS=0 GE_GC_GRACE_MS=0`;
+  see tests/harness/README.md.
 - **Workflow rules**: commit/push/PR via `/atlas-engineering:commit-push-pr`;
   no PR template → fallback Summary/Changes/Testing format. Do NOT run
   `cargo fmt` globally — repo is not rustfmt-clean, it creates noise. Never

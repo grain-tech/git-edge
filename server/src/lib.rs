@@ -11,6 +11,7 @@ pub mod remote;
 pub mod repo_do;
 pub mod sign;
 pub mod store;
+pub mod testhooks;
 pub mod wire;
 
 use std::cell::Cell;

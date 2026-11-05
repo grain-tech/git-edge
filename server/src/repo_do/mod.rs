@@ -236,6 +236,15 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/unpin") => self.unpin(&parse::<UnpinDto>(&body)?),
                 (Method::Post, "/_do/protect") => self.protect(&parse::<ProtectDto>(&body)?),
                 (Method::Post, "/_do/unprotect") => self.unprotect(&parse::<ProtectDto>(&body)?),
+                // PR0 test hooks (testhooks.rs): the pure-SQL routes. The flag
+                // check is the second gate (the edge already 404s) — with
+                // GE_TEST_HOOKS off these fall through to the same NotFound as
+                // any unknown route.
+                (Method::Post, "/_do/test/jobs") if crate::testhooks::enabled(self) => crate::testhooks::jobs_view(self),
+                (Method::Post, "/_do/test/failpoint") if crate::testhooks::enabled(self) => crate::testhooks::set_failpoint(self, &body),
+                (Method::Post, "/_do/test/repair") if crate::testhooks::enabled(self) => crate::testhooks::repair(self),
+                (Method::Post, "/_do/test/drop_object") if crate::testhooks::enabled(self) => crate::testhooks::drop_object(self, &body),
+                (Method::Post, "/_do/test/knob") if crate::testhooks::enabled(self) => crate::testhooks::set_knob(self, &body),
                 _ => return Ok(None),
             }
             .map(Some)
@@ -262,6 +271,19 @@ impl DurableObject for RepoDo {
                     let r = self.lfs_batch(&body, &hdr).await;
                     let _ = jobs::rearm(self).await;
                     return r;
+                }
+                // PR0 test hooks that await (job slice, R2 reads) — the flag is
+                // re-checked inside each handler, so off = NotFound either way.
+                (Method::Post, "/_do/test/step") => {
+                    let r = crate::testhooks::step(self, &body).await;
+                    let _ = jobs::rearm(self).await;
+                    return test_resp(r);
+                }
+                (Method::Post, "/_do/test/fsck") => {
+                    return test_resp(crate::testhooks::fsck(self, &body).await);
+                }
+                (Method::Post, "/_do/test/drop_pack") => {
+                    return test_resp(crate::testhooks::drop_pack(self, &body).await);
                 }
                 _ => Err(Error::NotFound),
             },
@@ -290,14 +312,29 @@ impl DurableObject for RepoDo {
 
     async fn alarm(&self) -> worker::Result<Response> {
         self.boot(&RepoHeaders::NONE)?; // alarm has no headers, section 8.2
-        let _ = jobs::dispatch(self).await; // never lets an Err escape, section 4.4
+        if crate::testhooks::manual_jobs(self) {
+            // GE_TEST_MANUAL_JOBS: slices run only via /_do/test/step. Clear the
+            // alarm rather than rearm — a queued row with run_at<=now would
+            // refire instantly and spin; the step hook rearms as needed.
+            let _ = self.state.storage().delete_alarm().await;
+        } else {
+            let _ = jobs::dispatch(self).await; // never lets an Err escape, section 4.4
+        }
         Response::empty()
     }
 }
 
-pub fn oid(hex: &str) -> Result<ObjectId, Error> {
-    ObjectId::from_hex(hex.as_bytes()).map_err(|e| Error::Protocol(e.to_string()))
+/// The awaited test routes (PR0): errors answer as the usual DO JSON error —
+/// NotFound included, so a flag-off request is indistinguishable from an
+/// unknown route. Awaited routes have no open sync span left to roll back.
+fn test_resp(r: Result<Response, Error>) -> worker::Result<Response> {
+    match r {
+        Ok(r) => Ok(r),
+        Err(e) => do_error_response(&e, 0).map_err(worker::Error::from),
+    }
 }
+
+pub use crate::store::oid; // hex->ObjectId boundary parse — canonical home is store
 
 /// A full valid refname under refs/ — the same gate apply_one uses on push commands.
 fn valid_ref(name: &str) -> Result<&str, Error> {
@@ -473,7 +510,7 @@ impl RepoDo {
         *self.booted.borrow_mut() = false;
     }
     pub fn q(&self, s: &str, args: Vec<V>) -> Result<SqlCursor, Error> {
-        self.sql().exec(s, Some(args)).map_err(|e| Error::Storage(e.to_string()))
+        crate::store::exec(&self.sql(), s, args)
     }
     /// The one CAS oracle (section 3): issued right after the write, same span. Never rows_written.
     pub fn changes(&self) -> Result<i64, Error> {
