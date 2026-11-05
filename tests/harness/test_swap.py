@@ -77,6 +77,19 @@ def push_commit(r, tag):
     return c
 
 
+def mark_to_build(r, limit=40):
+    """Step gc_mark until gc.phase=build publishes. Keyed on the persisted
+    phase, never on a row's outcome: a push staked while a mark slice was
+    parked leaves a queued gc_mark row behind, and once build stands that
+    row only Reschedules at the M4 guard — outcome-keyed stepping could
+    spin on it forever."""
+    for _ in range(limit):
+        if tb.meta(r).get("gc.phase") == "build":
+            return
+        ge.step(r.name, "gc_mark")
+    raise AssertionError("mark never reached phase=build: %r" % tb.meta(r))
+
+
 def pause_drain(r):
     """Start a gc_sweep slice parked at gc.drain.after_read; (thread, box).
     Requires drain work queued (non-empty gc_frontier/gc_pending) or the
@@ -399,10 +412,15 @@ class Swap(unittest.TestCase):
         tb.seed(r, 2)
         cutoff_now(r)
         ge.knob(r.name, "mark_delta_rounds", 1)  # cap forces leftover gen-1
-        ge.step(r.name, "gc_mark")  # init — barrier chain live
+        # the writes must land inside a live mark window — an uncapped init
+        # step on a tiny seed can hand the whole mark off to build first,
+        # and a mark queued after handoff only Reschedules at the M4 build
+        # guard (same pattern as tb.test_mark_completes_under_writer)
+        t, box = tb.pause_mark(r)
         for i in range(5):
             push_commit(r, "pre%d" % i)  # pending rows + gen-1, all pre-baseline
-        tb.step_until(r, "gc_mark", {"done"})
+        tb.release_pause(r, t, box)
+        mark_to_build(r)
         tb.step_until(r, "gc_consolidate", {"done"})
         ge.knob(r.name, "swap_tries", 1)
         tgs.gc_drain(r, limit=80)
@@ -430,13 +448,21 @@ class Swap(unittest.TestCase):
                        "%s:refs/heads/del" % victim, cwd=r.dir)
                 cutoff_now(r)
                 ge.knob(r.name, "mark_delta_rounds", 1)
-                ge.step(r.name, "gc_mark")
+                # same live-window requirement — the writes must land while
+                # the mark is mid-flight, or the mark they queue stalls at
+                # the M4 build guard and the chain never reaches phase=sweep
+                t, box = tb.pause_mark(r)
                 push_commit(r, "pre")
-                tb.step_until(r, "gc_mark", {"done"})
+                if mode == "delete_during_drain":
+                    # pre-baseline on purpose: drain work inside the try
+                    # baseline — a post-baseline push would charge the try
+                    # before gc.drain.after_read could ever park the slice
+                    push_commit(r, "pre2")
+                tb.release_pause(r, t, box)
+                mark_to_build(r)
                 tb.step_until(r, "gc_consolidate", {"done"})
                 ge.knob(r.name, "swap_tries", 1)
                 if mode == "delete_during_drain":
-                    push_commit(r, "pre2")  # drain work for the pause
                     t, box = pause_drain(r)
                     ge.git("push", "-q", r.url, ":refs/heads/del", cwd=r.dir)
                     release_drain(r, t, box)
@@ -464,7 +490,7 @@ class Swap(unittest.TestCase):
         ("mark-seen", "gc.mark.commit_ids.after_seen", "error", "start", None),
         ("mark-kids", "gc.mark.commit_ids.after_kids", "error", "start", None),
         ("cons-begin", "gc.consolidate.begin", "crash", "markdone", None),
-        ("cons-part", "gc.consolidate.after_part", "crash", "markdone", None),
+        ("cons-part", "gc.consolidate.after_part", "crash", "markdone", "parts"),
         ("cons-finish", "gc.consolidate.before_finish", "crash", "markdone", None),
         ("drain-read", "gc.drain.after_read", "crash", "presweep", "push"),
         ("swap-epoch", "gc.swap.after_epoch", "error", "presweep", None),
@@ -486,7 +512,20 @@ class Swap(unittest.TestCase):
             with self.subTest(case=name):
                 r = repo("crash-%s" % name)
                 tb.barrier_on(r)
-                if extra == "fallback":
+                if extra == "parts":
+                    # after_part only exists past the first uploaded part —
+                    # a single-part seed never reaches it. The
+                    # consolidate_parts recipe (test_harness._failpoint_case):
+                    # part size at the dev-R2 non-final floor plus ~6 MiB of
+                    # incompressible binary, committed before the seed pushes
+                    # so it lands inside a candidate pack
+                    ge.knob(r.name, "gc_part_bytes", 5 << 20)
+                    with open(os.path.join(r.dir, "big"), "wb") as fh:
+                        fh.write(os.urandom(6 << 20))
+                    ge.git("add", "big", cwd=r.dir)
+                    ge.git("commit", "-qm", "big", cwd=r.dir)
+                    th.seed_gc_repo(r)
+                elif extra == "fallback":
                     # all-reachable cohort so the forced fallback takes the
                     # RETIRE branch (a garbage cohort would wipe N instead —
                     # the failpoint sits in the fallback's retire span)
