@@ -255,6 +255,7 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/test/knob") if crate::testhooks::enabled(self) => crate::testhooks::set_knob(self, &body),
                 (Method::Post, "/_do/test/meta") if crate::testhooks::enabled(self) => crate::testhooks::set_meta(self, &body),
                 (Method::Post, "/_do/test/enqueue") if crate::testhooks::enabled(self) => crate::testhooks::enqueue_job(self, &body),
+                (Method::Post, "/_do/test/marked_built") if crate::testhooks::enabled(self) => crate::testhooks::marked_built(self, &body),
                 (Method::Post, "/_do/test/query") if crate::testhooks::enabled(self) => crate::testhooks::query(self, &body),
                 (Method::Post, "/_do/test/objects") if crate::testhooks::enabled(self) => crate::testhooks::objects_view(self),
                 (Method::Post, "/_do/test/pack_state") if crate::testhooks::enabled(self) => crate::testhooks::pack_state(self, &body),

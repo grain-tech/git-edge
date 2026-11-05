@@ -173,6 +173,28 @@ def kill_job(repo, kind):
     return admin(repo, "POST", "kill_job", {"kind": kind})
 
 
+def marked_built_null(repo):
+    """POST marked_built {"null": true} — force every marked.built back to
+    NULL (the pre-PR6-chain fixture). Raises on the SQL error the route
+    returns while the `built` column does not exist — that error IS the
+    expected red signal until phase B ships it."""
+    return admin(repo, "POST", "marked_built", {"null": True})
+
+
+def last_swap(repo):
+    """gc_last_swap from the jobs view's gc_meta, JSON-parsed — the fenced
+    swap's durable record ({"retired","kept","lossy","fallback","tries",
+    "slices",...}). None while no swap has ever landed."""
+    v = admin(repo, "GET", "jobs")["gc_meta"].get("gc_last_swap")
+    return None if v is None else json.loads(v)
+
+
+def fallbacks(repo):
+    """The gc_fallbacks counter — consecutive fallbacks since the last
+    fenced swap (0 when absent)."""
+    return int(admin(repo, "GET", "jobs")["gc_meta"].get("gc_fallbacks") or 0)
+
+
 def state(repo):
     """The public /_state probe — (status, dict|None)."""
     st, data = http("GET", "/%s/_state" % repo)
