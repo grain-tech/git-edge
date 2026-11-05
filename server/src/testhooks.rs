@@ -15,11 +15,46 @@
 //!   POST /_do/test/fsck        {"mode":"refs"|"all"} — index+R2 integrity oracle
 //!   POST /_do/test/drop_object {"sha","action"?:"drop"|"corrupt"} — index corruption jig
 //!   POST /_do/test/drop_pack   {"pack"} — delete the pack's R2 object (fsck must notice)
-//!   POST /_do/test/knob        {"name","value"?} — integer knobs (slice_subreqs, gc_part_bytes)
+//!   POST /_do/test/knob        {"name","value"?} — integer knobs (slice_subreqs,
+//!                              gc_part_bytes, gc_barrier, mark_delta_rounds,
+//!                              pending_window, pending_page, …)
 //!   POST /_do/test/meta        {"key","value"|null} — set/delete a meta row (legacy-state jig)
 //!   POST /_do/test/enqueue     {"kind","payload"?} — insert a job row like repair resurrection
+//!   POST /_do/test/mark_check  {} — PR5 §8 oracle (edge: GET /_admin/mark_check)
+//!   POST /_do/test/query       {"sql"} — EXPLAIN QUERY PLAN rows, EXPLAIN only
+//!
+//! PR5 additions (phase A ships the hooks only — the barrier itself lands in
+//! a later phase; every name below is documented here so tests can arm it):
+//!   knobs: `gc_barrier` — nonzero asks mark init to persist meta
+//!     gc.barrier=1 (barrier mode); `mark_delta_rounds` — delta-mark round cap
+//!     (default MARK_DELTA_ROUNDS=8); `pending_window`/`pending_page` — the
+//!     §5 pending-page span's idx window/page sizes (defaults 50000/5000),
+//!     read by the page span. The barrier knobs are read from phase B on.
+//!   failpoints (names only until phase B hosts them — an armed row at a
+//!     missing site stays inert, exactly like a pause arm at a sync site):
+//!     gc.barrier.before_promote   commit_push step 3, error: pack NOT
+//!                                 promoted but its gc_pending row exists
+//!     gc.barrier.after            commit_push, after the ref-write span
+//!     gc.barrier.pending          error at the gc_pending INSERT (promotion)
+//!     gc.barrier.landing          error at the gc_frontier INSERT (landing)
+//!     gc.mark.commit_ids.after_bits  error between bitmap flush and gc_seen
+//!     gc.mark.commit_ids.after_seen  error between gc_seen and kids insert
+//!     gc.mark.commit_ids.after_kids  error between kids insert and frontier
+//!                                    delete — K must hold after the retry
+//!     gc.mark.page.after_frontier    error between page frontier insert and
+//!                                    the cursor update
+//!     gc.mark.page.after_cursor      error between cursor update and the
+//!                                    pending-row delete
+//!     gc.mark.init_barrier           error between the started_at and
+//!                                    gc.barrier writes at mark init
+//!     gc.build.handoff               error between the sweep enqueue and the
+//!                                    gc.phase publish (total==0 arm)
+//!     gc.sweep.after_deadmark        error after the cohort dead-mark, before
+//!                                    the object-row delete (partial sweep)
+//!     gc.compact.after_deadmark      error after cohort retirement inside
+//!                                    compact::swap (partial swap)
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use gix_hash::{self, ObjectId};
 use gix_object::Kind;
@@ -248,8 +283,11 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
         // stale slice managed to land shows up
         "gc_tables": serde_json::json!({
             "marked": table_digest(d, "marked", "pack_id || ':' || hex(bitmap)")?,
-            "gc_seen": table_digest(d, "gc_seen", "sha")?,
-            "gc_frontier": table_digest(d, "gc_frontier", "sha")?,
+            "gc_seen": seen_view(d)?,
+            "gc_frontier": frontier_view(d)?,
+            // PR5's pending-pack feed — {n,hash} plus the verbatim rows so a
+            // test can watch seq order and cursor progress directly
+            "gc_pending": pending_view(d)?,
             // the import side's write targets — the C7 stale-lease test
             // snapshots a stale import slice against these the same way
             "objects": table_digest(d, "objects",
@@ -302,6 +340,100 @@ fn rows_digest<'a>(rows: impl Iterator<Item = &'a str>) -> u64 {
         }
     }
     h
+}
+
+/// Schema probes for hooks that must tolerate tables/columns a later PR has
+/// not shipped yet — gc_pending and gc_frontier.gen land with the barrier.
+fn table_exists(d: &RepoDo, name: &str) -> Result<bool, Error> {
+    #[derive(serde::Deserialize)]
+    struct T {
+        n: i64,
+    }
+    Ok(d
+        .q(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name=?",
+            vec![V::from(name)],
+        )?
+        .one::<T>()?
+        .n
+        == 1)
+}
+
+/// `table`/`col` are hook-internal literals; the identifier check keeps this
+/// from ever becoming an injection point regardless.
+fn column_exists(d: &RepoDo, table: &str, col: &str) -> Result<bool, Error> {
+    let ident = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !ident(table) || !ident(col) {
+        return Err(Error::Internal("bad identifier".into()));
+    }
+    #[derive(serde::Deserialize)]
+    struct C {
+        name: String,
+    }
+    Ok(d
+        .q(&format!("PRAGMA table_info({table})"), vec![])?
+        .to_array::<C>()?
+        .iter()
+        .any(|c| c.name == col))
+}
+
+/// gc_frontier for the jobs view: the {n,hash} digest plus the sha list and
+/// per-generation counts — PR5's delta mark splits the table by `gen`, and
+/// the barrier tests assert membership/generation directly. A pre-PR5 schema
+/// (no gen column) reports every row under gen "0".
+fn frontier_view(d: &RepoDo) -> Result<serde_json::Value, Error> {
+    let mut v = table_digest(d, "gc_frontier", "sha")?;
+    #[derive(serde::Deserialize)]
+    struct F {
+        sha: String,
+        gen: i64,
+    }
+    let rows = if column_exists(d, "gc_frontier", "gen")? {
+        d.q("SELECT sha, gen FROM gc_frontier ORDER BY sha", vec![])?.to_array::<F>()?
+    } else {
+        d.q("SELECT sha, 0 AS gen FROM gc_frontier ORDER BY sha", vec![])?.to_array::<F>()?
+    };
+    let mut gens: BTreeMap<String, i64> = BTreeMap::new();
+    let mut shas = Vec::with_capacity(rows.len());
+    for r in &rows {
+        shas.push(r.sha.clone());
+        *gens.entry(r.gen.to_string()).or_insert(0) += 1;
+    }
+    v["shas"] = serde_json::json!(shas);
+    v["gen"] = serde_json::json!(gens);
+    Ok(v)
+}
+
+/// gc_seen for the jobs view: {n,hash} plus the sha list — the miss-race
+/// test asserts membership directly on the original chain.
+fn seen_view(d: &RepoDo) -> Result<serde_json::Value, Error> {
+    let mut v = table_digest(d, "gc_seen", "sha")?;
+    #[derive(serde::Deserialize)]
+    struct S { sha: String }
+    let rows = d.q("SELECT sha FROM gc_seen ORDER BY sha", vec![])?.to_array::<S>()?;
+    v["shas"] = serde_json::json!(rows.into_iter().map(|r| r.sha).collect::<Vec<_>>());
+    Ok(v)
+}
+
+/// gc_pending for the jobs view: {n,hash} over (seq,pack_id,cursor) plus the
+/// verbatim rows. The table is a PR5 addition — absent means pre-PR5 schema,
+/// reported as empty rather than an error.
+fn pending_view(d: &RepoDo) -> Result<serde_json::Value, Error> {
+    if !table_exists(d, "gc_pending")? {
+        return Ok(serde_json::json!({ "n": 0, "hash": 0, "rows": [] }));
+    }
+    let mut v = table_digest(d, "gc_pending", "seq || ':' || pack_id || ':' || cursor")?;
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct P {
+        seq: i64,
+        pack_id: String,
+        cursor: i64,
+    }
+    let rows = d
+        .q("SELECT seq, pack_id, cursor FROM gc_pending ORDER BY seq", vec![])?
+        .to_array::<P>()?;
+    v["rows"] = serde_json::to_value(&rows)?;
+    Ok(v)
 }
 
 pub fn jobs_view(d: &RepoDo) -> Result<Response, Error> {
@@ -1157,6 +1289,294 @@ async fn fsck_run(d: &RepoDo, all: bool) -> Result<serde_json::Value, Error> {
         "corrupt": f.corrupt,
         "checked": f.checked,
     }))
+}
+
+// ---- mark_check: the PR5 §8 oracle ----
+
+/// One live copy of a sha, flattened for the oracle.
+struct LiveCopy {
+    pack_id: String,
+    idx: i64,
+    kind: i64,
+    loc: ObjLoc,
+}
+
+/// Every SQL input the oracle needs — read in ONE sync span before the
+/// first R2 await, so a push or mark slice interleaving mid-check cannot
+/// split the inputs (the §8 snapshot contract).
+struct MarkSnap {
+    chain: Option<String>,
+    refs_version: i64,
+    /// ref targets + peeled targets + pin shas — the reachability roots
+    roots: Vec<String>,
+    /// cohort pack_id -> marked bitmap (bit i of byte i/8 = entry idx i)
+    marked: HashMap<String, Vec<u8>>,
+    /// every gc_frontier sha — the whole frontier is protection, both gens
+    frontier: Vec<String>,
+    /// pack_id -> cursor for gc_pending rows whose pack is live
+    pending: HashMap<String, i64>,
+    /// sha -> its live copies
+    live: HashMap<String, Vec<LiveCopy>>,
+}
+
+/// The walk cap — far above any harness repo; hitting it means the answer
+/// is partial, which the response reports as an error (a truncated U walk must never look OK).
+const MARK_CHECK_MAX: usize = 100_000;
+
+/// One bit of a marked bitmap — bit i of byte i/8, LSB first (bm_set's
+/// order); out-of-range reads as unset.
+fn bm_bit(bm: &[u8], idx: i64) -> bool {
+    let Ok(i) = u32::try_from(idx) else { return false };
+    bm.get(usize::try_from(i / 8).unwrap_or(usize::MAX))
+        .map(|b| b & (1u8 << (i % 8)) != 0)
+        .unwrap_or(false)
+}
+
+fn mark_snapshot(d: &RepoDo) -> Result<MarkSnap, Error> {
+    #[derive(serde::Deserialize)]
+    struct Ref {
+        target: String,
+        peeled: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pin {
+        sha: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Sha {
+        sha: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Mk {
+        pack_id: String,
+        #[serde(with = "serde_bytes")]
+        bitmap: Vec<u8>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PRow {
+        pack_id: String,
+        cursor: i64,
+    }
+    let mut roots = Vec::new();
+    for r in d.q("SELECT target, peeled FROM refs", vec![])?.to_array::<Ref>()? {
+        roots.push(r.target);
+        if let Some(p) = r.peeled {
+            roots.push(p);
+        }
+    }
+    for p in d.q("SELECT sha FROM pins", vec![])?.to_array::<Pin>()? {
+        roots.push(p.sha);
+    }
+    let mut marked = HashMap::new();
+    for m in d.q("SELECT pack_id, bitmap FROM marked", vec![])?.to_array::<Mk>()? {
+        marked.insert(m.pack_id, m.bitmap);
+    }
+    let frontier = if table_exists(d, "gc_frontier")? {
+        d.q("SELECT sha FROM gc_frontier", vec![])?
+            .to_array::<Sha>()?
+            .into_iter()
+            .map(|r| r.sha)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // only rows whose pack is live — the drain deletes the rest before
+    // paging, so a dead/ingesting pack's row is not pending protection
+    let mut pending = HashMap::new();
+    if table_exists(d, "gc_pending")? {
+        for r in d
+            .q(
+                "SELECT g.pack_id, g.cursor FROM gc_pending g \
+                 JOIN packs p ON p.id=g.pack_id WHERE p.state='live'",
+                vec![],
+            )?
+            .to_array::<PRow>()?
+        {
+            pending.insert(r.pack_id, r.cursor);
+        }
+    }
+    let mut live: HashMap<String, Vec<LiveCopy>> = HashMap::new();
+    for r in live_rows(d)? {
+        let (_, loc) = r.loc()?; // a corrupt index row is an error, not "ok"
+        live.entry(r.sha.clone()).or_default().push(LiveCopy {
+            pack_id: r.pack_id.clone(),
+            idx: r.idx,
+            kind: r.kind,
+            loc,
+        });
+    }
+    Ok(MarkSnap {
+        chain: d.meta_opt("gc.chain")?,
+        refs_version: d.meta_i64("refs_version")?,
+        roots,
+        marked,
+        frontier,
+        pending,
+        live,
+    })
+}
+
+/// Link shas of one object, decoded through the Fsck oracle's strict row
+/// gate — memoized; blobs and zero-live-copy shas yield no links. A
+/// missing or corrupt copy is an error response, never "ok" (spec §8).
+async fn mark_expand(
+    f: &mut Fsck<'_>,
+    snap: &MarkSnap,
+    memo: &mut HashMap<String, Vec<String>>,
+    sha: &str,
+) -> Result<Vec<String>, Error> {
+    if let Some(v) = memo.get(sha) {
+        return Ok(v.clone());
+    }
+    let mut out = Vec::new();
+    if let Some(copies) = snap.live.get(sha) {
+        if let Some(c) = copies.iter().find(|c| c.kind != 3) {
+            match f.row(sha, &c.loc, "mark_check").await? {
+                Some((kind, data)) => {
+                    if !f.hash_ok(sha, kind, &data)? {
+                        return Err(Error::Storage(format!("mark_check: {sha} corrupt")));
+                    }
+                    for l in extract_links(kind, &data, f.obj_kind)? {
+                        out.push(l.to_string());
+                    }
+                }
+                None => {
+                    return Err(Error::Storage(format!(
+                        "mark_check: {sha} missing or corrupt"
+                    )));
+                }
+            }
+        }
+    }
+    memo.insert(sha.to_string(), out.clone());
+    Ok(out)
+}
+
+async fn mark_oracle(d: &RepoDo, snap: &MarkSnap) -> Result<serde_json::Value, Error> {
+    let mut f = Fsck::new(d)?;
+    // U roots: ref/peeled/pin targets + every non-blob of every live
+    // non-cohort pack — the mark's own root set (the C2 seed)
+    let mut u_roots: Vec<String> = snap.roots.clone();
+    for (sha, copies) in &snap.live {
+        if copies
+            .iter()
+            .any(|c| c.kind != 3 && !snap.marked.contains_key(&c.pack_id))
+        {
+            u_roots.push(sha.clone());
+        }
+    }
+    // P roots: the whole frontier + non-blob objects of pending packs
+    // past their cursors
+    let mut p_roots: Vec<String> = snap.frontier.clone();
+    for (sha, copies) in &snap.live {
+        let rooted = copies.iter().any(|c| {
+            c.kind != 3
+                && snap
+                    .pending
+                    .get(&c.pack_id)
+                    .map(|cur| c.idx > *cur)
+                    .unwrap_or(false)
+        });
+        if rooted {
+            p_roots.push(sha.clone());
+        }
+    }
+    let mut links: HashMap<String, Vec<String>> = HashMap::new();
+    let limit_hit = false;
+    // U = reachable objects with >=1 live copy where EVERY live copy is an
+    // unmarked bit of a cohort pack — a marked bit rebuilds it, a
+    // non-cohort copy outlives the sweep; zero-copy shas are excluded
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = u_roots.into();
+    let mut u: Vec<String> = Vec::new();
+    while let Some(sha) = queue.pop_front() {
+        if !visited.insert(sha.clone()) {
+            continue;
+        }
+        if visited.len() > MARK_CHECK_MAX {
+            return Err(Error::Storage(format!(
+                "mark_check: walk hit {MARK_CHECK_MAX} cap"
+            )));
+        }
+        let at_risk = match snap.live.get(&sha) {
+            None => {
+                // reachable with no live copy — the repo is already broken;
+                // that is an error response, not an "ok" oracle answer
+                return Err(Error::Storage(format!(
+                    "mark_check: reachable {sha} has no live copy"
+                )));
+            }
+            Some(copies) => copies.iter().all(|c| {
+                snap.marked
+                    .get(&c.pack_id)
+                    .map(|bm| !bm_bit(bm, c.idx))
+                    .unwrap_or(false)
+            }),
+        };
+        for l in mark_expand(&mut f, snap, &mut links, &sha).await? {
+            queue.push_back(l);
+        }
+        if at_risk {
+            u.push(sha);
+        }
+    }
+    // P = reach(frontier ∪ pending non-blobs past cursor); frontier/pending
+    // shas with no live copy still count — they are protection entries
+    let mut p_set: HashSet<String> = HashSet::new();
+    let mut p_queue: VecDeque<String> = p_roots.into();
+    while let Some(sha) = p_queue.pop_front() {
+        if !p_set.insert(sha.clone()) {
+            continue;
+        }
+        if p_set.len() > MARK_CHECK_MAX {
+            return Err(Error::Storage(format!(
+                "mark_check: P-walk hit {MARK_CHECK_MAX} cap"
+            )));
+        }
+        for l in mark_expand(&mut f, snap, &mut links, &sha).await? {
+            p_queue.push_back(l);
+        }
+    }
+    u.sort_unstable();
+    let u_subset_p = u.iter().all(|s| p_set.contains(s));
+    Ok(serde_json::json!({
+        "chain": snap.chain.clone(),
+        "refs_version": snap.refs_version,
+        "reachable": visited.len(),
+        "u": u,
+        "p_size": p_set.len(),
+        "u_subset_p": u_subset_p,
+        "limit_hit": limit_hit,
+    }))
+}
+
+/// POST /_do/test/query {"sql"} — run one statement and return its rows
+/// verbatim. Restricted to EXPLAIN so the hook stays read-only; the PR5
+/// index checks (§11.6) assert the frontier pop and pending page seek
+/// indexes instead of scanning.
+pub fn query(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        sql: String,
+    }
+    let b: B = parse(body)?;
+    let first = b.sql.trim_start().split_whitespace().next().unwrap_or("");
+    if !first.eq_ignore_ascii_case("explain") {
+        return Err(Error::Protocol("query hook runs EXPLAIN only".into()));
+    }
+    let rows = d.q(b.sql.trim(), vec![])?.to_array::<serde_json::Value>()?;
+    json(serde_json::json!({ "rows": rows }))
+}
+
+/// POST /_do/test/mark_check (edge GET /_admin/mark_check) — the §8
+/// oracle. Read-only and test-only; an unknown chain state is still
+/// answered (chain: null), a corrupt index is an error response.
+pub async fn mark_check(d: &RepoDo) -> Result<Response, Error> {
+    if !enabled(d) {
+        return Err(Error::NotFound);
+    }
+    let snap = mark_snapshot(d)?;
+    json(mark_oracle(d, &snap).await?)
 }
 
 #[cfg(test)]

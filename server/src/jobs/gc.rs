@@ -30,10 +30,19 @@ const SPAN: u64 = 8 << 20;
 /// gc_tail row size — under the SqlStorage value ceiling; a <PART tail is ~100 rows.
 const TAIL_CHUNK: usize = 64 << 10;
 
+/// Every scratch table a GC chain owns — one list so no reset site can forget
+/// `gc_pending` (PR5 §7). Kill/init/sweep/purge all iterate this.
+pub(crate) const SCRATCH_TABLES: &[&str] =
+    &["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail", "gc_pending"];
+
 #[derive(serde::Deserialize)]
 struct N {
     #[allow(dead_code)]
     n: i64,
+}
+#[derive(serde::Deserialize)]
+struct MinGen {
+    n: Option<i64>,
 }
 #[derive(serde::Deserialize)]
 struct S {
@@ -60,6 +69,25 @@ struct BM {
 struct PE {
     part_no: i64,
     etag: String,
+}
+/// Barrier pop row: a frontier sha plus the generation its batch pops at (§4.5).
+#[derive(serde::Deserialize)]
+struct SG {
+    sha: String,
+    gen: i64,
+}
+/// One pending-page window row: sha plus its idx inside the pack (§5.2).
+#[derive(serde::Deserialize)]
+struct PW {
+    sha: String,
+    idx: i64,
+}
+/// One gc_pending row as the page span sees it (§5.2).
+#[derive(serde::Deserialize)]
+struct PD {
+    seq: i64,
+    pack_id: String,
+    cursor: i64,
 }
 
 // container-level serde(default): checkpoints written by older binaries must
@@ -169,23 +197,116 @@ pub(crate) fn legacy_chain(d: &RepoDo) -> Result<bool, Error> {
         && d.meta_opt("gc.started_at")?.is_some())
 }
 
-/// Drop every trace of a chain without touching the queue: dead-mark the
-/// in-flight build pack (a NULL-push_id row the janitor never reaps), empty
-/// the scratch tables and all gc.* meta. Shared by begin_build's
-/// nothing-to-repack out and the mark's all-young early exit.
+/// PR5 §1: barrier mode is a property of the persisted chain, never of the
+/// env var — every GC arm and every commit_push reads these gc.* rows.
+/// Barrier-active ≡ chain id set ∧ started_at set ∧ gc.barrier=1 ∧ mode ≠
+/// compact; every chain exit wipes gc.*, so the mode dies with the chain.
+pub(crate) fn barrier_active(d: &RepoDo) -> Result<bool, Error> {
+    Ok(d.meta_opt("gc.chain")?.is_some()
+        && d.meta_opt("gc.started_at")?.is_some()
+        && d.meta_opt("gc.barrier")?.as_deref() == Some("1")
+        && d.meta_opt("gc.mode")?.as_deref() != Some("compact"))
+}
+
+/// The mark-init capture of GE_GC_BARRIER (default off) with the gc_barrier
+/// test knob — read once here, persisted as gc.barrier=1 only when on; every
+/// arm afterwards reads the meta, never the env.
+fn barrier_capture(d: &RepoDo) -> bool {
+    crate::testhooks::knob(d, "gc_barrier")
+        .map(|v| v != 0)
+        .unwrap_or_else(|| d.env_i64("GE_GC_BARRIER", 0) != 0)
+}
+
+fn refs_moved(d: &RepoDo) -> Result<bool, Error> {
+    Ok(d.meta_i64("refs_version")? != d.meta_i64("gc.refs_version")?)
+}
+
+/// Legacy mark guard while phase is build/sweep: compare frozen gc.refs_version to live refs.
+fn refs_frozen_moved(d: &RepoDo) -> Result<bool, Error> {
+    match d.meta_opt("gc.refs_version")? {
+        Some(old) => match old.parse::<i64>() {
+            Ok(o) => Ok(o != d.meta_i64("refs_version")?),
+            Err(_) => Ok(false),
+        },
+        None => Ok(false),
+    }
+}
+
+fn min_frontier_gen(sql: &SqlStorage) -> Result<Option<i64>, Error> {
+    Ok(exec(sql, "SELECT MIN(gen) AS n FROM gc_frontier", vec![])?.one::<MinGen>()?.n)
+}
+
+/// Barrier §4.6 handoff when gen-0 is drained: `Some(Done)` if consolidate is enqueued.
+fn barrier_handoff_if_ready(
+    d: &RepoDo,
+    sql: &SqlStorage,
+    job: &Job,
+    chain: Option<&str>,
+    min_gen: Option<i64>,
+) -> Result<Option<SliceOutcome>, Error> {
+    let no_gen0 = match min_gen {
+        None => true,
+        Some(g) => g >= 1,
+    };
+    if !no_gen0 {
+        return Ok(None);
+    }
+    if !mark_fence(d, sql, job, chain)? {
+        return Ok(Some(SliceOutcome::Done));
+    }
+    let pending_n = exec(sql, "SELECT COUNT(*) AS n FROM gc_pending", vec![])?.one::<N>()?.n;
+    let rounds = d
+        .meta_opt("gc.delta_rounds")?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let cap = crate::testhooks::knob(d, "mark_delta_rounds").unwrap_or(8);
+    let both_empty = pending_n == 0 && min_gen.is_none();
+    if both_empty || (rounds >= cap && refs_moved(d)?) {
+        enqueue(sql, JobKind::GcConsolidate, now_ms(), &chain_payload(d)?)?;
+        put(d, "gc.phase", "build")?;
+        return Ok(Some(SliceOutcome::Done));
+    }
+    Ok(None)
+}
+
+/// Drop every trace of a chain without touching the queue: the §6 keep rule
+/// on gc.new_pack, then all gc.* meta, then the scratch tables — gc.* first so
+/// a partial kill never leaves gc.new_pack set over an emptied `marked` (the
+/// keep predicate reads `marked` while it is still intact). Shared by
+/// wipe_all, abort and (through wipe_all) orphan_abort.
 pub(crate) fn wipe_all(d: &RepoDo, sql: &SqlStorage) -> Result<(), Error> {
     if let Some(p) = d.meta_opt("gc.new_pack")? {
-        exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![p.clone().into()])?;
-        exec(
+        let live = exec(
             sql,
-            "UPDATE packs SET state='dead', dead_at=? WHERE id=? AND state IN ('ingesting','live')",
-            vec![now_ms().into(), p.into()],
-        )?;
-    }
-    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
-        exec(sql, &format!("DELETE FROM {t}"), vec![])?;
+            "SELECT COUNT(*) AS n FROM packs WHERE id=? AND state='live'",
+            vec![p.clone().into()],
+        )?
+        .one::<N>()?
+            .n
+            == 1;
+        if live && !compact::cohort_live(d, sql)? {
+            // a cohort pack already retired: this build pack is the surviving
+            // copy — keep it live and drop the dead cohort's leftover object
+            // rows (the janitor only reaps dead packs that have none)
+            exec(
+                sql,
+                "DELETE FROM objects WHERE pack_id IN (SELECT pack_id FROM marked) \
+                 AND pack_id NOT IN (SELECT id FROM packs WHERE state='live')",
+                vec![],
+            )?;
+        } else {
+            exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![p.clone().into()])?;
+            exec(
+                sql,
+                "UPDATE packs SET state='dead', dead_at=? WHERE id=? AND state IN ('ingesting','live')",
+                vec![now_ms().into(), p.into()],
+            )?;
+        }
     }
     exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
+    for t in SCRATCH_TABLES {
+        exec(sql, &format!("DELETE FROM {t}"), vec![])?;
+    }
     Ok(())
 }
 
@@ -257,6 +378,29 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             return Ok(SliceOutcome::Reschedule { run_at: now_ms() + d.gc_quiet_ms() });
         }
     }
+    // §4.7 M4: a mark slice while the chain sits at build/sweep — ordered
+    // after the legacy_chain and compact guards. Barrier: an orphaned owner
+    // aborts losslessly and this slice falls through to init in the same
+    // slice (the pushed mark is the chain's only re-owner); a live owner
+    // just reschedules behind the quiet window — no writes either way.
+    // Legacy: moved refs aborts; stable refs are Done — never the old
+    // phase=build re-stamp, which wedged a second consolidate behind the
+    // live one (§1.1).
+    if matches!(d.meta_opt("gc.phase")?.as_deref(), Some("build") | Some("sweep")) {
+        if barrier_active(d)? {
+            if compact::orphaned(d, &sql)? {
+                compact::orphan_abort(d, &sql)?;
+            } else {
+                return Ok(SliceOutcome::Reschedule { run_at: now_ms() + d.gc_quiet_ms() });
+            }
+        } else {
+            return if refs_frozen_moved(d)? {
+                abort(d, &sql)
+            } else {
+                Ok(SliceOutcome::Done)
+            };
+        }
+    }
     if d.meta_opt("gc.started_at")?.is_none() {
         // first slice: refuse to overlap a chain already mid-flight
         let busy = exec(
@@ -270,15 +414,20 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             return Ok(SliceOutcome::Reschedule { run_at: now_ms() + d.gc_quiet_ms() });
         }
         let now = now_ms();
-        for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
+        // §2: wipe, then the chain id and the frozen refs_version, then the
+        // cohort and roots — gc.started_at and gc.barrier land LAST so an Err
+        // mid-init is redone from scratch and never leaves a half-active
+        // barrier chain (an Err between the two writes stays flag-off, safe)
+        for t in SCRATCH_TABLES {
             exec(&sql, &format!("DELETE FROM {t}"), vec![])?;
         }
         exec(&sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
-        put(d, "gc.refs_version", d.meta("refs_version")?)?;
         // C3: name this chain — consolidate/sweep rows carry it and a row that
         // outlives its chain's abort exits via `stray` instead of wedging
         put(d, "gc.chain", hex16()?)?;
-        put(d, "gc.started_at", now.to_string())?;
+        put(d, "gc.refs_version", d.meta("refs_version")?)?;
+        // captured now, persisted at the end — every arm reads the meta
+        let barrier = barrier_capture(d);
         // gc_candidate_before_ms knob (testhooks): an absolute candidate
         // cutoff — a test splits packs into old candidates and young keepers
         // without racing a moving now-grace boundary
@@ -299,10 +448,13 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             wipe_all(d, &sql)?;
             return Ok(SliceOutcome::Done);
         }
+        // §2 roots at gen 0 (the column default): ref targets ∪ peeled ∪ pins —
+        // a pin equals a ref target, so the pin seed is a defensive no-op
         exec(
             &sql,
             "INSERT OR IGNORE INTO gc_frontier(sha) SELECT target FROM refs UNION \
-             SELECT peeled FROM refs WHERE peeled IS NOT NULL",
+             SELECT peeled FROM refs WHERE peeled IS NOT NULL UNION \
+             SELECT sha FROM pins",
             vec![],
         )?;
         // C2 stopgap: a young pack is kept by the grace cutoff but is never a
@@ -315,6 +467,13 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
              AND o.pack_id NOT IN (SELECT pack_id FROM marked)",
             vec![],
         )?;
+        put(d, "gc.started_at", now.to_string())?;
+        // §2: the barrier stamp is the LAST init write — between it and
+        // started_at an Err leaves a flag-off chain, which is safe
+        crate::testhooks::failpoint(d, "gc.mark.init_barrier")?;
+        if barrier {
+            put(d, "gc.barrier", "1")?;
+        }
         crate::testhooks::failpoint(d, "gc.mark.init")?;
     }
     let bucket = d.bucket()?;
@@ -324,26 +483,95 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
         .map(|r| r.pack_id)
         .collect();
     let mut bits: HashMap<String, Vec<u8>> = HashMap::new(); // touched bitmaps, flushed by commit_ids
+    // §4.1: a barrier chain has no refs_version fence in the walk — the sweep
+    // is the single retirement fence and the barrier protects every landing.
+    // Read once per slice: gc.* only changes under a chain exit, which the
+    // lease/heartbeat fences already cover.
+    let barrier = barrier_active(d)?;
+    // §4.2: the chain this slice serves — captured after any init; every mark
+    // write span (both heartbeat sites, the pending page, the empty-frontier
+    // transition and the delta_rounds write) fences on it plus the lease CAS
+    // and an unset gc.phase, so a stale slice writes nothing in either mode
+    let chain = d.meta_opt("gc.chain")?;
     loop {
         if budget.spent_80pct() {
             return Ok(SliceOutcome::Continue { cursor: "{}".into() });
         }
-        if d.meta_i64("refs_version")? != d.meta_i64("gc.refs_version")? {
+        if !barrier && refs_moved(d)? {
+            // §1.2/§4.2: even the legacy walk abort is a fenced write span —
+            // a slice whose chain/phase/lease went stale drops its bitmaps
+            // instead of wiping a chain that is no longer its own
+            if !mark_fence(d, &sql, job, chain.as_deref())? {
+                return Ok(SliceOutcome::Done);
+            }
             return abort(d, &sql);
         }
-        // span A: pop a batch, plan marks and loads; nothing commits until a chunk's span B
-        let batch: Vec<String> = exec(&sql, "SELECT sha FROM gc_frontier LIMIT ?", vec![ROUND.into()])?
-            .to_array::<S>()?
-            .into_iter()
-            .map(|r| r.sha)
-            .collect();
+        // §5.4: at most one pending page span per iteration, before the pop —
+        // pending pages can't starve the snapshot generations
+        if barrier && !pending_page(d, &sql, job, chain.as_deref())? {
+            return Ok(SliceOutcome::Done);
+        }
+        // §4.6: once no gen-0 rows remain, evaluate the handoff BEFORE the
+        // next gen-1 pop — a continuous writer keeps gen-1 nonempty forever,
+        // and the empty-batch arm alone would never fire (review c1 major).
+        // Both-empty still hands off on stable refs; the delta arm hands off
+        // with leftover gen-1 / pending (PR5's sweep then aborts; PR6 drains).
+        if barrier {
+            let min_gen = min_frontier_gen(&sql)?;
+            if let Some(out) = barrier_handoff_if_ready(d, &sql, job, chain.as_deref(), min_gen)? {
+                return Ok(out);
+            }
+        }
+        // span A: pop a batch, plan marks and loads; nothing commits until a chunk's span B.
+        // Barrier mode takes only the minimum generation (§4.5): every gen-0
+        // (snapshot) row drains before any gen-1 delta feed is touched
+        let (batch, batch_gen): (Vec<String>, i64) = if barrier {
+            let rows = exec(
+                &sql,
+                "SELECT sha, gen FROM gc_frontier \
+                 WHERE gen=(SELECT MIN(gen) FROM gc_frontier) LIMIT ?",
+                vec![ROUND.into()],
+            )?
+            .to_array::<SG>()?;
+            let gen = rows.first().map(|r| r.gen).unwrap_or(0);
+            (rows.into_iter().map(|r| r.sha).collect(), gen)
+        } else {
+            (
+                exec(&sql, "SELECT sha FROM gc_frontier LIMIT ?", vec![ROUND.into()])?
+                    .to_array::<S>()?
+                    .into_iter()
+                    .map(|r| r.sha)
+                    .collect(),
+                0,
+            )
+        };
         if batch.is_empty() {
+            // Barrier handoff (both-empty and delta) already ran above when
+            // no gen-0 remained. Reaching here with barrier means pending
+            // still feeds and the delta cap is not yet met — keep paging.
+            // Legacy: empty frontier is the only handoff, with gc_seen wiped.
+            if !mark_fence(d, &sql, job, chain.as_deref())? {
+                return Ok(SliceOutcome::Done);
+            }
+            if barrier {
+                continue; // pending still feeds gen-1 — keep draining
+            }
             exec(&sql, "DELETE FROM gc_seen", vec![])?;
             // the chain enters build: a consolidate (incl. a chain-less
-            // resurrected one) may only run while this phase stands
-            put(d, "gc.phase", "build")?;
+            // resurrected one) may only run while this phase stands.
+            // §4.6: the owner row is enqueued BEFORE the phase is published —
+            // an Err between them must never leave a phase with no owner
             enqueue(&sql, JobKind::GcConsolidate, now_ms(), &chain_payload(d)?)?;
+            put(d, "gc.phase", "build")?;
             return Ok(SliceOutcome::Done);
+        }
+        // §4.6: one delta round per gen-1 pop span — the counter the
+        // handoff's stall arm reads, written under the fence
+        if barrier && batch_gen == 1 {
+            if !mark_fence(d, &sql, job, chain.as_deref())? {
+                return Ok(SliceOutcome::Done);
+            }
+            delta_round(&sql)?;
         }
         let rows = exec(
             &sql,
@@ -382,6 +610,13 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
                 }
             }
         }
+        // §4.4: the shas with a live row in this span — the barrier miss
+        // split needs it to tell hits from zero-row pops
+        let live_shas: HashSet<String> = if barrier {
+            rows.iter().map(|r| r.sha.clone()).collect()
+        } else {
+            HashSet::new()
+        };
         let load_ids: HashSet<String> = loads.iter().map(|(id, _)| id.to_string()).collect();
         for chunk in chunks(&loads) {
             let ids: Vec<String> = chunk.iter().map(|(id, _)| id.to_string()).collect();
@@ -389,12 +624,14 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
             // spans, where a crash can't bisect the kids-flush writes below
             let entries = bucket.read_entries_chunked(&chunk, &mut budget.req).await?;
             crate::testhooks::failpoint_async(d, "gc.mark.after_read").await?;
-            // CAS heartbeat: the last await is behind us, so the lease check runs
-            // before every write in this span — a stale slice (requeued and
-            // reclaimed) must land nothing at all (A19); a live one refreshes
-            // started_at so repair never calls it a straggler
-            if !super::heartbeat(&sql, job)? {
-                return Err(super::stale_lease());
+            // §4.2 post-await fence: the last await is behind us, so the lease
+            // CAS + captured chain + unset phase run before every write in
+            // this span — a stale slice (requeued and reclaimed, or a chain
+            // that moved on) lands nothing and drops its bitmaps as Done
+            // (A19); a live one refreshes started_at so repair never calls
+            // it a straggler
+            if !mark_fence(d, &sql, job, chain.as_deref())? {
+                return Ok(SliceOutcome::Done);
             }
             let mut kids: Vec<String> = Vec::new();
             for (_id, entry) in entries {
@@ -406,11 +643,11 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
                 // flush admission early rather than OOM mid-slice (an OOM kill never
                 // increments attempts and would wedge the job forever)
                 if kids.len() > 50_000 {
-                    commit_ids(&sql, &[], &kids, &mut bits)?;
+                    commit_ids(d, &sql, &[], &[], &kids, &mut bits, batch_gen, barrier)?;
                     kids.clear();
                 }
             }
-            commit_ids(&sql, &ids, &kids, &mut bits)?; // span B: expansion commits
+            commit_ids(d, &sql, &ids, &[], &kids, &mut bits, batch_gen, barrier)?; // span B: expansion commits
             // models a real death only while another await follows in the
             // same slice — at the slice's true end nothing is left to roll back
             crate::testhooks::failpoint(d, "gc.mark.after_commit")?;
@@ -420,37 +657,47 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
         }
         let rest: Vec<String> = batch.iter().filter(|s| !load_ids.contains(*s)).cloned().collect();
         if !rest.is_empty() {
-            // same-span CAS as the chunk loop's — an all-blob batch ran no
-            // read/heartbeat above but still writes
-            if !super::heartbeat(&sql, job)? {
-                return Err(super::stale_lease());
+            // same-span fence as the chunk loop's — an all-blob batch ran no
+            // read above but still writes
+            if !mark_fence(d, &sql, job, chain.as_deref())? {
+                return Ok(SliceOutcome::Done);
             }
-            commit_ids(&sql, &rest, &[], &mut bits)?; // blobs/misses: nothing to read
+            if barrier {
+                // §4.4: hits (live blob rows) commit like §4.3; misses — pops
+                // with no live row — are never seen-recorded and leave the
+                // frontier only while still absent
+                let (hits, misses): (Vec<String>, Vec<String>) =
+                    rest.into_iter().partition(|s| live_shas.contains(s.as_str()));
+                commit_ids(d, &sql, &hits, &misses, &[], &mut bits, batch_gen, true)?;
+            } else {
+                commit_ids(d, &sql, &rest, &[], &[], &mut bits, 0, false)?; // blobs/misses: nothing to read
+            }
             crate::testhooks::failpoint(d, "gc.mark.after_commit")?;
         }
     }
 }
 
-/// One sync span: ids are now expanded — seen-recorded, unseen kids admitted, frontier rows
-/// deleted, bits flushed.
+/// One sync span (§4.3, both modes): ids are now expanded — bitmaps flush
+/// FIRST so K holds (bits land before seen), then the seen insert, kids at
+/// the batch's generation, and the frontier delete LAST, so any Err leaves
+/// the batch in the frontier to replay idempotently. `misses` is the
+/// barrier-mode zero-row split (§4.4): never seen-recorded, and deleted only
+/// while still absent — a SHA that gained a live row during the await stays.
+/// `gen` is the batch's frontier generation (barrier mode); `barrier` picks
+/// the gen-aware kids upsert and the conditional miss delete.
+#[allow(clippy::too_many_arguments)]
 fn commit_ids(
+    d: &RepoDo,
     sql: &SqlStorage,
     ids: &[String],
+    misses: &[String],
     kids: &[String],
     bits: &mut HashMap<String, Vec<u8>>,
+    gen: i64,
+    barrier: bool,
 ) -> Result<(), Error> {
-    exec(sql, "INSERT OR IGNORE INTO gc_seen(sha) SELECT value FROM json_each(?)", vec![js(ids)?])?;
-    exec(
-        sql,
-        "INSERT OR IGNORE INTO gc_frontier(sha) SELECT j.value FROM json_each(?) j \
-         WHERE NOT EXISTS(SELECT 1 FROM gc_seen s WHERE s.sha=j.value)",
-        vec![js(kids)?],
-    )?;
-    exec(sql, "DELETE FROM gc_frontier WHERE sha IN (SELECT value FROM json_each(?))", vec![js(ids)?])?;
+    // 1. bitmaps — OR-merge so a duplicate slice's different bits never drop
     for (p, mut bm) in bits.drain() {
-        // a duplicate concurrent mark slice may have flushed different bits since our
-        // last SELECT — OR-merge with the stored bitmap inside this sync span so a
-        // last-writer-wins overwrite can never drop a reachable object's mark
         #[derive(serde::Deserialize)]
         struct Cur {
             #[serde(with = "serde_bytes")]
@@ -470,7 +717,169 @@ fn commit_ids(
         }
         exec(sql, "UPDATE marked SET bitmap=? WHERE pack_id=?", vec![bm.into(), p.into()])?;
     }
+    crate::testhooks::failpoint(d, "gc.mark.commit_ids.after_bits")?;
+    // 2. seen
+    exec(sql, "INSERT OR IGNORE INTO gc_seen(sha) SELECT value FROM json_each(?)", vec![js(ids)?])?;
+    crate::testhooks::failpoint(d, "gc.mark.commit_ids.after_seen")?;
+    // 3. kids not in gc_seen — barrier mode tags them with the batch's
+    //    generation through the min-gen upsert (§4.5); legacy rows stay 0
+    if barrier {
+        exec(
+            sql,
+            "INSERT INTO gc_frontier(sha, gen) SELECT j.value, ? FROM json_each(?) j \
+             WHERE NOT EXISTS(SELECT 1 FROM gc_seen s WHERE s.sha=j.value) \
+             ON CONFLICT(sha) DO UPDATE SET gen=MIN(gc_frontier.gen, excluded.gen)",
+            vec![V::from(gen), js(kids)?],
+        )?;
+    } else {
+        exec(
+            sql,
+            "INSERT OR IGNORE INTO gc_frontier(sha) SELECT j.value FROM json_each(?) j \
+             WHERE NOT EXISTS(SELECT 1 FROM gc_seen s WHERE s.sha=j.value)",
+            vec![js(kids)?],
+        )?;
+    }
+    crate::testhooks::failpoint(d, "gc.mark.commit_ids.after_kids")?;
+    // 4. frontier delete LAST — hits unconditionally; misses only while they
+    //    still have no live row (§4.4)
+    exec(sql, "DELETE FROM gc_frontier WHERE sha IN (SELECT value FROM json_each(?))", vec![js(ids)?])?;
+    if barrier && !misses.is_empty() {
+        exec(
+            sql,
+            "DELETE FROM gc_frontier WHERE sha IN (SELECT value FROM json_each(?)) \
+             AND NOT EXISTS(SELECT 1 FROM objects o JOIN packs p ON p.id=o.pack_id \
+             WHERE p.state='live' AND o.sha=gc_frontier.sha)",
+            vec![js(misses)?],
+        )?;
+    }
     Ok(())
+}
+
+/// §4.2 (both modes): the fence every mark write span passes — the lease
+/// CAS, `gc.chain ==` the id this slice captured after any init, and
+/// `gc.phase` unset. A lost lease is still `stale_lease` (the outcome span
+/// reports `stale`); a moved chain or a published phase answers `Ok(false)`
+/// and the caller stops as Done, dropping its local bitmaps.
+fn mark_fence(d: &RepoDo, sql: &SqlStorage, job: &Job, chain: Option<&str>) -> Result<bool, Error> {
+    // §4.2: chain/phase first — a resumed slice whose chain was aborted must
+    // not refresh jobs.started_at before returning Done (review c1)
+    if d.meta_opt("gc.chain")?.as_deref() != chain {
+        return Ok(false);
+    }
+    if d.meta_opt("gc.phase")?.is_some() {
+        return Ok(false);
+    }
+    if !super::heartbeat(sql, job)? {
+        return Err(super::stale_lease());
+    }
+    Ok(true)
+}
+
+/// §4.6: one delta round per gen-1 pop span and per pending page span — the
+/// persisted counter the handoff's stall arm reads. The caller holds the
+/// mark fence; the upsert keeps it monotone (it is wiped with gc.* on exit).
+fn delta_round(sql: &SqlStorage) -> Result<(), Error> {
+    exec(
+        sql,
+        "INSERT INTO meta(key,value) VALUES('gc.delta_rounds','1') \
+         ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)",
+        vec![],
+    )?;
+    Ok(())
+}
+
+/// §5: one fenced pending-page span per mark iteration (barrier mode only),
+/// run before the frontier pop so pending work can't starve the snapshot
+/// generations. The drain first deletes rows whose pack is absent or no
+/// longer live; then the oldest live row's next idx window feeds
+/// gc_frontier at gen 1 (minus gc_seen, min-gen upsert), the cursor
+/// advances, and the row deletes once a short page has covered the pack —
+/// frontier insert → cursor → delete, so a failure never loses a page.
+/// `Ok(false)` means the fence failed: the caller stops as Done.
+fn pending_page(d: &RepoDo, sql: &SqlStorage, job: &Job, chain: Option<&str>) -> Result<bool, Error> {
+    let n = exec(sql, "SELECT COUNT(*) AS n FROM gc_pending", vec![])?.one::<N>()?.n;
+    if n == 0 {
+        return Ok(true);
+    }
+    if !mark_fence(d, sql, job, chain)? {
+        return Ok(false);
+    }
+    // §5.3 drain: a row whose pack is gone or not live protects nothing
+    exec(
+        sql,
+        "DELETE FROM gc_pending WHERE pack_id NOT IN \
+         (SELECT id FROM packs WHERE state='live')",
+        vec![],
+    )?;
+    let Some(row) = exec(
+        sql,
+        "SELECT seq, pack_id, cursor FROM gc_pending ORDER BY seq LIMIT 1",
+        vec![],
+    )?
+    .to_array::<PD>()?
+    .into_iter()
+    .next() else {
+        delta_round(sql)?;
+        return Ok(true);
+    };
+    // knobs: the test values keep the windows small; production defaults
+    // are 50 000 idx / 5 000 rows per span (§5.2)
+    let window = crate::testhooks::knob(d, "pending_window").unwrap_or(50_000).max(1);
+    let page_rows = crate::testhooks::knob(d, "pending_page").unwrap_or(5_000).max(1);
+    let hi = row.cursor.saturating_add(window);
+    let page = exec(
+        sql,
+        "SELECT sha, idx FROM objects WHERE pack_id=? AND idx>? AND idx<=? AND kind != 3 \
+         ORDER BY idx LIMIT ?",
+        vec![
+            V::from(row.pack_id.as_str()),
+            V::from(row.cursor),
+            V::from(hi),
+            V::from(page_rows),
+        ],
+    )?
+    .to_array::<PW>()?;
+    // §5.2: the window's non-blobs enter at gen 1, minus gc_seen — the same
+    // min-gen upsert the barrier's ref feed uses, so an earlier generation
+    // is never overwritten
+    let shas: Vec<String> = page.iter().map(|r| r.sha.clone()).collect();
+    exec(
+        sql,
+        "INSERT INTO gc_frontier(sha, gen) SELECT j.value, 1 FROM json_each(?) j \
+         WHERE NOT EXISTS(SELECT 1 FROM gc_seen s WHERE s.sha=j.value) \
+         ON CONFLICT(sha) DO UPDATE SET gen=MIN(gc_frontier.gen, excluded.gen)",
+        vec![js(&shas)?],
+    )?;
+    crate::testhooks::failpoint(d, "gc.mark.page.after_frontier")?;
+    // a full page resumes at its last idx; a short page has covered the
+    // whole window, so the cursor jumps to the window's end either way
+    let page_rows_usize = usize::try_from(page_rows).unwrap_or(usize::MAX);
+    let full = page.len() >= page_rows_usize;
+    let new_cursor = if full {
+        page.last().map(|r| r.idx).unwrap_or(hi)
+    } else {
+        hi
+    };
+    exec(
+        sql,
+        "UPDATE gc_pending SET cursor=? WHERE seq=?",
+        vec![V::from(new_cursor), V::from(row.seq)],
+    )?;
+    crate::testhooks::failpoint(d, "gc.mark.page.after_cursor")?;
+    let max_idx = exec(
+        sql,
+        "SELECT COALESCE(MAX(idx),-1) AS n FROM objects WHERE pack_id=?",
+        vec![V::from(row.pack_id.as_str())],
+    )?
+    .one::<N>()?
+    .n;
+    // §5.2: a short page whose cursor reached the pack's last idx is done —
+    // frontier insert → cursor → delete, so a failure never loses a page
+    if !full && new_cursor >= max_idx {
+        exec(sql, "DELETE FROM gc_pending WHERE seq=?", vec![V::from(row.seq)])?;
+    }
+    delta_round(sql)?;
+    Ok(true)
 }
 
 /// S4's fence, shared by every post-await write in consolidate and its
@@ -499,23 +908,13 @@ pub(crate) fn chain_fence(
     Ok(true)
 }
 
-/// The 5.3 abort, shared by every arm: kill the build pack if one exists, drop all gc state,
-/// enqueue a fresh mark after the quiet window. A compact chain's abort is
-/// lossless — it enqueues nothing; the next trigger restarts compaction.
+/// The 5.3 abort, shared by every arm: the shared kill helper (keep rule on
+/// gc.new_pack, gc.* then scratch), then a fresh mark after the quiet window.
+/// A compact chain's abort is lossless — it enqueues nothing; the next
+/// trigger restarts compaction.
 fn abort(d: &RepoDo, sql: &SqlStorage) -> Result<SliceOutcome, Error> {
     let compact = d.meta_opt("gc.mode")?.as_deref() == Some("compact");
-    if let Some(p) = d.meta_opt("gc.new_pack")? {
-        exec(sql, "DELETE FROM objects WHERE pack_id=?", vec![p.clone().into()])?;
-        exec(
-            sql,
-            "UPDATE packs SET state='dead', dead_at=? WHERE id=? AND state IN ('ingesting','live')",
-            vec![now_ms().into(), p.into()],
-        )?;
-    }
-    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
-        exec(sql, &format!("DELETE FROM {t}"), vec![])?;
-    }
-    exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
+    wipe_all(d, sql)?;
     if !compact {
         enqueue(sql, JobKind::GcMark, now_ms() + d.gc_quiet_ms(), "{}")?;
     }
@@ -1191,7 +1590,17 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
         if d.meta_opt("gc.refs_version")?.is_none() {
             return Ok(None);
         }
-        if d.meta_i64("refs_version")? != d.meta_i64("gc.refs_version")? {
+        if barrier_active(d)? {
+            // §4.8: the refs_version abort is gone in barrier mode — the
+            // sweep is the single retirement fence. What remains is the
+            // cohort liveness guard: a dead cohort pack means the frozen
+            // bitmaps describe bytes that no longer exist, so the chain
+            // wipes like any other broken chain
+            if !compact::cohort_live(d, sql)? {
+                wipe_all(d, sql)?;
+                return Ok(None);
+            }
+        } else if refs_moved(d)? {
             abort(d, sql)?;
             return Ok(None);
         }
@@ -1218,8 +1627,11 @@ fn begin_build(d: &RepoDo, sql: &SqlStorage) -> Result<Option<Pos>, Error> {
             exec(sql, "DELETE FROM gc_parts", vec![])?;
             exec(sql, "DELETE FROM gc_tail", vec![])?;
             exec(sql, "DELETE FROM meta WHERE key IN ('gc.pos','gc.new_pack','gc.fails')", vec![])?;
-            put(d, "gc.phase", "sweep")?;
+            // §4.6: the sweep row exists before the phase is published —
+            // gc.build.handoff is the error-mode point between them
             enqueue(sql, JobKind::GcSweep, now_ms(), &chain_payload(d)?)?;
+            crate::testhooks::failpoint(d, "gc.build.handoff")?;
+            put(d, "gc.phase", "sweep")?;
         }
         return Ok(None);
     }
@@ -1308,8 +1720,10 @@ fn finish_build(
     if d.changes()? != 1 {
         return Err(Error::Internal("build pack row".into()));
     }
-    put(d, "gc.phase", "sweep")?;
+    // §4.6: the owner row is enqueued BEFORE the phase is published — same
+    // order as the begin_build total==0 arm
     enqueue(sql, JobKind::GcSweep, now_ms(), &chain_payload(d)?)?; // the only deleter (5.3)
+    put(d, "gc.phase", "sweep")?;
     Ok(Flow::Done) // gc.* cleared by the sweep span
 }
 
@@ -1343,23 +1757,29 @@ pub async fn gc_sweep(d: &RepoDo, job: &Job) -> Result<SliceOutcome, Error> {
     if d.meta_opt("gc.refs_version")?.is_none() {
         return Ok(SliceOutcome::Done);
     }
-    if d.meta_i64("refs_version")? != d.meta_i64("gc.refs_version")? {
+    if refs_moved(d)? {
         return abort(d, &sql);
     }
+    // §1.4b: epoch bump FIRST (a refs-moved abort above never reaches it),
+    // then dead-mark, then the row delete, then gc.*, then scratch — a kill
+    // anywhere leaves either the whole retirement or a keep-rule-clean slate
+    exec(&sql, "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='gc_epoch'", vec![])?;
     exec(
         &sql,
         "UPDATE packs SET state='dead', dead_at=? WHERE id IN (SELECT pack_id FROM marked)",
         vec![now_ms().into()],
     )?;
+    // error-mode point: the cohort is dead-marked but its rows still stand —
+    // the keep rule's partial-retirement window
+    crate::testhooks::failpoint(d, "gc.sweep.after_deadmark")?;
     exec(&sql, "DELETE FROM objects WHERE pack_id IN (SELECT pack_id FROM marked)", vec![])?;
-    exec(&sql, "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='gc_epoch'", vec![])?;
     // the delete span really ran — the chain completed, so repair's bounded
     // resurrection counters reset here; a stray or no-op sweep Done must not
     exec(&sql, "DELETE FROM meta WHERE key LIKE 'resurrected.gc_%'", vec![])?;
-    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
+    exec(&sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
+    for t in SCRATCH_TABLES {
         exec(&sql, &format!("DELETE FROM {t}"), vec![])?;
     }
-    exec(&sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
     Ok(SliceOutcome::Done)
 }
 

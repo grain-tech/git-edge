@@ -1114,6 +1114,10 @@ pub mod schema {
         // buffer, chunked. Without it a slice that can't fill one part inside the
         // request budget (sparse marks => ~1 read per entry) replays forever.
         "CREATE TABLE IF NOT EXISTS gc_tail (seq INTEGER PRIMARY KEY, blob BLOB NOT NULL)",
+        // PR5 write barrier: one row per pack promoted while a barrier chain is
+        // live; cursor = the mark's paging position into that pack's objects
+        // (B1 inserts rows only — the page span is phase B2).
+        "CREATE TABLE IF NOT EXISTS gc_pending (seq INTEGER PRIMARY KEY AUTOINCREMENT, pack_id TEXT UNIQUE NOT NULL, cursor INTEGER NOT NULL DEFAULT -1)",
         "CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL, level TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, scope TEXT, expires_at INTEGER) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS tokens_hash ON tokens(hash)",
         "CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, sha TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID",
@@ -1167,6 +1171,10 @@ pub mod schema {
         ("pushes", "scope", "scope TEXT"),
         ("pushes", "auth", "auth TEXT"),
         ("tokens", "expires_at", "expires_at INTEGER"),
+        // PR5: frontier rows carry a generation — 0 = snapshot roots, 1 = delta
+        // feeds written by the barrier while the mark walks. Existing rows
+        // default to 0, which is exactly what they are.
+        ("gc_frontier", "gen", "gen INTEGER NOT NULL DEFAULT 0"),
     ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {
@@ -1184,6 +1192,13 @@ pub mod schema {
                 super::exec(sql, &format!("ALTER TABLE {table} ADD COLUMN {decl}"), vec![])?;
             }
         }
+        // After LATE_COLS so the column exists on every schema vintage: the
+        // barrier-era frontier pop seeks by generation.
+        super::exec(
+            sql,
+            "CREATE INDEX IF NOT EXISTS gc_frontier_gen ON gc_frontier(gen, sha)",
+            vec![],
+        )?;
         // PR-3a: a NULL/blank token scope used to mean "all refs" and now denies.
         // Rewrite legacy rows to the explicit pattern so existing tokens keep the
         // access they were minted with. Idempotent; a no-op once every row is set.

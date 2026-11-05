@@ -50,14 +50,25 @@ def gc_chain(r, limit=30):
 def gc_drain(r, limit=60):
     """Step GC jobs until none of the three kinds is queued — unlike gc_chain
     this tolerates mid-chain aborts (an abort re-enqueues gc_mark) and chains
-    that end without a sweep."""
+    that end without a sweep.
+
+    Prefer the phase's owner (consolidate at build, sweep at sweep, else mark).
+    A naive mark-first order livelocks under PR5's barrier M4: a mark while
+    consolidate is queued only Reschedules, so the drain would never step the
+    builder."""
     for _ in range(limit):
         v = ge.jobs(r.name)
         queued = {j["kind"] for j in v["jobs"] if j["state"] == "queued"}
-        kind = next(
-            (k for k in ("gc_mark", "gc_consolidate", "gc_sweep") if k in queued),
-            None,
-        )
+        phase = (v.get("gc_meta") or {}).get("gc.phase")
+        if phase == "build" and "gc_consolidate" in queued:
+            kind = "gc_consolidate"
+        elif phase == "sweep" and "gc_sweep" in queued:
+            kind = "gc_sweep"
+        else:
+            kind = next(
+                (k for k in ("gc_consolidate", "gc_sweep", "gc_mark") if k in queued),
+                None,
+            )
         if kind is None:
             return
         ge.step(r.name, kind)

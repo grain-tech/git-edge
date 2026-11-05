@@ -193,6 +193,9 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Post, "_admin/test/pack_check") => test_forward(req, &env, &route, "/_do/test/pack_check", &spend).await,
         (Method::Post, "_admin/test/pack_state") => test_forward(req, &env, &route, "/_do/test/pack_state", &spend).await,
         (Method::Post, "_admin/test/kill_job") => test_forward(req, &env, &route, "/_do/test/kill_job", &spend).await,
+        (Method::Post, "_admin/test/query") => test_forward(req, &env, &route, "/_do/test/query", &spend).await,
+        // PR5 §8 oracle — GET (no _admin/test prefix per spec), same hooks gate
+        (Method::Get, "_admin/mark_check") => test_forward(req, &env, &route, "/_do/test/mark_check", &spend).await,
         _ => Err(Error::NotFound),
     };
     let resp = respond(r, git_pkt, spend.get());
