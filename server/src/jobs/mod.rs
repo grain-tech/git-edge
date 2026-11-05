@@ -128,6 +128,28 @@ pub fn heartbeat(sql: &SqlStorage, job: &Job) -> Result<bool, Error> {
         .map_err(|e| Error::Storage(e.to_string()))
 }
 
+/// The read-only half of the lease fence: true while the row is 'running'
+/// under our token. Sufficient inside one sync span — nothing can interleave
+/// between the SELECT and the writes that follow it, so a mid-span write
+/// batch (JobSink) needs no CAS; heartbeat's UPDATE additionally refreshes
+/// started_at for repair visibility, which a fenced-out slice doesn't want.
+pub fn lease_held(sql: &SqlStorage, job: &Job) -> Result<bool, Error> {
+    #[derive(serde::Deserialize)]
+    struct N {
+        n: i64,
+    }
+    // to_array, never one() — a zero-row cursor throws in workers-rs; COUNT(*)
+    // always returns exactly one row so the field carries the verdict
+    exec(
+        sql,
+        "SELECT COUNT(*) AS n FROM jobs WHERE id=? AND state='running' AND lease=?",
+        vec![V::from(job.id), V::from(job.lease.as_str())],
+    )?
+    .to_array::<N>()
+    .map(|rows| rows.first().map(|r| r.n > 0).unwrap_or(false))
+    .map_err(|e| Error::Storage(e.to_string()))
+}
+
 /// Returned by a slice whose heartbeat CAS failed: the row belongs to another
 /// lease now. The fenced outcome span no-ops on it, `attempts` is not consumed,
 /// and dispatch reports the event as `stale`, never a retry.
@@ -245,7 +267,8 @@ pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
             // bound resurrection: a deterministically failing chain (corrupt pack,
             // wedge) would otherwise restart at every boot forever — a ~400-subrequest
             // slice of doomed work each time. resurrected.<kind> counts restarts and
-            // resets when the chain completes (gc_sweep Done clears it).
+            // resets when a chain really completes (the sweep's delete span clears
+            // it — a stray or no-op sweep Done doesn't).
             let key = format!("resurrected.{}", kind.as_str());
             #[derive(serde::Deserialize)]
             struct M {
@@ -464,10 +487,6 @@ fn land_outcome(
                 if job.kind == JobKind::Janitor {
                     enqueue(&d.sql(), JobKind::Janitor, now + 15 * 60 * 1000, "{}")?;
                 }
-                if job.kind == JobKind::GcSweep {
-                    // chain completed — clear the resurrection counters repair uses
-                    d.q("DELETE FROM meta WHERE key LIKE 'resurrected.gc_%'", vec![])?;
-                }
                 emit("done", "ok", false, "");
                 outcome = "done";
             } else {
@@ -535,7 +554,7 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         JobKind::Janitor => janitor::run_slice(d, job, budget).await,
         JobKind::GcMark => gc::gc_mark(d, job, budget).await,
         JobKind::GcConsolidate => gc::gc_consolidate(d, job, budget).await,
-        JobKind::GcSweep => gc::gc_sweep(d).await,
+        JobKind::GcSweep => gc::gc_sweep(d, job).await,
         JobKind::PurgeRepo => purge::run_slice(d, job, budget).await,
         JobKind::ImportPack => import::run_slice(d, job, budget).await,
         JobKind::PushEvent => events::run_slice(d, job, budget).await,

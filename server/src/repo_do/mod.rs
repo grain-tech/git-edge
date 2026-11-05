@@ -245,6 +245,8 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/test/repair") if crate::testhooks::enabled(self) => crate::testhooks::repair(self),
                 (Method::Post, "/_do/test/drop_object") if crate::testhooks::enabled(self) => crate::testhooks::drop_object(self, &body),
                 (Method::Post, "/_do/test/knob") if crate::testhooks::enabled(self) => crate::testhooks::set_knob(self, &body),
+                (Method::Post, "/_do/test/meta") if crate::testhooks::enabled(self) => crate::testhooks::set_meta(self, &body),
+                (Method::Post, "/_do/test/enqueue") if crate::testhooks::enabled(self) => crate::testhooks::enqueue_job(self, &body),
                 _ => return Ok(None),
             }
             .map(Some)
@@ -1760,8 +1762,16 @@ impl RepoDo {
             any_ok |= r.is_none();
             results.push((c.name.clone(), r));
         }
+        // step 5: the version moves when a ref landed OR a pack went live
+        // without one — a non-atomic push whose every command lost still
+        // promoted its pack at step 3, so the live set a running GC
+        // snapshotted changed either way and its refs_version guards must
+        // abort it (C2). The atomic all-fail arm above already demoted its
+        // pack, so `pack_id` here means "live now".
+        if any_ok || req.pack_id.is_some() {
+            self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?;
+        }
         if any_ok {
-            self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?; // step 5
             // a repo created by pushing a non-main history (e.g. master-first) leaves
             // meta.head dangling — adopt an existing branch or clones can't check out
             self.q(
@@ -2317,27 +2327,29 @@ impl RepoDo {
         }
         let mut set = generate::SendSet::default();
         let mut by_pack: HashMap<String, usize> = HashMap::new();
-        let mut args: Vec<V> = Vec::with_capacity(live.len() + 1);
-        let marks = live.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // two parameters at any pack count (A6); one global sha cursor keeps
+        // cross-pack and cross-page dedup; chunking is rejected because each
+        // chunk would run its own cursor. The unary + keeps SQLite off the
+        // objects_pack index, so it walks the PK from sha > ?2 in order with
+        // no temp sort — without it every page re-scans every live row
+        // (quadratic).
+        let pack_ids = serde_json::to_string(&live.iter().map(|p| p.id.as_str()).collect::<Vec<_>>())
+            .map_err(|e| Error::Internal(e.to_string()))?;
         for p in &live {
             let count = u32::try_from(p.count).map_err(|_| Error::Internal("count".into()))?;
             let bytes = u64::try_from(p.bytes).map_err(|_| Error::Internal("bytes".into()))?;
             let bits = usize::try_from(count).map_err(|_| Error::Internal("count".into()))?.div_ceil(8);
             by_pack.insert(p.id.clone(), set.packs.len());
-            args.push(V::from(p.id.as_str()));
             set.packs.push(generate::PackSlice { pack: PackId(p.id.clone()), count, bytes, bitmap: vec![0; bits] });
         }
         let mut last = String::new();
         loop {
-            let mut page = args.clone();
-            page.push(V::from(last.as_str()));
             let rows = self
                 .q(
-                    &format!(
-                        "SELECT sha, pack_id, idx FROM objects \
-                         WHERE pack_id IN ({marks}) AND sha > ? ORDER BY sha LIMIT 5000"
-                    ),
-                    page,
+                    "SELECT sha, pack_id, idx FROM objects \
+                     WHERE +pack_id IN (SELECT value FROM json_each(?1)) AND sha > ?2 \
+                     ORDER BY sha LIMIT 5000",
+                    vec![V::from(pack_ids.as_str()), V::from(last.as_str())],
                 )?
                 .to_array::<DedupRow>()?;
             let n = rows.len();
