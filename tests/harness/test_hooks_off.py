@@ -26,6 +26,8 @@ ROUTES = [
     ("POST", "drop_object"),
     ("POST", "drop_pack"),
     ("POST", "knob"),
+    ("POST", "meta"),
+    ("POST", "enqueue"),
     ("GET", "jobs"),
     ("GET", "fsck"),
 ]

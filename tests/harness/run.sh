@@ -10,4 +10,4 @@ if [ "${GE_HOOKS_OFF:-0}" = "1" ]; then
   exec python3 -m unittest -v tests/harness/test_hooks_off.py
 fi
 export GE_SERVER_LOG="${GE_SERVER_LOG:-/tmp/ge-dev.log}"
-exec python3 -m unittest -v tests/harness/test_harness.py
+exec python3 -m unittest -v tests/harness/test_harness.py tests/harness/test_gc_safety.py
