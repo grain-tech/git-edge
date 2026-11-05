@@ -369,16 +369,10 @@ Remaining known gaps (documented, not blocking):
 - `coalesce` keeps a defensive `unwrap_or(u32::MAX)` on a value bounded by
   WINDOW (P3); a future invariant change should fail loudly instead.
 
-## Round 7 — real-repo benchmark (atlas-core, grain-core)
+## Round 7 — large-repo benchmark bugs
 
-Pushed two production repos (staged by commit ranges, local worker):
-
-- **atlas-core `master`**: 5,376 commits, ~150k objects across refs, 153 MiB
-  pack — 4 pushes ~63 s, clone 11.6 s, fsck clean.
-- **grain-core `main`**: 6,570 commits, ~403k objects across refs, 434 MiB
-  pack — 8 pushes ~26 s, clone 20.3 s, fsck clean.
-
-The benchmark surfaced two production bugs, both fixed:
+A local-worker benchmark against large private histories (staged by commit
+ranges; sizes omitted) surfaced two production bugs, both fixed:
 
 - **Clone 413 `read batch exceeds memory budget`** — `read_entries` bounds one
   call at 48 MiB of *coalesced spans*; the expansion `load()` (CHUNK=10,000
@@ -476,8 +470,7 @@ Four features, all verified against local workerd (git 2.54,
 
 ## Round 10 — OSS repo benchmarks + artifact-fs e2e (main, post-#12)
 
-Public-repo spread replacing the private-repo numbers (atlas-core/grain-core,
-kept above as history). Harness: `tests/bench/oss-bench.sh` — bare clone,
+Public-repo spread that replaced the earlier private-history numbers. Harness: `tests/bench/oss-bench.sh` — bare clone,
 staged first-parent pushes sliced under 60 MiB **and** 30k objects, clone back,
 tip + `fsck --strict` output must match the source byte-for-byte.
 
