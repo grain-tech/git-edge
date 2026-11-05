@@ -625,7 +625,8 @@ class Barrier(unittest.TestCase):
         and reports dead_rows == 0 — the surviving new pack is NOT cohort.
         Killing the sweep owner then stepping gc_mark runs the M4 orphan arm:
         wipe_all(keep) dead-marks-or-keeps, deletes the dead cohort's object
-        rows, and leaves gc.new_pack live."""
+        rows, and leaves gc.new_pack live. (PR6: the fenced swap's
+        gc.swap.after_deadmark is the same post-dead-mark window.)"""
         r = repo("keep-partial")
         barrier_on(r)
         seed(r, 2)
@@ -634,12 +635,12 @@ class Barrier(unittest.TestCase):
         v = ge.jobs(r.name)
         new_pack = v["gc_meta"].get("gc.new_pack")
         self.assertIsNotNone(new_pack, "%r" % v["gc_meta"])
-        ge.failpoint(r.name, "gc.sweep.after_deadmark", "error", 1)
+        ge.failpoint(r.name, "gc.swap.after_deadmark", "error", 1)
         s = ge.step(r.name, "gc_sweep")  # dies mid-retirement
         self.assertEqual(s["outcome"], "retry", "failpoint never fired: %r" % s)
         v = ge.jobs(r.name)
         fp = next((f for f in v["failpoints"]
-                   if f["name"] == "gc.sweep.after_deadmark"), None)
+                   if f["name"] == "gc.swap.after_deadmark"), None)
         self.assertIsNotNone(fp)
         self.assertEqual(fp["remaining"], 0, "failpoint was never consumed")
         packs = {p["id"]: p for p in v["packs"]}
@@ -664,7 +665,7 @@ class Barrier(unittest.TestCase):
                          "keep path dead-marked the surviving pack")
         self.assertEqual(ge.live_objects(r.name)["dead_rows"], 0,
                          "keep path left dead-pack object rows behind")
-        ge.failpoint(r.name, "gc.sweep.after_deadmark", "off")
+        ge.failpoint(r.name, "gc.swap.after_deadmark", "off")
         tgs.gc_drain(r, limit=120)
         assert_pack_ok(self, r)
 

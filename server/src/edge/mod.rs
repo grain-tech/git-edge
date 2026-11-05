@@ -185,6 +185,7 @@ pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Post, "_admin/test/knob") => test_forward(req, &env, &route, "/_do/test/knob", &spend).await,
         (Method::Post, "_admin/test/meta") => test_forward(req, &env, &route, "/_do/test/meta", &spend).await,
         (Method::Post, "_admin/test/enqueue") => test_forward(req, &env, &route, "/_do/test/enqueue", &spend).await,
+        (Method::Post, "_admin/test/marked_built") => test_forward(req, &env, &route, "/_do/test/marked_built", &spend).await,
         (Method::Post, "_admin/test/drop_pack") => test_forward(req, &env, &route, "/_do/test/drop_pack", &spend).await,
         (Method::Get, "_admin/test/jobs") => test_forward(req, &env, &route, "/_do/test/jobs", &spend).await,
         (Method::Get, "_admin/test/fsck") => test_forward(req, &env, &route, "/_do/test/fsck", &spend).await,

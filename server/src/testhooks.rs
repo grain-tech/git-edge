@@ -22,6 +22,8 @@
 //!   POST /_do/test/enqueue     {"kind","payload"?} — insert a job row like repair resurrection
 //!   POST /_do/test/mark_check  {} — PR5 §8 oracle (edge: GET /_admin/mark_check)
 //!   POST /_do/test/query       {"sql"} — EXPLAIN QUERY PLAN rows, EXPLAIN only
+//!   POST /_do/test/marked_built {"null": true} — UPDATE marked SET built=NULL
+//!                              (pre-PR6 barrier-chain fixture)
 //!
 //! PR5 additions (phase A ships the hooks only — the barrier itself lands in
 //! a later phase; every name below is documented here so tests can arm it):
@@ -53,6 +55,27 @@
 //!                                    the object-row delete (partial sweep)
 //!     gc.compact.after_deadmark      error after cohort retirement inside
 //!                                    compact::swap (partial swap)
+//!
+//! PR6 additions (phase A ships the hooks only — the fenced swap lands in
+//! phase B):
+//!   route: `POST /_do/test/marked_built` — body {"null": true} runs
+//!     `UPDATE marked SET built=NULL`, modelling a barrier chain that began
+//!     before `marked.built` existed (the deploy-over-PR5 arm, spec §2). Until
+//!     phase B adds the column the UPDATE just errors — that error is the
+//!     expected red signal.
+//!   jobs view: gc_meta also returns `gc_last_swap`/`gc_fallbacks` once set
+//!     (both live outside `gc.*`, so they survive the chain-end wipe).
+//!   knobs: `swap_tries` (default 8) — non-empty drain checks that also saw
+//!     refs_version move before the fallback fires; `swap_max_slices`
+//!     (default 64) — the drain-slice backstop.
+//!   failpoints (names only until phase B hosts them):
+//!     gc.drain.after_read             async (pause-capable): after a drain
+//!                                     slice's R2 read, before its write span
+//!     gc.swap.before                  claim-only, at the swap span's entry
+//!     gc.swap.after_epoch             error after the lossy epoch bump
+//!     gc.swap.after_deadmark          error after the retire-set dead-mark
+//!     gc.swap.fallback.after_deadmark error inside the fallback's retire span
+//!     janitor.before_r2_delete        error before a dead pack's R2 delete
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -239,7 +262,8 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
     let gc_meta: serde_json::Map<String, serde_json::Value> = d
         .q(
             "SELECT key,value FROM meta WHERE key LIKE 'gc.%' OR key LIKE 'dead.%' \
-             OR key IN ('compact.quarantine','compact.quarantine.corrupt','gc_epoch','refs_version')",
+             OR key IN ('compact.quarantine','compact.quarantine.corrupt','gc_epoch','refs_version',\
+             'gc_last_swap','gc_fallbacks')",
             vec![],
         )?
         .to_array::<KV>()?
@@ -518,6 +542,24 @@ pub fn set_meta(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
         }
     }
     json(serde_json::json!({ "key": b.key, "value": b.value }))
+}
+
+/// POST /_do/test/marked_built {"null": true} — force every `marked.built`
+/// back to NULL: the fixture for a barrier chain that reached phase=sweep
+/// before PR6 shipped the column (the deploy-transition arm — such a chain's
+/// sweep must take the unchanged PR5 path). Until the column exists the
+/// UPDATE fails, which is exactly the red signal the test wants.
+pub fn marked_built(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        null: Option<bool>,
+    }
+    let b: B = parse(body)?;
+    if b.null != Some(true) {
+        return Err(Error::Protocol("marked_built wants {\"null\": true}".into()));
+    }
+    d.q("UPDATE marked SET built=NULL", vec![])?;
+    json(serde_json::json!({ "built_null": true, "rows": d.changes()? }))
 }
 
 pub fn set_failpoint(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {

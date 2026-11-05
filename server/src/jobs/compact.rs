@@ -644,6 +644,44 @@ fn swap_wipe_compact_scratch(sql: &SqlStorage) -> Result<(), Error> {
     Ok(())
 }
 
+/// §3.2 step 11 (d1 D): release the compaction hold once a barrier chain's
+/// swap lands. Any gc_compact row sitting out a busy reschedule
+/// (attempts=0 AND last_error IS NULL — error backoffs keep their own
+/// run_at) is pulled forward to now; then, when a compact row is due,
+/// EVERY queued gc_mark is pushed behind now + max(gc_quiet_ms,1) so the
+/// compaction runs before the next chain can grab the hold again. Called
+/// from the sweep's end_of_chain on barrier chains only.
+pub fn release_hold(d: &RepoDo) -> Result<(), Error> {
+    #[derive(serde::Deserialize)]
+    struct N {
+        n: i64,
+    }
+    let sql = d.sql();
+    let now = now_ms();
+    exec(
+        &sql,
+        "UPDATE jobs SET run_at=? WHERE kind='gc_compact' AND state='queued' AND attempts=0 AND last_error IS NULL",
+        vec![V::from(now)],
+    )?;
+    let due = exec(
+        &sql,
+        "SELECT COUNT(*) AS n FROM jobs WHERE kind='gc_compact' AND state='queued' AND run_at<=?",
+        vec![V::from(now)],
+    )?
+    .one::<N>()?
+    .n
+        > 0;
+    if due {
+        let hold = now.saturating_add(d.gc_quiet_ms().max(1));
+        exec(
+            &sql,
+            "UPDATE jobs SET run_at=MAX(run_at,?) WHERE kind='gc_mark' AND state='queued'",
+            vec![V::from(hold)],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
