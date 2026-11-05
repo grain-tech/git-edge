@@ -87,6 +87,19 @@ def admin(repo, method, path, body=None):
     return json.loads(data)
 
 
+def admin_route(repo, method, path, body=None):
+    """Call a PRODUCTION admin route — /<owner>/<repo>/_admin/<path>
+    (pin/unpin/protect/unprotect/format), as opposed to the _admin/test jigs
+    admin() drives. Returns the decoded JSON body; raises on non-200."""
+    st, data = http(method, "/%s/_admin/%s" % (repo, path), body)
+    if st != 200:
+        raise AssertionError(
+            "%s /%s/_admin/%s -> %d: %s"
+            % (method, repo, path, st, redact(data[:400].decode("utf-8", "replace")))
+        )
+    return json.loads(data)
+
+
 def jobs(repo):
     return admin(repo, "GET", "jobs")
 

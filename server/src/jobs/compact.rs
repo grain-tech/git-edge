@@ -555,7 +555,7 @@ fn gc_compact_dedup_bitmaps(sql: &SqlStorage, mut good: Vec<LivePack>) -> Result
 }
 
 fn gc_compact_stake_chain(d: &RepoDo, sql: &SqlStorage, bitmaps: Vec<(String, Vec<u8>)>) -> Result<(), Error> {
-    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
+    for t in gc::SCRATCH_TABLES {
         exec(sql, &format!("DELETE FROM {t}"), vec![])?;
     }
     exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
@@ -593,7 +593,7 @@ pub(crate) fn swap(
         return Ok(gc::Flow::Done);
     }
     swap_promote_output_pack(d, sql, pack, meta)?;
-    swap_retire_cohort_packs(sql)?;
+    swap_retire_cohort_packs(d, sql)?;
     swap_wipe_compact_scratch(sql)?;
     // S7: the compact swap owns only this counter — GC's sweep keeps the rest
     exec(sql, "DELETE FROM meta WHERE key='resurrected.gc_compact'", vec![])?;
@@ -622,21 +622,25 @@ fn swap_promote_output_pack(d: &RepoDo, sql: &SqlStorage, pack: &str, meta: &Pac
     Ok(())
 }
 
-fn swap_retire_cohort_packs(sql: &SqlStorage) -> Result<(), Error> {
+fn swap_retire_cohort_packs(d: &RepoDo, sql: &SqlStorage) -> Result<(), Error> {
     exec(
         sql,
         "UPDATE packs SET state='dead', dead_at=? WHERE id IN (SELECT pack_id FROM marked)",
         vec![now_ms().into()],
     )?;
+    // error-mode point: the cohort is dead-marked but its rows still stand —
+    // the keep rule's partial-retirement window, same as the sweep's
+    crate::testhooks::failpoint(d, "gc.compact.after_deadmark")?;
     exec(sql, "DELETE FROM objects WHERE pack_id IN (SELECT pack_id FROM marked)", vec![])?;
     Ok(())
 }
 
 fn swap_wipe_compact_scratch(sql: &SqlStorage) -> Result<(), Error> {
-    for t in ["marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail"] {
+    // same order as the sweep and the kill helper: gc.* before the scratch
+    exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
+    for t in gc::SCRATCH_TABLES {
         exec(sql, &format!("DELETE FROM {t}"), vec![])?;
     }
-    exec(sql, "DELETE FROM meta WHERE key LIKE 'gc.%'", vec![])?;
     Ok(())
 }
 

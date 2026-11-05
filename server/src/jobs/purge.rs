@@ -16,17 +16,18 @@
 
 use worker::{SqlStorage, SqlStorageValue as V};
 
-use super::{heartbeat, stale_lease, Job, SliceBudget, SliceOutcome};
+use super::{gc, heartbeat, stale_lease, Job, SliceBudget, SliceOutcome};
 use crate::error::Error;
 use crate::repo_do::RepoDo;
 use crate::store::schema;
 
 const PAGE: u32 = 1_000; // one list page == one delete_multiple call (<= 1000 keys)
 
-/// Every table but `jobs` — our own row goes last so a re-sliced run can find it.
+/// Every table but `jobs` and the GC scratch set (gc::SCRATCH_TABLES wipes
+/// those) — our own row goes last so a re-sliced run can find it.
 const TABLES: &[&str] = &[
     "objects", "packs", "pushes", "refs", "reflog", "tokens", "pins", "protected", "commit_parents", "push_events", "rate",
-    "marked", "gc_frontier", "gc_seen", "gc_parts", "gc_tail", "meta",
+    "meta",
 ];
 
 #[derive(serde::Deserialize)]
@@ -108,7 +109,7 @@ async fn wipe(d: &RepoDo, job: &Job, sql: &SqlStorage) -> Result<SliceOutcome, E
     // a previous attempt may have completed delete_all (schema dropped) and died
     // before the fenced Done ran — recreate so the deletes below still parse
     schema::migrate(sql)?;
-    for t in TABLES {
+    for t in gc::SCRATCH_TABLES.iter().chain(TABLES.iter()) {
         crate::store::exec(sql, &format!("DELETE FROM {t}"), vec![])?;
     }
     // no janitor/gc row may resurrect into a half-wiped repo — every job but this one

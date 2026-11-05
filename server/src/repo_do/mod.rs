@@ -255,6 +255,7 @@ impl DurableObject for RepoDo {
                 (Method::Post, "/_do/test/knob") if crate::testhooks::enabled(self) => crate::testhooks::set_knob(self, &body),
                 (Method::Post, "/_do/test/meta") if crate::testhooks::enabled(self) => crate::testhooks::set_meta(self, &body),
                 (Method::Post, "/_do/test/enqueue") if crate::testhooks::enabled(self) => crate::testhooks::enqueue_job(self, &body),
+                (Method::Post, "/_do/test/query") if crate::testhooks::enabled(self) => crate::testhooks::query(self, &body),
                 (Method::Post, "/_do/test/objects") if crate::testhooks::enabled(self) => crate::testhooks::objects_view(self),
                 (Method::Post, "/_do/test/pack_state") if crate::testhooks::enabled(self) => crate::testhooks::pack_state(self, &body),
                 (Method::Post, "/_do/test/kill_job") if crate::testhooks::enabled(self) => crate::testhooks::kill_job(self, &body),
@@ -300,6 +301,9 @@ impl DurableObject for RepoDo {
                 }
                 (Method::Post, "/_do/test/pack_check") => {
                     return test_resp(crate::testhooks::pack_check(self, &body).await);
+                }
+                (Method::Post, "/_do/test/mark_check") => {
+                    return test_resp(crate::testhooks::mark_check(self).await);
                 }
                 _ => Err(Error::NotFound),
             },
@@ -840,6 +844,9 @@ impl RepoDo {
             // consolidate holds undrained buffered bytes between slices;
             // a nonzero count that never moves is the livelock tell
             "gc_tail": count("SELECT COUNT(*) AS n FROM gc_tail")?,
+            // PR5: packs promoted under a live barrier chain awaiting their
+            // pending-page drain — nonzero only while barrier mode is on
+            "gc_pending": count("SELECT COUNT(*) AS n FROM gc_pending")?,
             "tokens": count("SELECT COUNT(*) AS n FROM tokens")?,
             "pins": pins
                 .iter()
@@ -1749,6 +1756,10 @@ impl RepoDo {
                 .collect::<Vec<_>>();
             return self.finish_push(req, "rejected", now, results);
         }
+        // PR5 §3.1: the barrier mode is read once per push, after the epoch
+        // check — a rejected push feeds nothing. Every arm reads the
+        // persisted gc.* rows, never the env var.
+        let barrier = jobs::gc::barrier_active(self)?;
         if let Some(pack) = &req.pack_id {
             // A26: per-repo object/byte quotas, evaluated now that ingest has posted
             // the pack's real counts. Live packs plus this push's own ingesting pack
@@ -1777,6 +1788,9 @@ impl RepoDo {
                 return Err(Error::Limit(format!("repo quota exceeded: {m}")));
             }
             // step 3
+            if barrier {
+                self.barrier_write_pending_before_promote(pack.as_str())?;
+            }
             self.q(
                 // bound to this push: an ingesting pack that belongs to a different push
                 // must not be promotable by someone else's commit
@@ -1804,7 +1818,7 @@ impl RepoDo {
             let mut results = Vec::with_capacity(cmds.len());
             let mut any_fail = false;
             for c in &cmds {
-                let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, false, &scopes)?;
+                let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, false, barrier, &scopes)?;
                 any_fail |= r.is_some();
                 results.push((c.name.clone(), r));
             }
@@ -1815,6 +1829,14 @@ impl RepoDo {
                         "UPDATE packs SET state='ingesting' WHERE id=? AND push_id=?",
                         vec![V::from(pack.as_str()), V::from(req.push_id.as_str())],
                     )?;
+                    if barrier {
+                        // §3.3: demote first, then drop the pending row — the
+                        // pack can't be promoted again (step 1 requires 'open')
+                        self.q(
+                            "DELETE FROM gc_pending WHERE pack_id=?",
+                            vec![V::from(pack.as_str())],
+                        )?;
+                    }
                 }
                 let results = results
                     .into_iter()
@@ -1827,7 +1849,7 @@ impl RepoDo {
         let mut any_ok = false;
         for c in &cmds {
             // step 4
-            let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, true, &scopes)?;
+            let r = self.apply_one(&idx, &head, c, &req.push_id, &req.principal, now, true, barrier, &scopes)?;
             any_ok |= r.is_none();
             results.push((c.name.clone(), r));
         }
@@ -1900,10 +1922,61 @@ impl RepoDo {
         Ok(())
     }
 
+    /// §3.2 write-ahead: the pending row and the refs_version bump precede the
+    /// promotion they protect — protection and bump land before the mutation,
+    /// never after (DO SQLite does not roll back).
+    fn barrier_write_pending_before_promote(&self, pack: &str) -> Result<(), Error> {
+        crate::testhooks::failpoint(self, "gc.barrier.pending")?;
+        self.q(
+            "INSERT OR IGNORE INTO gc_pending(pack_id) VALUES(?)",
+            vec![V::from(pack)],
+        )?;
+        self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?;
+        crate::testhooks::failpoint(self, "gc.barrier.before_promote")?;
+        Ok(())
+    }
+
+    /// §3.4 landing feed: frontier gen-1 insert for new/peeled targets (non-delete).
+    fn barrier_feed_landing(&self, feeds: &[String]) -> Result<(), Error> {
+        crate::testhooks::failpoint(self, "gc.barrier.landing")?;
+        self.q(
+            "INSERT INTO gc_frontier(sha, gen) SELECT j.value, 1 FROM json_each(?) j \
+             WHERE NOT EXISTS(SELECT 1 FROM gc_seen s WHERE s.sha=j.value) \
+             ON CONFLICT(sha) DO UPDATE SET gen=MIN(gc_frontier.gen, excluded.gen)",
+            vec![serde_json::to_string(feeds)
+                .map_err(|e| Error::Internal(e.to_string()))?
+                .into()],
+        )?;
+        Ok(())
+    }
+
+    /// The CAS predicate both the --atomic dry run and the barrier pre-check
+    /// share: a create lands iff the ref is absent; an update/delete lands
+    /// iff the stored target equals the expected old.
+    fn ref_cas_ok(&self, name: &str, old_null: bool, old: &str) -> Result<bool, Error> {
+        #[derive(serde::Deserialize)]
+        struct T {
+            target: String,
+        }
+        let cur = self
+            .q("SELECT target FROM refs WHERE name=?", vec![V::from(name)])?
+            .to_array::<T>()?
+            .into_iter()
+            .next();
+        Ok(match (&cur, old_null) {
+            (None, true) => true,
+            (Some(t), false) => t.target == old,
+            _ => false,
+        })
+    }
+
     /// One RefCommand, independent of its siblings unless `atomic` was requested.
     /// `write=false` is the --atomic dry run: every check runs but the ref table
     /// is only read — the CAS predicate becomes a SELECT so a multi-command push
-    /// can validate fully before any sibling writes.
+    /// can validate fully before any sibling writes. `barrier` is the push's
+    /// persisted barrier mode (§3): a landing pre-checks the same CAS predicate,
+    /// feeds its new/peeled to gc_frontier at gen 1 and bumps refs_version
+    /// BEFORE the ref write lands.
     fn apply_one(
         &self,
         idx: &Index<'_>,
@@ -1913,6 +1986,7 @@ impl RepoDo {
         who: &str,
         now: i64,
         write: bool,
+        barrier: bool,
         scopes: &[Option<&str>],
     ) -> Result<Option<&'static str>, Error> {
         // refs live under refs/ only — a full valid refname, never HEAD or a bare word
@@ -1966,23 +2040,35 @@ impl RepoDo {
         if !write {
             // the CAS predicates, read-only: a create lands iff the ref is
             // absent; update/delete land iff target equals the expected old.
-            #[derive(serde::Deserialize)]
-            struct T {
-                target: String,
-            }
-            let cur = self
-                .q("SELECT target FROM refs WHERE name=?", vec![V::from(name)])?
-                .to_array::<T>()?
-                .into_iter()
-                .next();
-            let ok = match (&cur, c.old.is_null()) {
-                (None, true) => true,
-                (Some(t), false) => t.target == o,
-                _ => false,
-            };
-            return Ok(if ok { None } else { Some("failed to update ref") });
+            return Ok(if self.ref_cas_ok(name, c.old.is_null(), &o)? {
+                None
+            } else {
+                Some("failed to update ref")
+            });
         }
         let peeled = c.peeled.clone().map_or(V::Null, |p| V::from(p));
+        if barrier {
+            // §3.4: the same read-only CAS predicate the write uses, in this
+            // span — a loser gets the existing rejection with no protection
+            // and no bump
+            if !self.ref_cas_ok(name, c.old.is_null(), &o)? {
+                return Ok(Some("failed to update ref"));
+            }
+            // a landing feeds its non-zero new/peeled to the frontier at gen 1
+            // (minus gc_seen, min-gen upsert) and bumps refs_version BEFORE
+            // the ref write — deletes feed nothing
+            if !c.new.is_null() {
+                let mut feeds = vec![c.new.to_string()];
+                if let Some(p) = &c.peeled {
+                    if p.bytes().any(|b| b != b'0') {
+                        feeds.push(p.clone());
+                    }
+                }
+                self.barrier_feed_landing(&feeds)?;
+            }
+            // P′: every landing including deletes bumps before the write (review c1)
+            self.q("UPDATE meta SET value=value+1 WHERE key='refs_version'", vec![])?;
+        }
         if c.old.is_null() {
             self.q(
                 "INSERT INTO refs(name,target,peeled,updated_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
@@ -2000,6 +2086,12 @@ impl RepoDo {
             )?;
         }
         if self.changes()? != 1 {
+            // §3.4: in barrier mode the landing pre-check already proved the
+            // CAS — a zero-row write here is impossible, so it is a bug, not
+            // a legitimate CAS loss (legacy keeps the ng string)
+            if barrier {
+                return Err(Error::Internal("ref write after landing pre-check".into()));
+            }
             return Ok(Some("failed to update ref")); // git's own ng string
         }
         self.q(
@@ -2013,6 +2105,10 @@ impl RepoDo {
                 V::from(now),
             ],
         )?;
+        if barrier {
+            // §3.7: the ref and its protection are all present past this point
+            crate::testhooks::failpoint(self, "gc.barrier.after")?;
+        }
         Ok(None)
     }
 
