@@ -133,6 +133,33 @@ def enqueue(repo, kind, payload="{}"):
     return admin(repo, "POST", "enqueue", {"kind": kind, "payload": payload})
 
 
+def live_objects(repo):
+    """GET objects -> {"shas": sorted distinct SHAs of objects rows in live
+    packs, "rows": n, "dead_rows": objects rows whose pack is neither live
+    nor ingesting} — the PR4 lossless-compaction oracle."""
+    return admin(repo, "GET", "objects")
+
+
+def pack_check(repo, pack):
+    """POST pack_check {"pack"} — decode the pack's R2 bytes and compare
+    against its index rows: {"header_count","decoded","index_rows","distinct",
+    "commit_lo","commit_hi"}. commit_lo/hi are the decoded commit-entry byte
+    span (min start offset, max end offset) — null when the pack holds no
+    commits — the order-independent oracle for a packs row's commit span."""
+    return admin(repo, "POST", "pack_check", {"pack": pack})
+
+
+def pack_state(repo, pack, state):
+    """Jig: force packs.state — e.g. kill a cohort pack under a paused swap."""
+    return admin(repo, "POST", "pack_state", {"pack": pack, "state": state})
+
+
+def kill_job(repo, kind):
+    """Jig: every queued/running row of `kind` -> 'dead', last_error
+    'test kill' — strands a chain the way a poisoned job row would."""
+    return admin(repo, "POST", "kill_job", {"kind": kind})
+
+
 def state(repo):
     """The public /_state probe — (status, dict|None)."""
     st, data = http("GET", "/%s/_state" % repo)

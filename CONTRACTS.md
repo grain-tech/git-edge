@@ -374,6 +374,8 @@ Why the two review races are now impossible:
 - *Janitor deletes bytes of a pack whose ref is live* (repo-do-ref-authority review): R2 deletion needs a `dead` row older than GRACE. A pack becomes `dead` only in `GcSweep` (guarded above) or for a push that is `expired`/`rejected` (never committed, so no ref points into it; `pending/` keys are never referenced by any ref).
 - *A refs_version check that is not atomic with the delete* (gc review): the check and the SQLite deletes are the same sync span; the R2 delete is not load-bearing, because readers resolve through SQLite only.
 
+**G4a compaction** (`GcCompact` -> `GcConsolidate`, sharing the single-chain machinery with `gc.mode='compact'`): bounds live-pack growth without reachability — it repacks only what it already holds, so a push or fetch during the build is legal by construction. A cohort is chosen by a pure tiered selector over live packs (tiers by object count from BASE_N=8, fanin T >= 2, packs < 64 MiB, at most 2T packs / MAX_ROWS rows / 256 MiB per swap); triggers fire on every pack that goes live, on each janitor pass, and as a drain re-trigger inside the swap, and each trigger also pulls an already-queued `gc_compact` row forward to the new wake — but only a row that has never been dispatched (`attempts=0 AND last_error IS NULL AND started_at IS NULL`): a row sitting out an error backoff or busy reschedule keeps its `run_at` rather than retrying on every push. `gc_compact` is one sync span: it verifies or aborts an existing chain (S1's owner-keyed orphan check — the dead rows' `last_error` is preserved under `dead.<kind>` and a compact cohort takes a `compact.quarantine` strike, n=2 excluding a pack; a stored strike map that fails to parse is stashed raw under `compact.quarantine.corrupt` (first corruption kept) and replaced by a fresh empty map, so strikes keep accumulating rather than freezing forever), dedups cohort entries into the `marked` bitmaps, and stakes `gc.chain` + `gc.phase='build'`. The shared `GcConsolidate` build then runs with the refs_version checks skipped, a cohort-liveness recheck on entry (a marked pack that died between init and the first build slice aborts losslessly), and every post-await write fenced on the captured `gc.chain` (plus `gc.new_pack == pos.pack` in compact mode); its finish swaps one sync span: the new pack goes `live` with `created_at = MAX(cohort.created_at)`, cohort packs die in place with their `objects` rows deleted, and scratch wipes — no `gc_epoch` bump, no mark, and a `gc_sweep` row in compact mode is a no-op. Fetches survive the swap: the walk path keeps the marked SHAs and replans once against the live index when a marked pack retires mid-fetch — a mark landing on a retired pack flags the send-set stale and forces the replan even when no bitmap survives to compare.
+
 ---
 
 ## 6. Request body contract (defect 7)
@@ -697,8 +699,9 @@ produced these corrections, all verified against git 2.54:
 - A mid-stream fetch error is one band-3 `ERR` frame, then the stream ends; the failing
   step is never retried.
 - `plan_reads` asserts the objects index still matches the in-memory bitmap: a `gc_sweep`
-  or push-abort landing between mark and plan now fails the fetch instead of writing a
-  wire-corrupt pack.
+  or push-abort landing between mark and plan fails the fetch — or, on the walking path
+  that recorded the marked SHAs, replans once against the live index — instead of
+  writing a wire-corrupt pack.
 - Ingest strictness: commits whose headers do not parse and tags that do not parse are
   `unpack` failures — a malformed object can never enter the index and poison every later
   read. Forward `REF_DELTA` bases (a delta naming a later entry) resolve in a bounded

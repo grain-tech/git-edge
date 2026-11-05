@@ -176,7 +176,10 @@ struct PackRow {
     id: String,
     state: String,
     count: i64,
+    bytes: i64,
     created_at: i64,
+    commit_lo: i64,
+    commit_hi: i64,
     push_id_null: i64,
     marked: i64,
 }
@@ -200,7 +203,8 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
         .to_array::<JobRow>()?;
     let gc_meta: serde_json::Map<String, serde_json::Value> = d
         .q(
-            "SELECT key,value FROM meta WHERE key LIKE 'gc.%' OR key IN ('gc_epoch','refs_version')",
+            "SELECT key,value FROM meta WHERE key LIKE 'gc.%' OR key LIKE 'dead.%' \
+             OR key IN ('compact.quarantine','compact.quarantine.corrupt','gc_epoch','refs_version')",
             vec![],
         )?
         .to_array::<KV>()?
@@ -209,7 +213,8 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
         .collect();
     let packs = d
         .q(
-            "SELECT id,state,count,created_at,(push_id IS NULL) AS push_id_null, \
+            "SELECT id,state,count,bytes,created_at,commit_lo,commit_hi, \
+             (push_id IS NULL) AS push_id_null, \
              EXISTS(SELECT 1 FROM marked m WHERE m.pack_id=packs.id) AS marked \
              FROM packs ORDER BY id",
             vec![],
@@ -259,8 +264,9 @@ fn view(d: &RepoDo) -> Result<serde_json::Value, Error> {
             "name": f.name, "action": f.action, "remaining": f.remaining,
         })).collect::<Vec<_>>(),
         "packs": packs.iter().map(|p| serde_json::json!({
-            "id": p.id, "state": p.state, "count": p.count,
-            "created_at": p.created_at, "push_id_null": p.push_id_null != 0,
+            "id": p.id, "state": p.state, "count": p.count, "bytes": p.bytes,
+            "created_at": p.created_at, "commit_lo": p.commit_lo,
+            "commit_hi": p.commit_hi, "push_id_null": p.push_id_null != 0,
             "marked": p.marked != 0,
         })).collect::<Vec<_>>(),
         "pushes": pushes.iter().map(|p| serde_json::json!({
@@ -525,6 +531,184 @@ pub fn drop_object(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
     }
 }
 
+/// GET /_do/test/objects — {"shas": sorted distinct SHAs over live packs'
+/// objects rows, "rows": n, "dead_rows": objects rows whose pack is neither
+/// live nor ingesting}. The PR4 lossless-compaction oracle: the live SHA set
+/// must be byte-identical before and after a swap, and the swap must delete
+/// the cohort's rows — fsck only reads live packs, so dead_rows is the only
+/// place a leaked row shows up.
+pub fn objects_view(d: &RepoDo) -> Result<Response, Error> {
+    #[derive(serde::Deserialize)]
+    struct S {
+        sha: String,
+    }
+    let rows = d
+        .q(
+            "SELECT o.sha AS sha FROM objects o JOIN packs p ON p.id=o.pack_id \
+             WHERE p.state='live'",
+            vec![],
+        )?
+        .to_array::<S>()?;
+    let mut shas: Vec<String> = rows.iter().map(|r| r.sha.clone()).collect();
+    shas.sort_unstable();
+    shas.dedup();
+    #[derive(serde::Deserialize)]
+    struct N {
+        n: i64,
+    }
+    let dead_rows = d
+        .q(
+            "SELECT COUNT(*) AS n FROM objects o JOIN packs p ON p.id=o.pack_id \
+             WHERE p.state NOT IN ('live','ingesting')",
+            vec![],
+        )?
+        .one::<N>()?
+        .n;
+    json(serde_json::json!({ "shas": shas, "rows": rows.len(), "dead_rows": dead_rows }))
+}
+
+/// POST /_do/test/pack_state {"pack","state"} — force packs.state (e.g. kill
+/// a cohort pack under a paused swap); 'dead' stamps dead_at like the real
+/// transitions do.
+pub fn pack_state(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        pack: String,
+        state: String,
+    }
+    let b: B = parse(body)?;
+    if !matches!(b.state.as_str(), "ingesting" | "live" | "dead") {
+        return Err(Error::Protocol("state must be ingesting|live|dead".into()));
+    }
+    d.q(
+        "UPDATE packs SET state=? WHERE id=?",
+        vec![V::from(b.state.as_str()), V::from(b.pack.as_str())],
+    )?;
+    let rows = d.changes()?;
+    if b.state == "dead" {
+        d.q(
+            "UPDATE packs SET dead_at=? WHERE id=? AND dead_at IS NULL",
+            vec![V::from(crate::platform::now_ms()), V::from(b.pack.as_str())],
+        )?;
+    }
+    json(serde_json::json!({ "pack": b.pack, "state": b.state, "rows": rows }))
+}
+
+/// POST /_do/test/kill_job {"kind"} — every queued/running row of `kind` ->
+/// 'dead' with last_error 'test kill': strands a chain the way a poisoned job
+/// row would (its owner vanishes, so the next gc_compact sees an orphan).
+pub fn kill_job(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        kind: String,
+    }
+    let b: B = parse(body)?;
+    let kind = JobKind::of(&b.kind)?;
+    d.q(
+        "UPDATE jobs SET state='dead', last_error='test kill', lease=NULL \
+         WHERE kind=? AND state IN ('queued','running')",
+        vec![V::from(kind.as_str())],
+    )?;
+    json(serde_json::json!({ "killed": kind.as_str(), "rows": d.changes()? }))
+}
+
+/// POST /_do/test/pack_check {"pack"} — decode the pack's R2 object fully and
+/// compare it with its index rows: {"header_count","decoded","index_rows",
+/// "distinct","commit_lo","commit_hi"}. commit_lo/hi are the decoded
+/// commit-entry span — min start offset, max end (start + wire length),
+/// PackWriter's convention — or null when the pack holds no commits. The
+/// order-independent oracle for a packs row's span: pack_id ordering and
+/// entry sizes can't skew it. The PR4 output-pack oracle over replay and
+/// HEAD-recovery.
+pub async fn pack_check(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
+    if !enabled(d) {
+        return Err(Error::NotFound);
+    }
+    #[derive(serde::Deserialize)]
+    struct B {
+        pack: String,
+    }
+    let b: B = parse(body)?;
+    let bytes = pack_check_fetch_bytes(d, &b.pack).await?;
+    let ds = d.obj_kind()?.len_in_bytes();
+    let header_count = pack_check_header_count(&bytes)?;
+    let (decoded, span) = pack_check_decode_span(&bytes, ds)?;
+    let (index_rows, distinct) = pack_check_index_counts(d, &b.pack)?;
+    json(serde_json::json!({
+        "header_count": header_count, "decoded": decoded,
+        "index_rows": index_rows, "distinct": distinct,
+        "commit_lo": span.map(|s| s.0), "commit_hi": span.map(|s| s.1),
+    }))
+}
+
+async fn pack_check_fetch_bytes(d: &RepoDo, pack: &str) -> Result<Vec<u8>, Error> {
+    let key = keys::pack(&d.repo_id()?, &PackId(pack.to_string()));
+    let mut budget = ReqBudget::paid();
+    budget.charge(1)?;
+    let obj = d
+        .bucket()?
+        .inner
+        .get(&key)
+        .execute()
+        .await?
+        .ok_or_else(|| Error::Storage(format!("missing {key}")))?;
+    Ok(obj
+        .body()
+        .ok_or_else(|| Error::Storage(format!("no body for {key}")))?
+        .bytes()
+        .await?)
+}
+
+fn pack_check_header_count(bytes: &[u8]) -> Result<u32, Error> {
+    if bytes.len() >= 12 && bytes[..4] == *b"PACK" {
+        Ok(u32::from_be_bytes(
+            bytes[8..12].try_into().map_err(|_| Error::Internal("hdr".into()))?,
+        ))
+    } else {
+        Ok(0)
+    }
+}
+
+fn pack_check_decode_span(bytes: &[u8], ds: usize) -> Result<(u32, Option<(u64, u64)>), Error> {
+    let end = bytes.len().saturating_sub(ds);
+    let (mut decoded, mut pos) = (0u32, 12usize);
+    let mut span: Option<(u64, u64)> = None;
+    while pos < end {
+        let (kind, _, used) = codec::decode_entry_counted(
+            bytes.get(pos..).ok_or_else(|| Error::Internal("entry".into()))?,
+        )?;
+        if kind == Kind::Commit {
+            let (lo, hi) = (pos as u64, pos.saturating_add(used) as u64);
+            span = Some(match span {
+                None => (lo, hi),
+                Some((l, h)) => (l.min(lo), h.max(hi)),
+            });
+        }
+        decoded = decoded.saturating_add(1);
+        pos = pos.saturating_add(used);
+    }
+    if pos != end {
+        return Err(Error::Protocol("pack entries do not fill the trailer".into()));
+    }
+    Ok((decoded, span))
+}
+
+fn pack_check_index_counts(d: &RepoDo, pack: &str) -> Result<(i64, i64), Error> {
+    #[derive(serde::Deserialize)]
+    struct N {
+        n: i64,
+    }
+    let index_rows = d
+        .q("SELECT COUNT(*) AS n FROM objects WHERE pack_id=?", vec![V::from(pack)])?
+        .one::<N>()?
+        .n;
+    let distinct = d
+        .q("SELECT COUNT(DISTINCT sha) AS n FROM objects WHERE pack_id=?", vec![V::from(pack)])?
+        .one::<N>()?
+        .n;
+    Ok((index_rows, distinct))
+}
+
 /// POST /_do/test/drop_pack {"pack":"<id>"} — delete the pack's R2 object
 /// outright. The index keeps its rows — fsck must report them missing.
 pub async fn drop_pack(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
@@ -605,16 +789,18 @@ pub async fn fsck(d: &RepoDo, body: &[u8]) -> Result<Response, Error> {
     json(fsck_run(d, all).await?)
 }
 
-fn note_missing(missing: &mut Vec<serde_json::Value>, sha: &str, by: &str) {
-    if missing.len() < FSCK_CAP {
-        missing.push(serde_json::json!({ "sha": sha, "referenced_by": by }));
+fn note_capped(out: &mut Vec<serde_json::Value>, build: impl FnOnce() -> serde_json::Value) {
+    if out.len() < FSCK_CAP {
+        out.push(build());
     }
 }
 
+fn note_missing(missing: &mut Vec<serde_json::Value>, sha: &str, by: &str) {
+    note_capped(missing, || serde_json::json!({ "sha": sha, "referenced_by": by }));
+}
+
 fn note_corrupt(corrupt: &mut Vec<serde_json::Value>, sha: &str, why: String) {
-    if corrupt.len() < FSCK_CAP {
-        corrupt.push(serde_json::json!({ "sha": sha, "why": why }));
-    }
+    note_capped(corrupt, || serde_json::json!({ "sha": sha, "why": why }));
 }
 
 fn kind_str(k: Kind) -> &'static str {

@@ -13,7 +13,8 @@ use crate::repo_do::RepoDo;
 use crate::store::{keys, PackId};
 
 const BATCH: i64 = 400; // keys per slice (5.1: at most 400)
-const GRACE_MS: i64 = 3_600_000;
+/// Dead-pack grace — pub(crate): the packfile-URI TTL derives from it (S9/R10).
+pub(crate) const GRACE_MS: i64 = 3_600_000;
 const PUSH_TIMEOUT_MS: i64 = 3_600_000;
 const REFLOG_KEEP_MS: i64 = 90 * 24 * 3_600_000;
 
@@ -250,6 +251,13 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         .collect();
     for r in &old_log {
         d.q("DELETE FROM reflog WHERE id=?", vec![V::from(r.id)])?;
+    }
+
+    // G4a backstop: the same cohort check the push path runs fires at every
+    // janitor pass, for repos that went quiet right after a burst (§3b) —
+    // best-effort, a trigger hiccup must not fail the pass itself
+    if let Err(e) = super::compact::trigger(d) {
+        worker::console_log!("janitor: compact trigger: {e}");
     }
 
     // failed deletes stay unmarked and retry next run — but the job records the error

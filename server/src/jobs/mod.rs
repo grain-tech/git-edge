@@ -1,6 +1,7 @@
 //! Job dispatcher (CONTRACTS.md 4, 5; A3, A4) + running-row repair (A12).
 //! `rearm` is the sole `set_alarm` caller; `enqueue` is sync and only writes a row.
 
+pub mod compact;
 pub mod events;
 pub mod gc;
 pub mod import;
@@ -21,6 +22,7 @@ pub enum JobKind {
     GcMark,
     GcConsolidate,
     GcSweep,
+    GcCompact,
     PurgeRepo,
     ImportPack,
     PushEvent,
@@ -32,6 +34,7 @@ impl JobKind {
             JobKind::GcMark => "gc_mark",
             JobKind::GcConsolidate => "gc_consolidate",
             JobKind::GcSweep => "gc_sweep",
+            JobKind::GcCompact => "gc_compact",
             JobKind::PurgeRepo => "purge_repo",
             JobKind::ImportPack => "import_pack",
             JobKind::PushEvent => "push_event",
@@ -43,6 +46,7 @@ impl JobKind {
             "gc_mark" => Ok(JobKind::GcMark),
             "gc_consolidate" => Ok(JobKind::GcConsolidate),
             "gc_sweep" => Ok(JobKind::GcSweep),
+            "gc_compact" => Ok(JobKind::GcCompact),
             "purge_repo" => Ok(JobKind::PurgeRepo),
             "import_pack" => Ok(JobKind::ImportPack),
             "push_event" => Ok(JobKind::PushEvent),
@@ -230,7 +234,7 @@ pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
     if janitors.n == 0 {
         enqueue(sql, JobKind::Janitor, now, "{}")?;
     }
-    for kind in [JobKind::GcMark, JobKind::GcConsolidate, JobKind::GcSweep] {
+    for kind in [JobKind::GcMark, JobKind::GcConsolidate, JobKind::GcSweep, JobKind::GcCompact] {
         // dead maintenance jobs of a chain that may have been mid-flight resume via re-enqueue (A4)
         let n = exec(
             sql,
@@ -268,8 +272,25 @@ pub fn repair(sql: &SqlStorage) -> Result<(), Error> {
             // wedge) would otherwise restart at every boot forever — a ~400-subrequest
             // slice of doomed work each time. resurrected.<kind> counts restarts and
             // resets when a chain really completes (the sweep's delete span clears
-            // it — a stray or no-op sweep Done doesn't).
-            let key = format!("resurrected.{}", kind.as_str());
+            // it — a stray or no-op sweep Done doesn't). T4: under gc.mode=compact a
+            // resurrected builder charges the compact chain's own counter — the swap
+            // resets only that one.
+            let key = if kind == JobKind::GcConsolidate
+                && exec(
+                    sql,
+                    "SELECT value FROM meta WHERE key='gc.mode'",
+                    vec![],
+                )?
+                .to_array::<M>()?
+                .into_iter()
+                .next()
+                .map(|m| m.value == "compact")
+                .unwrap_or(false)
+            {
+                "resurrected.gc_compact".to_string()
+            } else {
+                format!("resurrected.{}", kind.as_str())
+            };
             #[derive(serde::Deserialize)]
             struct M {
                 value: String,
@@ -573,6 +594,7 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         JobKind::GcMark => gc::gc_mark(d, job, budget).await,
         JobKind::GcConsolidate => gc::gc_consolidate(d, job, budget).await,
         JobKind::GcSweep => gc::gc_sweep(d, job).await,
+        JobKind::GcCompact => compact::gc_compact(d, job),
         JobKind::PurgeRepo => purge::run_slice(d, job, budget).await,
         JobKind::ImportPack => import::run_slice(d, job, budget).await,
         JobKind::PushEvent => events::run_slice(d, job, budget).await,
