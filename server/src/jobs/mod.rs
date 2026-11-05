@@ -593,7 +593,7 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
         JobKind::Janitor => janitor::run_slice(d, job, budget).await,
         JobKind::GcMark => gc::gc_mark(d, job, budget).await,
         JobKind::GcConsolidate => gc::gc_consolidate(d, job, budget).await,
-        JobKind::GcSweep => gc::gc_sweep(d, job).await,
+        JobKind::GcSweep => gc::gc_sweep(d, job, budget).await,
         JobKind::GcCompact => compact::gc_compact(d, job),
         JobKind::PurgeRepo => purge::run_slice(d, job, budget).await,
         JobKind::ImportPack => import::run_slice(d, job, budget).await,

@@ -180,6 +180,9 @@ pub async fn run_slice(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Resul
             return Ok(SliceOutcome::Continue { cursor: "{}".into() });
         }
         let key = keys::pack(&d.repo_id()?, &PackId(p.id.clone()));
+        // §5: error-mode point right before the R2 delete — a retry re-takes
+        // the same pack (the dead row and its TTL still stand)
+        crate::testhooks::failpoint(d, "janitor.before_r2_delete")?;
         budget.req.charge(1)?;
         match d.bucket()?.inner.delete(key.as_str()).await {
             Ok(()) => {

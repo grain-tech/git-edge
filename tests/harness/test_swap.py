@@ -90,6 +90,31 @@ def mark_to_build(r, limit=40):
     raise AssertionError("mark never reached phase=build: %r" % tb.meta(r))
 
 
+def finish_chain(r, limit=80):
+    """Step ONLY the live chain's owner until gc.phase is gone — never the
+    queued gc_mark a mid-chain push leaves behind. tgs.gc_drain steps that
+    mark next, and under GE_GC_QUIET_MS=0 it runs a WHOLE SECOND chain
+    whose fenced swap overwrites gc_last_swap, resets gc_fallbacks and
+    retires more packs — so every swap/epoch/pack assertion on THIS chain
+    must read state observed between finish_chain and any later drain.
+    The owner choice mirrors gc_drain's (build -> gc_consolidate, sweep ->
+    gc_sweep); a phase standing with no owner queued is a setup bug, never
+    a reason to step another kind."""
+    for _ in range(limit):
+        v = ge.jobs(r.name)
+        phase = (v.get("gc_meta") or {}).get("gc.phase")
+        if phase is None:
+            return
+        owner = {"build": "gc_consolidate", "sweep": "gc_sweep"}.get(phase)
+        queued = {j["kind"] for j in v["jobs"] if j["state"] == "queued"}
+        if owner is None or owner not in queued:
+            raise AssertionError(
+                "gc.phase=%r but %s not queued: %r" % (phase, owner, v["jobs"]))
+        ge.step(r.name, owner)
+    raise AssertionError(
+        "chain never ended in %d steps: %r" % (limit, tb.meta(r)))
+
+
 def pause_drain(r):
     """Start a gc_sweep slice parked at gc.drain.after_read; (thread, box).
     Requires drain work queued (non-empty gc_frontier/gc_pending) or the
@@ -226,7 +251,10 @@ class Swap(unittest.TestCase):
             r.name, [(ZERO, g, "refs/heads/res")], ge.empty_pack())
         self.assertIn(b"ok refs/heads/res", body,
                       "%r" % ge.redact(body[:300].decode("utf-8", "replace")))
-        tgs.gc_drain(r, limit=60)
+        # finish only THIS chain — the res push's queued gc_mark would run a
+        # second chain under a full drain, retiring g_pack legitimately once
+        # its marks are copied into that chain's own build pack
+        finish_chain(r, limit=60)
         packs = packs_by_id(r)
         self.assertEqual(packs[g_pack]["state"], "live",
                          "resurrected pack was retired: %r" % packs[g_pack])
@@ -234,10 +262,11 @@ class Swap(unittest.TestCase):
         self.assertIsNotNone(swap, "no swap recorded")
         self.assertTrue(any(p["state"] == "dead" for p in packs.values()),
                         "no other cohort pack retired: %r" % packs)
-        clone = r.clone()
+        clone = r.clone("-res")
         self.assertEqual(
-            ge.git("rev-parse", "refs/heads/res", cwd=clone).stdout.strip(), g)
+            ge.git("rev-parse", "refs/remotes/origin/res", cwd=clone).stdout.strip(), g)
         ge.git("fsck", "--strict", cwd=clone)
+        tgs.gc_drain(r, limit=120)
         assert_clean(self, r)
 
     # -- §6.3: lossless keeps the epoch, lossy bumps it; in-flight push -----
@@ -270,7 +299,7 @@ class Swap(unittest.TestCase):
         tgs.import_until_commit_phase(r)
         epoch0 = epoch(r)
         tb.to_stage(r, "presweep")
-        tgs.gc_drain(r, limit=60)
+        finish_chain(r, limit=60)
         swap = ge.last_swap(r.name)
         self.assertIsNotNone(swap, "no gc_last_swap")
         self.assertFalse(swap["lossy"], "all-reachable cohort swapped lossy: %r" % swap)
@@ -309,7 +338,7 @@ class Swap(unittest.TestCase):
         tgs.import_until_commit_phase(r)
         epoch0 = epoch(r)
         tb.to_stage(r, "presweep")
-        tgs.gc_drain(r, limit=60)
+        finish_chain(r, limit=60)
         swap = ge.last_swap(r.name)
         self.assertIsNotNone(swap, "no gc_last_swap")
         self.assertTrue(swap["lossy"], "garbage cohort swapped lossy: %r" % swap)
@@ -374,7 +403,10 @@ class Swap(unittest.TestCase):
                 else:
                     push_commit(r, "during")
                 release_drain(r, t, box)
-                tgs.gc_drain(r, limit=80)
+                # observe THIS chain's fallback before the queued mark the
+                # mid-drain pushes left runs a second (quiesced) chain —
+                # its swap would overwrite gc_last_swap and gc_fallbacks
+                finish_chain(r, limit=80)
                 swap = ge.last_swap(r.name)
                 self.assertIsNotNone(swap, "no gc_last_swap")
                 self.assertTrue(swap["fallback"], "not a fallback: %r" % swap)
@@ -395,6 +427,7 @@ class Swap(unittest.TestCase):
                     self.assertTrue(any(
                         packs[c]["state"] == "dead" for c in cohort),
                         "retire branch retired nothing: %r" % packs)
+                tgs.gc_drain(r, limit=120)
                 assert_clean(self, r)
 
     # -- §6.5: a stable drain never counts tries -----------------------------
@@ -423,10 +456,13 @@ class Swap(unittest.TestCase):
         mark_to_build(r)
         tb.step_until(r, "gc_consolidate", {"done"})
         ge.knob(r.name, "swap_tries", 1)
-        tgs.gc_drain(r, limit=80)
+        # the pushes staked under the parked mark left a rescheduled gc_mark
+        # queued — finish this chain only, then observe its swap
+        finish_chain(r, limit=80)
         swap = ge.last_swap(r.name)
         self.assertIsNotNone(swap, "no gc_last_swap")
         self.assertFalse(swap["fallback"], "stable drain fell back: %r" % swap)
+        tgs.gc_drain(r, limit=120)
         assert_clean(self, r)
 
     # -- §6.17: the try baseline counts only post-sweep writes ---------------
@@ -466,19 +502,22 @@ class Swap(unittest.TestCase):
                     t, box = pause_drain(r)
                     ge.git("push", "-q", r.url, ":refs/heads/del", cwd=r.dir)
                     release_drain(r, t, box)
-                    tgs.gc_drain(r, limit=80)
+                    # the delete queued a gc_mark — observe this chain's
+                    # try/fallback before any second chain can overwrite it
+                    finish_chain(r, limit=80)
                     swap = ge.last_swap(r.name)
                     self.assertIsNotNone(swap, "no gc_last_swap")
                     self.assertTrue(
                         swap["fallback"],
                         "a delete-only push did not charge a try: %r" % swap)
                 else:
-                    tgs.gc_drain(r, limit=80)
+                    finish_chain(r, limit=80)
                     swap = ge.last_swap(r.name)
                     self.assertIsNotNone(swap, "no gc_last_swap")
                     self.assertFalse(
                         swap["fallback"],
                         "presweep writes were charged as tries: %r" % swap)
+                tgs.gc_drain(r, limit=120)
                 assert_clean(self, r)
 
     # -- §6.6: crash/error injection at every point --------------------------
@@ -755,9 +794,9 @@ class Swap(unittest.TestCase):
         self.assertEqual(packs[g_pack]["state"], "live",
                          "post-error resurrected pack was retired: %r"
                          % packs[g_pack])
-        clone = r.clone()
+        clone = r.clone("-res")
         self.assertEqual(
-            ge.git("rev-parse", "refs/heads/res", cwd=clone).stdout.strip(), g)
+            ge.git("rev-parse", "refs/remotes/origin/res", cwd=clone).stdout.strip(), g)
         ge.git("fsck", "--strict", cwd=clone)
         assert_clean(self, r)
 
@@ -805,8 +844,18 @@ class Swap(unittest.TestCase):
                 s = ge.step(r.name, "gc_sweep")
                 self.assertEqual(s["outcome"], "retry",
                                  "gc.swap.after_deadmark never fired: %r" % s)
-                # a push lands between the error and the retry
-                push_commit(r, "mid")
+                # a push lands between the error and the retry — on a side
+                # branch: pushing local main would move refs/heads/main
+                # before the import's own tip->c CAS lands, failing it with
+                # "failed to update ref" rather than the epoch rule under
+                # test. The commit is built on tip so local main never
+                # moves (it already points at the import's c / the seed tip)
+                mb = ge.git("hash-object", "-w", "--stdin", cwd=r.dir,
+                            input="mid\n").stdout.strip()
+                mt = tgs.mktree(r, [("100644", "blob", mb, "mid")])
+                mid = tgs.commit_tree(r, mt, [tip], "mid")
+                ge.git("push", "-q", r.url,
+                       "%s:refs/heads/mid" % mid, cwd=r.dir)
                 ge.failpoint(r.name, "gc.swap.after_deadmark", "off")
                 tb.step_until(r, "gc_sweep", {"done"})
                 tgs.step_until(r, "import_pack", {"done"})
@@ -860,7 +909,10 @@ class Swap(unittest.TestCase):
                     t, box = pause_drain(r)
                     push_commit(r, "mid%d" % cycle)
                     release_drain(r, t, box)
-                    tgs.gc_drain(r, limit=80)
+                    # observe THIS cycle's fallback before the queued mark
+                    # the mid-drain pushes left starts the NEXT cycle early —
+                    # a full drain would run it past the swap assert below
+                    finish_chain(r, limit=80)
                     swap = ge.last_swap(r.name)
                     self.assertIsNotNone(swap, "cycle %d: no gc_last_swap" % cycle)
                     self.assertTrue(swap["fallback"],
@@ -886,7 +938,7 @@ class Swap(unittest.TestCase):
                         "net-positive violated: live bytes grew")
                 # a later quiesced chain swaps — the counter resets
                 tb.to_stage(r, "presweep")
-                tgs.gc_drain(r, limit=80)
+                finish_chain(r, limit=80)
                 swap = ge.last_swap(r.name)
                 self.assertIsNotNone(swap, "no post-fallback swap")
                 self.assertFalse(swap["fallback"], "%r" % swap)
@@ -932,7 +984,7 @@ class Swap(unittest.TestCase):
                 self.assertIn(b"queued", body)
                 tgs.import_until_commit_phase(r)  # checked; commit still queued
                 tb.to_stage(r, "presweep")
-                tgs.gc_drain(r, limit=60)  # the swap lands mid-flight
+                finish_chain(r, limit=60)  # the swap lands mid-flight
                 self.assertIsNotNone(
                     ge.last_swap(r.name), "no swap recorded mid-import")
                 tgs.step_until(r, "import_pack", {"done"})
@@ -979,7 +1031,9 @@ class Swap(unittest.TestCase):
                       "%r" % ge.redact(body[:300].decode("utf-8", "replace")))
         self.assertIn(b"ok refs/heads/res2", body,
                       "%r" % ge.redact(body[:300].decode("utf-8", "replace")))
-        tgs.gc_drain(r, limit=60)
+        # the res pushes left a queued gc_mark — observe this chain's empty
+        # retire set before a second chain can retire the cohort for real
+        finish_chain(r, limit=60)
         swap = ge.last_swap(r.name)
         self.assertIsNotNone(swap, "no gc_last_swap")
         self.assertEqual(swap["retired"], 0, "%r" % swap)
@@ -988,6 +1042,7 @@ class Swap(unittest.TestCase):
                          "empty retire kept the build pack: %r" % packs[new_pack])
         self.assertTrue(all(packs[c]["state"] == "live" for c in cohort),
                         "empty retire killed a cohort pack: %r" % packs)
+        tgs.gc_drain(r, limit=120)
         assert_clean(self, r)
 
     # -- §6.16: the compaction hold is released after the swap -----------------
@@ -1017,7 +1072,10 @@ class Swap(unittest.TestCase):
                 if mode == "fallback":
                     ge.knob(r.name, "swap_tries", 1)
                     push_commit(r, "fb")
-                tgs.gc_drain(r, limit=80)  # runs the swap/fallback to the end
+                # runs the swap/fallback to the chain's end — never the
+                # queued mark the fb push left, which would run a second
+                # chain whose swap overwrites gc_last_swap
+                finish_chain(r, limit=80)
                 swap = ge.last_swap(r.name)
                 self.assertIsNotNone(swap, "no gc_last_swap")
                 self.assertEqual(swap["fallback"], mode == "fallback",

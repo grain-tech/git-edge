@@ -2568,6 +2568,9 @@ impl RepoDo {
         // derived from the constant with a 10-minute margin, since compaction
         // retires the single live pack more often than GC did
         const TTL: i64 = crate::jobs::janitor::GRACE_MS / 1000 - 600;
+        // §3.4 (C9): the signed-URI margin below the dead-pack grace can
+        // never regress — shrinking GRACE_MS below 600s stops the build.
+        const _: () = assert!(TTL + 600 <= crate::jobs::janitor::GRACE_MS / 1000);
         let exp = platform::now_ms() / 1000 + TTL;
         // the signature binds the opaque repo_id (carried as r=) — stronger than
         // the route name: a deleted+recreated repo gets a fresh id, so old sigs die

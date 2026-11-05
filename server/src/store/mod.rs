@@ -1175,6 +1175,11 @@ pub mod schema {
         // feeds written by the barrier while the mark walks. Existing rows
         // default to 0, which is exactly what they are.
         ("gc_frontier", "gen", "gen INTEGER NOT NULL DEFAULT 0"),
+        // PR6 §2 (C11): the as-copied bitmap snapshot. Barrier chains freeze
+        // `bitmap` into `built` at admission (begin_build) so the sweep's
+        // subset check compares what was actually copied, not what is marked
+        // now. NULL on flag-off/compact chains and pre-PR6 marked rows.
+        ("marked", "built", "built BLOB"),
     ];
     pub fn migrate(sql: &SqlStorage) -> Result<(), Error> {
         for q in DDL {
