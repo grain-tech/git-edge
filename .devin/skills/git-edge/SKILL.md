@@ -213,6 +213,7 @@ wedged. Pushes are CAS; a stale push is rejected — refetch and retry, don't
 | Fetch walk (non-clone fetches with haves) | 200k commits / 1M objects | `ERR fetch too large for this server; clone instead` — incremental fetches only |
 | Push links (tree edges) per push | 1,000,000 (8M via `_admin/import`) | `push references too many objects` → smaller slices, or import the pack server-side |
 | Push rate | 30/min per credential per repo (`GE_RATE_PUSHES_PER_MIN`) | HTTP 429 + `Retry-After` → wait and retry |
+| Live packs | 1,000 live+ingesting per repo (`GE_MAX_LIVE_PACKS`) | HTTP 503 + `Retry-After: 60` → wait and retry; the janitor re-queues GC so the cap self-clears within ~1¼ h (GC grace + janitor period) |
 | Quotas | 2M objects / 4 GiB stored per repo, 50 repos/owner (`GE_QUOTA_MAX_*`) | `unpack objects N > GE_QUOTA_MAX_OBJECTS=M` etc. — the message names the cap. LFS objects count toward the byte quota |
 | Full clone scale | verified ≥700k objects; no walk bound | Plain clones take the no-walk path (all live objects streamed in pack order) — the 200k-commit walk cap applies only to haves-ful fetches. When `packs_live: 1` (post-GC consolidation) the live pack streams verbatim (~1 subrequest); clients with `fetch.uriprotocols` set get a signed `/_packs/…` URL instead (bandwidth bypasses the Worker entirely, needs `GE_URL_SIGNING_KEY`) |
 | LFS objects | basic transfer only, sha256 oids | No `verify` callback, no locking API, no custom transfers — plain upload/download via signed URLs |
