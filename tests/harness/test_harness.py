@@ -5,7 +5,8 @@ Requires the dev server started with:
   GE_RATE_PUSHES_PER_MIN=0
 (GE_URL selects it, default http://test:write-test-token@127.0.0.1:8795.)
 Deterministic by construction: manual mode means jobs move only when _step is
-called — no sleeps, no polling.
+called — no sleeps, no polling. test_f carries the G2 no-walk-clone regression:
+>100 live packs, with duplicate rows straddling the 5,000-row dedup page.
 """
 
 import os
@@ -147,44 +148,89 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(f["ok"])
         self.assertIn(blob, [m["sha"] for m in f["missing"]])
 
-    def test_f_a6_guard_rejects_101_param_clone(self):
-        """Pins today's behaviour: a plain clone of a repo with >= 100 live
-        packs makes no_walk_set bind live_packs+1 params, the A6 guard rejects
-        the statement, and the clone fails with the "sql: N bound params > 100
-        (A6)" line in the server log. When G2 (walk-set chunking) lands, flip
-        this test to assert a successful clone + git fsck instead."""
-        log = os.environ.get("GE_SERVER_LOG")
-        if not log or not os.path.isfile(log):
-            self.fail("GE_SERVER_LOG must point at the dev server's log "
-                      "(run.sh exports it, default /tmp/ge-dev.log)")
-        r = repo("f-100packs")
-        r.commit_file("f", "seed\n", "seed")
+    def test_f_clone_over_101_live_packs(self):
+        """G2 regression: a plain clone of a repo with >100 live packs must
+        succeed. no_walk_set used to bind live_packs+1 params in one statement
+        and trip the DO SQLite 100-param A6 guard -> 500; binding the pack
+        list as one json_each parameter must still dedupe a sha's copies
+        across packs AND 5,000-row pages."""
+        r = repo("f-101packs")
+        # Every commit in this test is pinned to one timestamp so the shas —
+        # and therefore the row order the server's dedup scan walks — are
+        # deterministic; the straddle itself is asserted below, not assumed.
+        PIN = {"GIT_AUTHOR_DATE": "1700000000 +0000", "GIT_COMMITTER_DATE": "1700000000 +0000",
+               "GIT_CONFIG_GLOBAL": "/dev/null"}
+        with open(os.path.join(r.dir, "f"), "w") as fh:
+            fh.write("seed\n")
+        ge.git("add", "f", cwd=r.dir, env=PIN)
+        ge.git("commit", "-qm", "seed", cwd=r.dir, env=PIN)
         r.push()
-        for i in range(100):
-            r.commit_file("f", "n%d\n" % i, "n%d" % i)
+        ge.git("checkout", "--orphan", "dup", cwd=r.dir)
+        ge.git("rm", "-rf", "-q", ".", cwd=r.dir)
+        os.mkdir(os.path.join(r.dir, "d"))
+        for i in range(1650):
+            with open(os.path.join(r.dir, "d", "%04d" % i), "w") as fh:
+                fh.write("x%d\n" % i)
+        ge.git("add", "d", cwd=r.dir, env=PIN)
+        ge.git("commit", "-qm", "dup", cwd=r.dir, env=PIN)
+        # 3 live packs with identical objects: deleting the server ref between
+        # pushes makes git resend every object (no advertised dup tip to
+        # negotiate against). The pinned dates fix every sha, so whether a dup
+        # sha's 3-row run straddles the 5,000-row dedup page is deterministic —
+        # and asserted below rather than left to modular arithmetic.
+        for _ in range(3):
+            r.push("HEAD:dup")
+            ge.git("push", "-q", r.url, ":dup", cwd=r.dir)
+        ge.git("checkout", "-q", "main", cwd=r.dir)
+        for i in range(98):
+            with open(os.path.join(r.dir, "f"), "w") as fh:
+                fh.write("n%d\n" % i)
+            ge.git("add", "f", cwd=r.dir, env=PIN)
+            ge.git("commit", "-qm", "n%d" % i, cwd=r.dir, env=PIN)
             r.push()
-        v = ge.jobs(r.name)
-        live = [p for p in v["packs"] if p["state"] == "live"]
-        self.assertGreaterEqual(len(live), 100)
-        log_off = os.path.getsize(log)  # only log written after THIS point counts
-        res = ge.git("clone", "-q", r.url, r.dir + "-clone", check=False)
-        self.assertNotEqual(res.returncode, 0,
-                            "clone succeeded — did G2 land? flip this test")
-        self.assertIn("500", ge.redact(res.stderr + res.stdout))
-        # wrangler flushes its log asynchronously — the guard line lands a few
-        # hundred ms after clone returns. Polls on log I/O, not job timing.
-        deadline = time.time() + 10
-        new = ""
-        while time.time() < deadline:
-            with open(log, errors="replace") as f:
-                f.seek(log_off)
-                new = f.read()
-            if "bound params" in new:
-                break
-            time.sleep(0.2)
-        else:
-            self.fail("no 'bound params' guard line in new server log text: %s"
-                      % new[-2048:])
+        # Straddle precondition, simulated locally: the dedup scan walks every
+        # live objects row ordered by sha, so a dup-reachable sha contributes 3
+        # adjacent rows (one per identical pack) and any other sha one. Rows
+        # 4,999 and 5,000 must share a sha for a run to cross the page.
+        dup = {
+            line.split(" ", 1)[0]
+            for line in ge.git("rev-list", "--objects", "dup", cwd=r.dir).stdout.splitlines()
+        }
+        allo = set(
+            ge.git("cat-file", "--batch-all-objects",
+                   "--batch-check=%(objectname)", cwd=r.dir).stdout.splitlines()
+        )
+        rows = sorted(sha for sha in allo for _ in range(3 if sha in dup else 1))
+        self.assertGreater(len(rows), 5000)
+        self.assertEqual(
+            rows[4999],
+            rows[5000],
+            "fixture no longer straddles the 5,000-row page; retune the file count",
+        )
+        live = [p for p in ge.jobs(r.name)["packs"] if p["state"] == "live"]
+        self.assertGreaterEqual(len(live), 101)
+        self.assertEqual(len([p for p in live if p["count"] == len(dup)]), 3)
+        self.assertEqual(sum(p["count"] for p in live), len(rows))
+        target = r.dir + "-clone"
+        res = ge.git("-c", "transfer.fsckObjects=true", "clone", "-q",
+                     r.url, target, check=False)
+        self.assertEqual(res.returncode, 0,
+                         "clone failed: %s" % ge.redact(res.stderr + res.stdout))
+        ge.git("fsck", "--strict", cwd=target)
+        # The clone's single pack must carry each unique sha exactly once:
+        # comparing the pack header's emitted count against the unique count
+        # catches a duplicate row emitted twice (across packs or across
+        # 5,000-row dedup pages) just as it catches a missing one. Every local
+        # object was pushed, so the local unique count IS the server's.
+        expected = len(ge.git("cat-file", "--batch-all-objects",
+                              "--batch-check=%(objectname)", cwd=r.dir)
+                       .stdout.splitlines())
+        packdir = os.path.join(target, ".git", "objects", "pack")
+        packs = [p for p in os.listdir(packdir) if p.endswith(".pack")]
+        self.assertEqual(len(packs), 1, packs)
+        with open(os.path.join(packdir, packs[0]), "rb") as pf:
+            emitted = int.from_bytes(pf.read(12)[8:12], "big")
+        self.assertEqual(emitted, expected)
 
     def test_g_fsck_corrupt_location(self):
         # index rows that lie about their bytes: offset+1 misdecodes, len+1

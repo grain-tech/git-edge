@@ -210,8 +210,15 @@ _GIT_ENV = dict(
 )
 
 
-def git(*args, cwd=None, check=True, input=None):
-    r = subprocess.run(["git", *args], cwd=cwd, env=_GIT_ENV, capture_output=True, text=True, input=input)
+def git(*args, cwd=None, check=True, input=None, env=None):
+    r = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=dict(_GIT_ENV, **env) if env else _GIT_ENV,
+        capture_output=True,
+        text=True,
+        input=input,
+    )
     if check and r.returncode != 0:
         raise AssertionError(
             "git %s -> %d\n%s%s" % (redact(" ".join(args)), r.returncode, redact(r.stdout), redact(r.stderr))
