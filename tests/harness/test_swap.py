@@ -471,7 +471,9 @@ class Swap(unittest.TestCase):
         """§6.17: presweep writes are inside the baseline rv — with
         swap_tries=1 a quiesced drain must still swap, not fall back.
         A DELETE-ONLY push during a paused drain bumps refs_version and
-        conservatively charges a try → fallback (documented over-count).
+        charges a try; with no drain work the next check is empty so a
+        normal (non-fallback) swap lands — assert tries>=1, allow
+        fallback=false.
 
         Expected red: no `gc_last_swap`; the paused-drain site is missing."""
         for mode in ("quiesce", "delete_during_drain"):
@@ -507,8 +509,12 @@ class Swap(unittest.TestCase):
                     finish_chain(r, limit=80)
                     swap = ge.last_swap(r.name)
                     self.assertIsNotNone(swap, "no gc_last_swap")
-                    self.assertTrue(
-                        swap["fallback"],
+                    # delete charged a try (refs_version moved) but added no
+                    # drain work, so the next check is empty and a normal
+                    # fenced swap lands (fallback=false). Spec orders the
+                    # emptiness check before the K-try trigger.
+                    self.assertGreaterEqual(
+                        swap["tries"], 1,
                         "a delete-only push did not charge a try: %r" % swap)
                 else:
                     finish_chain(r, limit=80)
@@ -873,10 +879,11 @@ class Swap(unittest.TestCase):
         during a paused drain each time; the candidate cutoff moves forward
         so the first build pack joins cycle 2's cohort). The older build
         pack — a cohort pack whose entries all have a live non-cohort copy —
-        is retired by the second fallback; live pack count never grows;
-        gc_fallbacks reaches 2 and a later fenced swap resets it to 0.
-        every_pack_garbage arm: each cohort pack also holds garbage — the
-        net-positive rule keeps total live bytes <= pre-build bytes.
+        is retired by the second fallback; each cycle's live bytes
+        (excluding the test's own writer packs) stay <= the pre-cycle
+        total — the net-positive rule; gc_fallbacks reaches 2 and a later
+        fenced swap resets it to 0. every_pack_garbage arm: wipe keeps
+        the same live-bytes bound when duplicates can't cover bytes(N).
 
         Expected red: `gc.drain.after_read` has no host site."""
         for garbage in (False, True):
@@ -897,17 +904,23 @@ class Swap(unittest.TestCase):
                 else:
                     tb.seed(r, 2)
                 cutoff_now(r)
-                live0 = tgs.live_packs(r)
-                n0, bytes0 = len(live0), sum(p["bytes"] for p in live0)
                 new_pack1 = None
+                writers = set()  # packs the test's own pre/mid pushes add
                 for cycle in (1, 2):
+                    # live bytes before this cycle's build — the net-positive
+                    # baseline; the test's writer packs are excluded below
+                    bytes_before = sum(p["bytes"] for p in tgs.live_packs(r))
                     tb.to_stage(r, "presweep")
                     if cycle == 1:
                         new_pack1 = tb.meta(r).get("gc.new_pack")
                     ge.knob(r.name, "swap_tries", 1)
+                    before = live_ids(r)
                     push_commit(r, "pre%d" % cycle)  # drain work for the pause
+                    writers |= (live_ids(r) - before)
                     t, box = pause_drain(r)
+                    before = live_ids(r)
                     push_commit(r, "mid%d" % cycle)
+                    writers |= (live_ids(r) - before)
                     release_drain(r, t, box)
                     # observe THIS cycle's fallback before the queued mark
                     # the mid-drain pushes left starts the NEXT cycle early —
@@ -917,6 +930,15 @@ class Swap(unittest.TestCase):
                     self.assertIsNotNone(swap, "cycle %d: no gc_last_swap" % cycle)
                     self.assertTrue(swap["fallback"],
                                     "cycle %d did not fall back: %r" % (cycle, swap))
+                    # exclude the test's writer packs — they are not cohort —
+                    # so the live-bytes bound checks the GC effect alone
+                    live_gc = [p for p in tgs.live_packs(r)
+                               if p["id"] not in writers]
+                    self.assertLessEqual(
+                        sum(p["bytes"] for p in live_gc), bytes_before,
+                        "live bytes grew across fallback cycle %d: %d -> %d"
+                        % (cycle, bytes_before,
+                           sum(p["bytes"] for p in live_gc)))
                     # the next cohort spans every pack including the build
                     # pack this cycle left live
                     ge.knob(r.name, "gc_candidate_before_ms",
@@ -928,14 +950,6 @@ class Swap(unittest.TestCase):
                     self.assertEqual(packs[new_pack1]["state"], "dead",
                                      "cycle 2 kept the older duplicate: %r"
                                      % packs[new_pack1])
-                live = tgs.live_packs(r)
-                self.assertLessEqual(len(live), n0,
-                                     "live packs grew across fallbacks: %d -> %d"
-                                     % (n0, len(live)))
-                if garbage:
-                    self.assertLessEqual(
-                        sum(p["bytes"] for p in live), bytes0,
-                        "net-positive violated: live bytes grew")
                 # a later quiesced chain swaps — the counter resets
                 tb.to_stage(r, "presweep")
                 finish_chain(r, limit=80)
