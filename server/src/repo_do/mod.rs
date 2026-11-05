@@ -31,6 +31,14 @@ const DEFAULT_MAX_BYTES: i64 = 4 << 30; // GE_QUOTA_MAX_BYTES (4 GiB)
 /// A27: pushes per minute per credential per repo (GE_RATE_PUSHES_PER_MIN). Abuse
 /// damping only — the heavy hammer is a zone-level Cloudflare rate-limit rule.
 const DEFAULT_PUSHES_PER_MIN: i64 = 30;
+/// G2b live-pack admission cap (GE_MAX_LIVE_PACKS); <= 0 disables, and an
+/// enabled env value is floored at 2 (see at_pack_cap). 1000 covers
+/// ~720 young packs under the 1 h grace at a 5 s write cadence, plus burst
+/// headroom; higher only inflates clone fan-out until G4a compaction lands.
+const DEFAULT_MAX_LIVE_PACKS: i64 = 1000;
+/// G2b: Retry-After on a refused push/import — the count only drops through a
+/// GC cycle, so a shorter hint just re-polls a refusal.
+const BUSY_RETRY_S: u32 = 60;
 
 /// A28: memoized advertisement state, valid for exactly one refs_version. `ls` holds a
 /// few (request body -> response body) pairs for /_do/ls-refs so a lazy-mount poller
@@ -1206,17 +1214,50 @@ impl RepoDo {
         Response::from_bytes(w.out).map_err(|e| Error::Internal(e.to_string()))
     }
 
+    /// G2b admission cap: true while live+ingesting packs reach the cap. One
+    /// COUNT, no writes — callers run it before any INSERT. Soft cap: pack
+    /// rows appear only at push/index, so concurrent begins may overshoot by
+    /// at most the 64-open-push bound. The knob reads only with hooks on;
+    /// cap <= 0 disables (never at cap). The janitor-done hook in jobs/mod.rs
+    /// consults the same predicate to keep a capped repo's GC chain alive.
+    pub(crate) fn at_pack_cap(&self) -> Result<bool, Error> {
+        let cap = match crate::testhooks::knob(self, "max_live_packs") {
+            Some(v) => v,
+            None => {
+                let v = self.env_i64("GE_MAX_LIVE_PACKS", DEFAULT_MAX_LIVE_PACKS);
+                if v <= 0 {
+                    return Ok(false);
+                }
+                // GC cannot shrink a fully reachable repo below one pack, so
+                // a cap of 1 would be a permanent ban.
+                v.max(2)
+            }
+        };
+        if cap <= 0 {
+            return Ok(false);
+        }
+        let n = self
+            .q("SELECT COUNT(*) AS n FROM packs WHERE state IN ('live','ingesting')", vec![])?
+            .one::<N>()?
+            .n;
+        Ok(n >= cap)
+    }
+
+    /// G2b: refuse a NEW pack while at the cap — Busy(retry_s), write-free.
+    fn admit_pack(&self) -> Result<(), Error> {
+        if self.at_pack_cap()? {
+            return Err(Error::Busy(BUSY_RETRY_S));
+        }
+        Ok(())
+    }
+
     /// Section 3 step 0: the push row carrying the gc_epoch the whole push validates against.
     fn push_begin(&self, meta: &Meta, b: &BeginDto) -> Result<Response, Error> {
-        self.rate_check(&b.key)?; // A27: before the row exists — throttled pushes hold nothing
-        // object-format negotiation lands here: a v0 push's declared format pins
-        // an unpinned repo, and a conflicting one is refused before ingest sees bytes
-        if let Some(kind) = Self::parse_kind(b.object_format.as_deref())? {
-            self.pin_obj_format(kind)?;
-        }
         // I1 multi-part staging reuses ONE open push for every part key so the import
         // job's began_at heartbeat covers them all: re-beginning an existing open push
         // under the same principal is a no-op; any other state or owner is an error.
+        // The read runs first so an already-admitted push can never be bounced by
+        // the G2b cap — a re-begin allocates nothing.
         #[derive(serde::Deserialize)]
         struct Existing {
             state: String,
@@ -1231,6 +1272,17 @@ impl RepoDo {
             .to_array::<Existing>()?
             .into_iter()
             .next();
+        // G2b: before rate_check — a refusal writes nothing, and rate_check's
+        // first act is an INSERT into `rate`. Only a NEW push can add a pack.
+        if existing.is_none() {
+            self.admit_pack()?;
+        }
+        self.rate_check(&b.key)?; // A27: before the row exists — throttled pushes hold nothing
+        // object-format negotiation lands here: a v0 push's declared format pins
+        // an unpinned repo, and a conflicting one is refused before ingest sees bytes
+        if let Some(kind) = Self::parse_kind(b.object_format.as_deref())? {
+            self.pin_obj_format(kind)?;
+        }
         match existing {
             // PR-3b: same principal AND same credential — commit re-validates the
             // begin credential, so a second part can't ride under another token
@@ -1422,9 +1474,9 @@ impl RepoDo {
 
     /// I1: POST /_do/import/start — open the pushes row, plant the 'ingesting'
     /// packs row the job will write into, and queue the import_pack job. One sync
-    /// span; a second start for the same push updates payload + run_at instead of
-    /// queueing a duplicate row (the generic enqueue dedup is per-kind, which
-    /// would silently swallow a distinct push's job).
+    /// span; a second start for the same push hands back the live job's pack id
+    /// instead of queueing a duplicate row (the generic enqueue dedup is
+    /// per-kind, which would silently swallow a distinct push's job).
     fn import_start(&self, meta: &Meta, b: &ImportStartDto) -> Result<Response, Error> {
         #[derive(serde::Deserialize)]
         struct S {
@@ -1450,6 +1502,38 @@ impl RepoDo {
         if url.is_none() && (b.parts.is_empty() || b.commands.is_empty()) {
             return Err(Error::Protocol("import needs parts and commands".into()));
         }
+        // same-push start is idempotent: a live job for it already owns a pack —
+        // hand that pack id back rather than planting a second ingesting row
+        #[derive(serde::Deserialize)]
+        struct J {
+            payload: String,
+        }
+        let existing = self
+            .q(
+                "SELECT payload FROM jobs WHERE kind='import_pack' AND state IN ('queued','running')",
+                vec![],
+            )?
+            .to_array::<J>()?
+            .into_iter()
+            .find(|j| {
+                serde_json::from_str::<serde_json::Value>(&j.payload)
+                    .ok()
+                    .and_then(|v| v.get("push").and_then(|p| p.as_str()).map(String::from))
+                    .as_deref()
+                    == Some(b.push.as_str())
+            });
+        if let Some(j) = existing {
+            let pack = serde_json::from_str::<serde_json::Value>(&j.payload)
+                .ok()
+                .and_then(|v| v.get("pack").and_then(|p| p.as_str()).map(String::from))
+                .unwrap_or_default();
+            return json(serde_json::json!({ "queued": true, "push": b.push, "pack": pack }));
+        }
+        // G2b: a NEW import plants an 'ingesting' pack — admit before its first
+        // write (the format pin below included) so a refusal changes nothing at
+        // all. A retry of an already-queued import returned above and never
+        // reaches this check, so a cap that appeared mid-import can't strand it.
+        self.admit_pack()?;
         // staged imports declare the pack's format (default: the repo's own) and
         // pin it before the job exists; a url import pins the remote's format at
         // fetch time
@@ -1488,33 +1572,6 @@ impl RepoDo {
             // malformed commands should 400 here, not kill the job mid-import
             serde_json::from_value::<Vec<CmdDto>>(serde_json::Value::Array(b.commands.clone()))
                 .map_err(|e| Error::Protocol(format!("commands: {e}")))?;
-        }
-        // same-push start is idempotent: a live job for it already owns a pack —
-        // hand that pack id back rather than planting a second ingesting row
-        #[derive(serde::Deserialize)]
-        struct J {
-            payload: String,
-        }
-        let existing = self
-            .q(
-                "SELECT payload FROM jobs WHERE kind='import_pack' AND state IN ('queued','running')",
-                vec![],
-            )?
-            .to_array::<J>()?
-            .into_iter()
-            .find(|j| {
-                serde_json::from_str::<serde_json::Value>(&j.payload)
-                    .ok()
-                    .and_then(|v| v.get("push").and_then(|p| p.as_str()).map(String::from))
-                    .as_deref()
-                    == Some(b.push.as_str())
-            });
-        if let Some(j) = existing {
-            let pack = serde_json::from_str::<serde_json::Value>(&j.payload)
-                .ok()
-                .and_then(|v| v.get("pack").and_then(|p| p.as_str()).map(String::from))
-                .unwrap_or_default();
-            return json(serde_json::json!({ "queued": true, "push": b.push, "pack": pack }));
         }
         self.q(
             "INSERT INTO packs(id,state,count,bytes,commit_lo,commit_hi,push_id,created_at) \
@@ -2339,27 +2396,29 @@ impl RepoDo {
         }
         let mut set = generate::SendSet::default();
         let mut by_pack: HashMap<String, usize> = HashMap::new();
-        let mut args: Vec<V> = Vec::with_capacity(live.len() + 1);
-        let marks = live.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // two parameters at any pack count (A6); one global sha cursor keeps
+        // cross-pack and cross-page dedup; chunking is rejected because each
+        // chunk would run its own cursor. The unary + keeps SQLite off the
+        // objects_pack index, so it walks the PK from sha > ?2 in order with
+        // no temp sort — without it every page re-scans every live row
+        // (quadratic).
+        let pack_ids = serde_json::to_string(&live.iter().map(|p| p.id.as_str()).collect::<Vec<_>>())
+            .map_err(|e| Error::Internal(e.to_string()))?;
         for p in &live {
             let count = u32::try_from(p.count).map_err(|_| Error::Internal("count".into()))?;
             let bytes = u64::try_from(p.bytes).map_err(|_| Error::Internal("bytes".into()))?;
             let bits = usize::try_from(count).map_err(|_| Error::Internal("count".into()))?.div_ceil(8);
             by_pack.insert(p.id.clone(), set.packs.len());
-            args.push(V::from(p.id.as_str()));
             set.packs.push(generate::PackSlice { pack: PackId(p.id.clone()), count, bytes, bitmap: vec![0; bits] });
         }
         let mut last = String::new();
         loop {
-            let mut page = args.clone();
-            page.push(V::from(last.as_str()));
             let rows = self
                 .q(
-                    &format!(
-                        "SELECT sha, pack_id, idx FROM objects \
-                         WHERE pack_id IN ({marks}) AND sha > ? ORDER BY sha LIMIT 5000"
-                    ),
-                    page,
+                    "SELECT sha, pack_id, idx FROM objects \
+                     WHERE +pack_id IN (SELECT value FROM json_each(?1)) AND sha > ?2 \
+                     ORDER BY sha LIMIT 5000",
+                    vec![V::from(pack_ids.as_str()), V::from(last.as_str())],
                 )?
                 .to_array::<DedupRow>()?;
             let n = rows.len();

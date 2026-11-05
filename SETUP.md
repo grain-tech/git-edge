@@ -54,6 +54,7 @@ All have defaults; set in `wrangler.jsonc` `[vars]` or `wrangler dev --var`:
 | `GE_QUOTA_MAX_BYTES` | 4 GiB | Stored bytes per repo (the normalized pack — undeltified ~6× the wire size) |
 | `GE_QUOTA_MAX_REPOS_PER_OWNER` | 50 | Live repo claims per `owner/` prefix |
 | `GE_RATE_PUSHES_PER_MIN` | 30 | Pushes per credential per repo per minute |
+| `GE_MAX_LIVE_PACKS` | 1,000 | Live+ingesting packs per repo; min 2 when enabled, ≤0 disables — over-cap pushes/imports get 503 + `Retry-After: 60` |
 | `GE_GC_QUIET_MS` | (ms) | Quiet period before GC consolidates after a push |
 | `GE_GC_GRACE_MS` | (ms) | Grace before dead packs are swept |
 

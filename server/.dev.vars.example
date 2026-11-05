@@ -12,5 +12,7 @@ GE_URL_SIGNING_KEY=dev-only-signing-key-32-bytes-minimum-ok
 # GE_QUOTA_MAX_BYTES=4294967296
 # GE_QUOTA_MAX_REPOS_PER_OWNER=50
 # GE_RATE_PUSHES_PER_MIN=30
+# live+ingesting pack admission cap — over it, push/import begin refuse 503 + Retry-After
+# GE_MAX_LIVE_PACKS=1000
 # GE_GC_QUIET_MS=…
 # GE_GC_GRACE_MS=…

@@ -102,10 +102,11 @@ pub fn do_error_response(e: &Error, subreqs: u32) -> Result<Response, Error> {
         Error::Budget => "budget",
         Error::Limit(_) => "limit",
         Error::RateLimit(_) => "ratelimit",
+        Error::Busy(_) => "busy",
         Error::Storage(_) | Error::Internal(_) => "internal",
     };
     let mut body = serde_json::json!({ "error": kind, "message": e.message() });
-    if let Error::RateLimit(secs) = e {
+    if let Error::RateLimit(secs) | Error::Busy(secs) = e {
         body["retry_after"] = (*secs).into();
     }
     let mut resp = Response::from_json(&body).map_err(|e| Error::Internal(e.to_string()))?;
