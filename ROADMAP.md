@@ -123,12 +123,13 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
   **`object-info`**, **`bundle-uri`** —
   deliberately unadvertised; add when a client actually needs them.
 - **Jurisdiction-pinned DOs** — EU repos in EU DOs if compliance demands it.
-- **`git-edge mount` via artifact-fs** — Cloudflare's artifact-fs is a FUSE
-  lazy-mount client that works with *any* git remote, and git-edge already
-  speaks everything it needs (v2, `blob:none`, promisor backfill,
-  `allowAnySHA1InWant`). Documenting the mount path — or running their e2e
-  suite with `AFS_E2E_REPO` pointed at git-edge — is the cheapest
-  lazy-checkout story available; building our own mount client is not.
+- **artifact-fs compatibility** — decided: client-compatible, not a server
+  feature. Cloudflare's artifact-fs is an open-source FUSE lazy-mount client
+  that works with *any* git remote, and git-edge already speaks everything it
+  needs (v2, `blob:none`, promisor backfill, `allowAnySHA1InWant`) — its e2e
+  suite passes against git-edge (`findings/afs-e2e.md`). Remaining work is
+  docs-only: document the mount path for users. Building our own mount
+  client is not on the table.
 
 ## Explicit non-goals
 
@@ -136,3 +137,7 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
 - Web UI / code browsing / issue tracking — this is a storage service
 - Hooks (`pre-receive`, `post-receive`) — no user code runs in the DO
 - Self-serve multi-tenant SaaS — auth is tokens, not accounts
+- Managed fork graph — reserved as the deferred out-of-tree sister
+  `idl3/git-edge-fork`; core has no fork concept
+- Product notes API — reserved as the deferred out-of-tree sister
+  `idl3/git-edge-notes`; core already round-trips raw `refs/notes/*`

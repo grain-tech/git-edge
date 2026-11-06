@@ -79,6 +79,22 @@ When the job finishes, `gitge clone "$GE_HOST/me/flask"` works like any remote.
 Repos bigger than the ~100 MB request cap need the staged-push path — see
 `.devin/skills/git-edge/SKILL.md` and [SETUP.md](SETUP.md#first-repository).
 
+## 5. (Optional) git notes
+
+Notes are ordinary refs — `refs/notes/*` round-trips like any other ref, so
+stock `git notes` works with no product API:
+
+```bash
+git -C ../hello-back notes add -m "reviewed" HEAD
+gitge -C ../hello-back push "$GE_HOST/$GE_REPO" 'refs/notes/*'
+gitge -C ../hello-back fetch "$GE_HOST/$GE_REPO" 'refs/notes/*:refs/notes/*'
+```
+
+Clones don't fetch notes by default — pass the refspec explicitly (or use
+`git clone --mirror`). A scoped token needs `refs/notes/*` in its `scope` to
+push them. There is no notes REST/product API in core; that surface is a
+reserved sister (`idl3/git-edge-notes`).
+
 ## Local path
 
 Same commands with `GE_HOST=http://localhost:8787` and

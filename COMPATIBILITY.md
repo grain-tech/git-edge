@@ -21,7 +21,8 @@ Cloudflare deployment (`git-edge.<acct>.workers.dev`, Paid plan); see
 
 **Client floor:** any git ≥ 2.26 (March 2020) clones, fetches, and pushes
 normally. Older clients fail fetch with a clean protocol error, not a hang or
-corruption.
+corruption. (Cloudflare Artifacts negotiates v1 fetches too; git-edge is
+v2-only on `git-upload-pack`.)
 
 ## Advertised capabilities (v2)
 
@@ -86,7 +87,7 @@ supported format while the repo is unpinned.
 
 | Feature | Status |
 |---|---|
-| Full ref namespace (`refs/heads`, `refs/tags`, `refs/remotes`, arbitrary) | ✅ |
+| Full ref namespace (`refs/heads`, `refs/tags`, `refs/remotes`, `refs/notes/*`, arbitrary) | ✅ |
 | Annotated tags + `peel` in ls-refs | ✅ |
 | Symrefs (`symrefs` arg, `HEAD`) | ✅ |
 | Unborn `HEAD` (`ls-refs=unborn`) | ✅ |

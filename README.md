@@ -35,9 +35,10 @@ is a **managed** product: versioned storage that speaks Git,
 agent-first, operated by Cloudflare. Git objects live primarily in each
 repo's Durable Object SQLite (chunked under the ~2 MB row cap), R2 holds
 snapshots, and access is a native Workers API (create / fork / import, token
-minting) plus REST and a plain git remote — with first-class forks and
-git-notes, and [ArtifactFS](https://developers.cloudflare.com/artifacts/concepts/how-artifacts-works/)
-for lazy-mounting large repos from any remote. Storage lifecycle is
+minting) plus REST and a plain git remote — first-class forks, `git notes`
+via the stock remote (no notes REST), and
+[ArtifactFS](https://developers.cloudflare.com/artifacts/guides/artifact-fs/)
+for lazy-mounting large repos from any git remote. Storage lifecycle is
 Cloudflare's concern, not the operator's — it's part of the managed product.
 
 | | Cloudflare Artifacts | git-edge |
@@ -46,14 +47,17 @@ Cloudflare's concern, not the operator's — it's part of the managed product.
 | Who runs it | Cloudflare operates it | You (`wrangler deploy`) |
 | Object storage | Git objects primarily in the DO SQLite (chunked ~2 MB rows); R2 for snapshots | Packfiles in R2; the DO holds refs, the object index, and job/GC state |
 | API surface | Native Workers API (create/fork/import + mint tokens) + REST + git remote | Stock git smart-HTTP + `/_admin/*` (tokens, import, delete, pin, export) |
-| Forks / notes | First-class fork + git-notes | No managed fork graph; notes are not a product feature |
-| Large repos | ArtifactFS lazy mount (works with any git remote) | Consolidated single-pack clone / `packfile-uris`; artifact-fs listed as a future idea in [ROADMAP.md](ROADMAP.md) |
+| Forks / notes | First-class fork API; notes via stock `git notes` (no notes REST) | No managed fork graph; raw `refs/notes/*` round-trips — product surfaces are reserved out-of-tree sisters (below) |
+| Large repos | ArtifactFS lazy-mount client over any git remote | `artifact-fs` is client-compatible with git-edge — the upstream FUSE client mounts it unchanged (e2e-verified, see [findings/afs-e2e.md](findings/afs-e2e.md)); nothing server-side to build. Plain clones ride consolidated single-pack / `packfile-uris` |
 | Continuous-write GC | Managed internally | Explicit alarm-driven GC: mark → consolidate → sweep, opt-in `GE_GC_BARRIER`, G4a compaction (`GE_COMPACT_*`), live-pack admission (`GE_MAX_LIVE_PACKS`) |
 
 They are complementary, not competitors-to-conflate: Artifacts is the managed
 product; git-edge is the open-source, self-deployed remote for when you want
 pack-in-R2, operator-visible GC, and full control of the Worker on your own
-account.
+account. Managed extras deliberately stay out-of-tree as reserved sister
+repos — [git-edge-fork](https://github.com/idl3/git-edge-fork) for a managed
+fork graph and [git-edge-notes](https://github.com/idl3/git-edge-notes) for a
+product notes API — both deferred; core intentionally has neither.
 
 ## What works today
 
