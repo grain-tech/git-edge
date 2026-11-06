@@ -2,21 +2,31 @@
 # git-edge OSS benchmark: bare-clone a public repo, staged-push it into a
 # git-edge deployment in <SLICE_MIB slices, clone back, fsck, print a row.
 #
-# Single repo (owner/repo is the git-edge path, not the source path):
-#   tests/bench/oss-bench.sh <git-url> <edge-base> <owner/repo> <write-token>
-#   tests/bench/oss-bench.sh /tmp/flask.git http://localhost:8794 pallets/flask write-test-token
+# Token always via EDGE_TOKEN env (never argv — `ps` would leak it).
 #
-# Batch — owner/repo is derived from each URL's last two path segments:
+# Single repo (owner/repo is the git-edge path, not the source path):
+#   EDGE_TOKEN=… tests/bench/oss-bench.sh <git-url> <edge-base> <owner/repo>
+#   EDGE_TOKEN=… tests/bench/oss-bench.sh /tmp/flask.git http://localhost:8794 pallets/flask
+#
+# Batch — remote path is owner/repo from the URL, or BENCH_PREFIX/name when set:
 #   BENCH_REPOS="https://github.com/pallets/flask https://github.com/vitejs/vite" \
-#     EDGE_BASE=http://localhost:8794 EDGE_TOKEN=write-test-token \
+#     EDGE_BASE=https://git-edge.<acct>.workers.dev EDGE_TOKEN=… BENCH_PREFIX=bench \
 #     tests/bench/oss-bench.sh
 #
 # Tunables:
 #   SLICE_MIB   target staged-push slice size in MiB of on-disk object bytes
 #               (default 60 — leaves headroom under the ~100 MB zone body cap)
 #   SLICE_OBJS  max objects per staged push (default 30000 — larger slices
-#               risk the ingest request budget / 240 s wall clock)
+#               risk the ingest request budget / 240 s wall clock; if pushes
+#               die mid-ingest, lower this — each push is one request)
+#   BENCH_PREFIX  batch mode only: write to <prefix>/<name> instead of
+#               <owner>/<name> — e.g. BENCH_PREFIX=bench -> bench/flask for
+#               https://github.com/pallets/flask, so re-runs never collide
+#               with real owner paths
 #   BENCH_KEEP  set to keep the work dirs (bare clone + clone-back)
+#
+# Re-runs are cheap: a remote tip on the first-parent chain resumes mid-import;
+# a remote already at the source tip is clone+fsck'd only (0 pushes).
 set -euo pipefail
 
 SLICE_MIB="${SLICE_MIB:-60}"
@@ -83,8 +93,15 @@ bench_inner() { # W url repo -> prints one markdown row
       echo "$row| $commits | $objects | $packmib | - | - | - | **remote tip not on first-parent chain** |"
       return 0
     }
-    [ "$lo" -ge "$n" ] && { note "$repo: already fully imported"; }
-    note "$repo: resuming from remote tip at index $lo"
+    # A remote already at the source tip needs no pushes: bounds stays empty,
+    # the push loop is a no-op, and the shared clone+fsck+tip-check tail still
+    # runs — fsck is compared against the source's own output, so pre-existing
+    # findings don't false-fail the row.
+    if [ "$lo" -ge "$n" ]; then
+      note "$repo: already fully imported — clone+fsck only"
+    else
+      note "$repo: resuming from remote tip at index $lo"
+    fi
   fi
   local -a bounds=()
   slice=$(( n * SLICE_MIB / (packmib + 1) ))
@@ -153,18 +170,25 @@ bench_repo() {
   return $rc
 }
 
-if [ $# -ge 4 ]; then
-  EDGE=${2%/}; TOKEN=$4
+# Token always from EDGE_TOKEN (never argv — shows up in `ps`).
+TOKEN=${EDGE_TOKEN:?set EDGE_TOKEN}
+if [ $# -ge 3 ]; then
+  EDGE=${2%/}
   bench_repo "$1" "$3" || echo "| $3 | - | - | - | - | - | - | **error** |"
 elif [ -n "${BENCH_REPOS:-}" ]; then
   EDGE=${EDGE_BASE:?set EDGE_BASE and EDGE_TOKEN}; EDGE=${EDGE%/}
-  TOKEN=${EDGE_TOKEN:?set EDGE_BASE and EDGE_TOKEN}
   echo "| repo | commits | objects | pack MiB | pushes | import | clone | fsck |"
   echo "|---|---|---|---|---|---|---|---|"
   for u in $BENCH_REPOS; do
     p=${u%.git}; p=${p%/}
-    bench_repo "$u" "$(basename "$(dirname "$p")")/$(basename "$p")" \
-      || echo "| $p | - | - | - | - | - | - | **error** |"
+    owner=$(basename "$(dirname "$p")"); name=$(basename "$p")
+    if [ -n "${BENCH_PREFIX:-}" ]; then
+      remote_path="${BENCH_PREFIX}/${name}"
+    else
+      remote_path="${owner}/${name}"
+    fi
+    bench_repo "$u" "$remote_path" \
+      || echo "| $remote_path | - | - | - | - | - | - | **error** |"
   done
 else
   sed -n '2,20p' "$0" >&2; exit 2

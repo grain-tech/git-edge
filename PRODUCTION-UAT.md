@@ -107,7 +107,7 @@ rejection, malformed-pack `ERR`, GC mark/consolidate/sweep cycle.
 | Clone walk bound | none for plain clone (#22 streams all live objects); 200k commits for negotiated fetches | — | ☐ |
 | Fetch objects | 1M reachable | partial clone filters | ☐ |
 | Client floor | git ≥ 2.26 | — | ☐ |
-| Object format | sha1 only | — | ☐ |
+| Object format | sha1 + sha256 (unpinned repos advertise both; first write pins) | — | ☐ |
 | LFS | basic transfer implemented (A33): batch + signed GET/PUT | no verify/locking/custom transfers | ☐ |
 | Auth model | global + per-repo tokens, no per-user identity | name tokens per principal; per-ref `scope` on mint (ROADMAP #19) | ☐ |
 | Paid plan only | 10k subrequests vs 9k budget | — | ☐ |
