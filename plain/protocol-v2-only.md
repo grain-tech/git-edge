@@ -1,7 +1,7 @@
 # Speak git protocol v2 only, translate v0 at the edge
 
 > Verdict: **risky** · feasibility 4/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/protocol-v2-only.md) · [review](../reviews/protocol-v2-only.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/protocol-v2-only.md) · [review](../research/reviews/protocol-v2-only.md)
 
 
 ## What this idea is

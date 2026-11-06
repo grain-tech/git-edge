@@ -1,7 +1,7 @@
 # Search index built on push
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/search-index-on-push.md) · [review](../reviews/search-index-on-push.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/search-index-on-push.md) · [review](../research/reviews/search-index-on-push.md)
 
 
 ## What this idea is

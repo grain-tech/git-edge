@@ -1,7 +1,7 @@
 # Speculative packs
 
 > Verdict: **risky** · feasibility 3/5 · reliability 4/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/speculative-packs.md) · [review](../reviews/speculative-packs.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/speculative-packs.md) · [review](../research/reviews/archived/speculative-packs.md)
 
 
 ## What this idea is

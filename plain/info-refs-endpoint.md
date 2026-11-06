@@ -1,7 +1,7 @@
 # The /info/refs?service= entrypoint and pkt-line codec
 
 > Verdict: **lands** · feasibility 5/5 · reliability 5/5 · correctness 4/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/info-refs-endpoint.md) · [review](../reviews/info-refs-endpoint.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/info-refs-endpoint.md) · [review](../research/reviews/info-refs-endpoint.md)
 
 
 ## What this idea is

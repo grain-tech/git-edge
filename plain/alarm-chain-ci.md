@@ -1,7 +1,7 @@
 # Push-triggered CI as a DO alarm chain
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/alarm-chain-ci.md) · [review](../reviews/alarm-chain-ci.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/alarm-chain-ci.md) · [review](../research/reviews/alarm-chain-ci.md)
 
 
 ## What this idea is

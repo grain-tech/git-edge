@@ -110,14 +110,14 @@ The 56 proofs were written in TypeScript. We then asked whether the server can b
 |---|---|---|
 | `findings/` | The summary documents listed above | Everyone. Start here. |
 | `plain/` | One explainer per idea in plain language | Everyone. |
-| `proofs/` | One proof per idea, with code | Engineers. |
-| `reviews/` | One review per idea, in the reviewer's own words | Engineers. |
-| `proofs-v2/` | The second pass: 33 foundation and edge proofs rewritten in Rust against the contract | Engineers. |
-| `reviews-v2/` | The second-pass reviews, checking contract compliance | Engineers. |
+| `research/proofs/` | Canonical (second-pass) Rust proofs against the contract | Engineers. |
+| `research/reviews/` | Canonical (second-pass) reviews checking contract compliance | Engineers. |
+| `research/proofs/archived/` | First-pass TypeScript proofs (historical) | Engineers. |
+| `research/reviews/archived/` | First-pass reviews (historical) | Engineers. |
 | `ideas/` | The list of 56 ideas as they went into the study | Everyone. |
 | `site/` | The interactive map as one web page | Everyone. |
 | `data/` | The structured results every other file was made from | Tools. |
-| `research/` | Engineer-level memos with source links: the Rust check, and the platform facts we measured | Engineers. |
+| `research/` | Engineer memos (Rust check, platform facts) plus canonical proofs and reviews | Engineers. |
 | `spikes/` | Small real programs run on the Cloudflare runtime to test a fact | Engineers. |
 | `CONTRACTS.md` | The one set of rules every revised proof follows: storage layout, the ref transaction, the job timer, the janitor | Engineers. |
 | `server/` | The working server: the contract compiled to a Rust/WASM Cloudflare Worker, tested with real git | Engineers. |

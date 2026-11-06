@@ -1,5 +1,5 @@
 //! Phase one of the two-phase push (CONTRACTS.md 2.4-2.5, 3 ordering), in the edge Worker.
-//! Ported from proofs-v2/two-phase-push.md.
+//! Ported from research/proofs/two-phase-push.md.
 
 use std::collections::HashMap;
 

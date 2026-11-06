@@ -1,7 +1,7 @@
 # Tiny in-DO object cache with alarm-driven eviction
 
 > Verdict: **risky** · feasibility 4/5 · reliability 4/5 · correctness 2/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/in-do-object-cache.md) · [review](../reviews/in-do-object-cache.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/in-do-object-cache.md) · [review](../research/reviews/in-do-object-cache.md)
 
 
 ## What this idea is

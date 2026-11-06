@@ -1,7 +1,7 @@
 # Copy-on-write forks
 
 > Verdict: **risky** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/cow-forks.md) · [review](../reviews/cow-forks.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/cow-forks.md) · [review](../research/reviews/cow-forks.md)
 
 
 ## What this idea is

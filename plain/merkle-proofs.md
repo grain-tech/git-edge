@@ -1,7 +1,7 @@
 # Merkle inclusion proofs on fetch
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 5/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/merkle-proofs.md) · [review](../reviews/merkle-proofs.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/merkle-proofs.md) · [review](../research/reviews/archived/merkle-proofs.md)
 
 
 ## What this idea is

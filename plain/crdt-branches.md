@@ -1,7 +1,7 @@
 # Multi-writer CRDT branches
 
 > Verdict: **does not land** · feasibility 3/5 · reliability 2/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/crdt-branches.md) · [review](../reviews/crdt-branches.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/crdt-branches.md) · [review](../research/reviews/archived/crdt-branches.md)
 
 
 ## What this idea is

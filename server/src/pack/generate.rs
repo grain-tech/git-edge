@@ -1,5 +1,5 @@
 //! pack::generate — send_set + write_pack, running inside RepoDo (CONTRACTS.md 1.4, 9).
-//! Ported from proofs-v2/partial-clone-filters.md.
+//! Ported from research/proofs/partial-clone-filters.md.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

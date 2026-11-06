@@ -1,7 +1,7 @@
 # Zero-clone execution: repo as a virtual filesystem inside an agent DO
 
 > Verdict: **risky** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/zero-clone-vfs.md) · [review](../reviews/zero-clone-vfs.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/zero-clone-vfs.md) · [review](../research/reviews/archived/zero-clone-vfs.md)
 
 
 ## What this idea is

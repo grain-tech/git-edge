@@ -1,7 +1,7 @@
 # Diff API served with R2 range reads
 
 > Verdict: **risky** · feasibility 4/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/diff-api-range-reads.md) · [review](../reviews/diff-api-range-reads.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/diff-api-range-reads.md) · [review](../research/reviews/diff-api-range-reads.md)
 
 
 ## What this idea is

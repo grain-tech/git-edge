@@ -1,7 +1,7 @@
 # Snapshots via R2 object versioning of ref state
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/r2-versioned-snapshots.md) · [review](../reviews/r2-versioned-snapshots.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/r2-versioned-snapshots.md) · [review](../research/reviews/r2-versioned-snapshots.md)
 
 
 ## What this idea is

@@ -1,7 +1,7 @@
 # Git LFS natively via presigned R2 URLs
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 4/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/native-lfs.md) · [review](../reviews/native-lfs.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/native-lfs.md) · [review](../research/reviews/native-lfs.md)
 
 
 ## What this idea is

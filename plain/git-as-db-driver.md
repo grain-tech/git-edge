@@ -1,7 +1,7 @@
 # Git as a database driver
 
 > Verdict: **risky** · feasibility 4/5 · reliability 2/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/git-as-db-driver.md) · [review](../reviews/git-as-db-driver.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/git-as-db-driver.md) · [review](../research/reviews/archived/git-as-db-driver.md)
 
 
 ## What this idea is

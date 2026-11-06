@@ -1,7 +1,7 @@
 # Time-travel refs
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 4/5 · correctness 4/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/time-travel-refs.md) · [review](../reviews/time-travel-refs.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/time-travel-refs.md) · [review](../research/reviews/time-travel-refs.md)
 
 
 ## What this idea is

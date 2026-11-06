@@ -1,7 +1,7 @@
 # Commit graph in Vectorize for semantic git log
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/vectorized-commit-graph.md) · [review](../reviews/vectorized-commit-graph.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/vectorized-commit-graph.md) · [review](../research/reviews/archived/vectorized-commit-graph.md)
 
 
 ## What this idea is

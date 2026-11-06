@@ -1,7 +1,7 @@
 # Server-side three-way merge in the Worker
 
 > Verdict: **risky** · feasibility 4/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/server-side-merge.md) · [review](../reviews/server-side-merge.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/server-side-merge.md) · [review](../research/reviews/server-side-merge.md)
 
 
 ## What this idea is

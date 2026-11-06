@@ -1,7 +1,7 @@
 # Time-boxed history with cold-storage checkpoints
 
 > Verdict: **lands with caveats** · feasibility 3/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/time-boxed-history.md) · [review](../reviews/time-boxed-history.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/time-boxed-history.md) · [review](../research/reviews/archived/time-boxed-history.md)
 
 
 ## What this idea is

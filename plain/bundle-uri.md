@@ -1,7 +1,7 @@
 # Bundle-URI support
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/bundle-uri.md) · [review](../reviews/bundle-uri.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/bundle-uri.md) · [review](../research/reviews/bundle-uri.md)
 
 
 ## What this idea is

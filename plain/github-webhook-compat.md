@@ -1,7 +1,7 @@
 # GitHub-compatible webhook payloads
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/github-webhook-compat.md) · [review](../reviews/github-webhook-compat.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/github-webhook-compat.md) · [review](../research/reviews/archived/github-webhook-compat.md)
 
 
 ## What this idea is

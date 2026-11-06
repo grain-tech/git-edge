@@ -1,7 +1,7 @@
 # GC and repack as a DO alarm
 
 > Verdict: **risky** · feasibility 3/5 · reliability 2/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/gc-and-repack-alarm.md) · [review](../reviews/gc-and-repack-alarm.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/gc-and-repack-alarm.md) · [review](../research/reviews/gc-and-repack-alarm.md)
 
 
 ## What this idea is

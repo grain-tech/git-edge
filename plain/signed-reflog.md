@@ -1,7 +1,7 @@
 # Signed refs by default with append-only DO reflog
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/signed-reflog.md) · [review](../reviews/signed-reflog.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/signed-reflog.md) · [review](../research/reviews/signed-reflog.md)
 
 
 ## What this idea is

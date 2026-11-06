@@ -1,7 +1,7 @@
 # Refs replicated to every region via KV and DO location hints
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/replicated-refs-edge.md) · [review](../reviews/replicated-refs-edge.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/replicated-refs-edge.md) · [review](../research/reviews/replicated-refs-edge.md)
 
 
 ## What this idea is

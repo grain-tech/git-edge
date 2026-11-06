@@ -1,7 +1,7 @@
 # Branch previews deployed as Workers on push
 
 > Verdict: **lands with caveats** · feasibility 3/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/branch-preview-workers.md) · [review](../reviews/branch-preview-workers.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/branch-preview-workers.md) · [review](../research/reviews/archived/branch-preview-workers.md)
 
 
 ## What this idea is

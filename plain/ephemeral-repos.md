@@ -1,7 +1,7 @@
 # Ephemeral repos with a self-destruct alarm
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/ephemeral-repos.md) · [review](../reviews/ephemeral-repos.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/ephemeral-repos.md) · [review](../research/reviews/archived/ephemeral-repos.md)
 
 
 ## What this idea is

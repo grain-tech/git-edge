@@ -1,7 +1,7 @@
 # Two-phase push
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/two-phase-push.md) · [review](../reviews/two-phase-push.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/two-phase-push.md) · [review](../research/reviews/two-phase-push.md)
 
 
 ## What this idea is

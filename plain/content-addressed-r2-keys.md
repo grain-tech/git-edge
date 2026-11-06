@@ -1,7 +1,7 @@
 # Content-addressed R2 keys
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 4/5 · correctness 4/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/content-addressed-r2-keys.md) · [review](../reviews/content-addressed-r2-keys.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/content-addressed-r2-keys.md) · [review](../research/reviews/content-addressed-r2-keys.md)
 
 
 ## What this idea is

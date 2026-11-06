@@ -1,7 +1,7 @@
 # Ref leases
 
 > Verdict: **lands with caveats** · feasibility 5/5 · reliability 4/5 · correctness 4/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/ref-leases.md) · [review](../reviews/ref-leases.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/ref-leases.md) · [review](../research/reviews/archived/ref-leases.md)
 
 
 ## What this idea is

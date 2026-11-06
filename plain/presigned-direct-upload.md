@@ -1,7 +1,7 @@
 # Per-blob presigned direct upload for giant pushes
 
 > Verdict: **risky** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/presigned-direct-upload.md) · [review](../reviews/presigned-direct-upload.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/presigned-direct-upload.md) · [review](../research/reviews/presigned-direct-upload.md)
 
 
 ## What this idea is

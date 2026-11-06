@@ -50,6 +50,6 @@ Six ideas stay risky after the second pass. The copy-on-write fork still cannot 
 ## Where the details live
 
 - [scoreboard.md](scoreboard.md) has every idea, both passes, side by side.
-- [proofs-v2/](../proofs-v2/) has the 33 Rust proofs.
-- [reviews-v2/](../reviews-v2/) has the 33 re-reviews.
+- [research/proofs/](../research/proofs/) has the 33 Rust proofs.
+- [research/reviews/](../research/reviews/) has the 33 re-reviews.
 - [CONTRACTS.md](../CONTRACTS.md) is the rulebook, including the amendments.

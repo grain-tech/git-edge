@@ -1,5 +1,5 @@
 //! Pass A (stream_to_pending) and pass B (resolve_and_normalize) of ingest (CONTRACTS.md 2.4, A10).
-//! Runs in the edge Worker. Ported from proofs-v2/streaming-pack-parser.md.
+//! Runs in the edge Worker. Ported from research/proofs/streaming-pack-parser.md.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;

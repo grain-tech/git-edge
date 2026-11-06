@@ -1,7 +1,7 @@
 # Wasm git core for delta resolution and merge
 
 > Verdict: **risky** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/wasm-git-core.md) · [review](../reviews/wasm-git-core.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/wasm-git-core.md) · [review](../research/reviews/wasm-git-core.md)
 
 
 ## What this idea is

@@ -1,7 +1,7 @@
 # Deduplication across all repos in one content-addressed bucket
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/global-dedup.md) · [review](../reviews/global-dedup.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/global-dedup.md) · [review](../research/reviews/archived/global-dedup.md)
 
 
 ## What this idea is

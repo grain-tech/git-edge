@@ -1,7 +1,7 @@
 # Bisect on the server with parallel test Workers
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/server-side-bisect.md) · [review](../reviews/server-side-bisect.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/server-side-bisect.md) · [review](../research/reviews/archived/server-side-bisect.md)
 
 
 ## What this idea is

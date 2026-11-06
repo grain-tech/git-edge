@@ -1,7 +1,7 @@
 # Rate-limited, token-scoped remote URLs
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/scoped-token-remotes.md) · [review](../reviews/scoped-token-remotes.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/scoped-token-remotes.md) · [review](../research/reviews/scoped-token-remotes.md)
 
 
 ## What this idea is

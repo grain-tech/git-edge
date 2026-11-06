@@ -1,7 +1,7 @@
 # Live fetch over hibernating WebSockets
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/live-fetch-websocket.md) · [review](../reviews/live-fetch-websocket.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/live-fetch-websocket.md) · [review](../research/reviews/live-fetch-websocket.md)
 
 
 ## What this idea is

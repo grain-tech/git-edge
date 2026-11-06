@@ -1,7 +1,7 @@
 # Federated remotes via DO-to-DO gossip
 
 > Verdict: **risky** · feasibility 3/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/federated-gossip.md) · [review](../reviews/federated-gossip.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/federated-gossip.md) · [review](../research/reviews/archived/federated-gossip.md)
 
 
 ## What this idea is

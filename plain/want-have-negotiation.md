@@ -1,7 +1,7 @@
 # Want/have negotiation with a commit-graph in SQLite
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/want-have-negotiation.md) · [review](../reviews/want-have-negotiation.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/want-have-negotiation.md) · [review](../research/reviews/want-have-negotiation.md)
 
 
 ## What this idea is

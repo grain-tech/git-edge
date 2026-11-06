@@ -1,7 +1,7 @@
 # Encrypted-at-rest with client-held keys
 
 > Verdict: **risky** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/client-key-encryption.md) · [review](../reviews/client-key-encryption.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/client-key-encryption.md) · [review](../research/reviews/archived/client-key-encryption.md)
 
 
 ## What this idea is

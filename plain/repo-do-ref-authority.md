@@ -1,7 +1,7 @@
 # One Durable Object per repo as the ref authority
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/repo-do-ref-authority.md) · [review](../reviews/repo-do-ref-authority.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/repo-do-ref-authority.md) · [review](../research/reviews/repo-do-ref-authority.md)
 
 
 ## What this idea is

@@ -1,7 +1,7 @@
 # Agent-native protocol v2 commands (search, explain-diff, suggest-merge)
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/agent-native-commands.md) · [review](../reviews/agent-native-commands.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/agent-native-commands.md) · [review](../research/reviews/archived/agent-native-commands.md)
 
 
 ## What this idea is

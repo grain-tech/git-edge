@@ -1,7 +1,7 @@
 # Refs in DO SQLite, objects in R2
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/refs-sqlite-objects-r2.md) · [review](../reviews/refs-sqlite-objects-r2.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/refs-sqlite-objects-r2.md) · [review](../research/reviews/refs-sqlite-objects-r2.md)
 
 
 ## What this idea is

@@ -1,7 +1,7 @@
 # Server-side rebase and squash as protocol v2 extensions
 
 > Verdict: **risky** · feasibility 4/5 · reliability 2/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/server-side-rebase.md) · [review](../reviews/server-side-rebase.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/server-side-rebase.md) · [review](../research/reviews/server-side-rebase.md)
 
 
 ## What this idea is

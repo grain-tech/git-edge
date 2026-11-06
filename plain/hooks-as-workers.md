@@ -1,7 +1,7 @@
 # Pre/post-receive hooks as Workers via service bindings
 
 > Verdict: **risky** · feasibility 4/5 · reliability 2/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/hooks-as-workers.md) · [review](../reviews/hooks-as-workers.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/hooks-as-workers.md) · [review](../research/reviews/hooks-as-workers.md)
 
 
 ## What this idea is

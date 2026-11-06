@@ -1,7 +1,7 @@
 # Packfile parsing in a Worker with a streaming inflater
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/streaming-pack-parser.md) · [review](../reviews/streaming-pack-parser.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/streaming-pack-parser.md) · [review](../research/reviews/streaming-pack-parser.md)
 
 
 ## What this idea is

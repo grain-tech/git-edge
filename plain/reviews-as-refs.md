@@ -1,7 +1,7 @@
 # Pull-request review data as git objects under refs/reviews
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/reviews-as-refs.md) · [review](../reviews/reviews-as-refs.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/reviews-as-refs.md) · [review](../research/reviews/archived/reviews-as-refs.md)
 
 
 ## What this idea is

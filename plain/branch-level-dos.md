@@ -1,7 +1,7 @@
 # Branch-level Durable Objects for monorepos
 
 > Verdict: **risky** · feasibility 4/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/branch-level-dos.md) · [review](../reviews/branch-level-dos.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/branch-level-dos.md) · [review](../research/reviews/branch-level-dos.md)
 
 
 ## What this idea is

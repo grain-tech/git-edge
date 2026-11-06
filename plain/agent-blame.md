@@ -1,7 +1,7 @@
 # Blame that knows which agent wrote each line
 
 > Verdict: **risky** · feasibility 3/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/agent-blame.md) · [review](../reviews/agent-blame.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/agent-blame.md) · [review](../research/reviews/archived/agent-blame.md)
 
 
 ## What this idea is

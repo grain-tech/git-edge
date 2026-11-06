@@ -1,7 +1,7 @@
 # Delta bases pinned per repo
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 4/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/pinned-delta-bases.md) · [review](../reviews/pinned-delta-bases.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/pinned-delta-bases.md) · [review](../research/reviews/pinned-delta-bases.md)
 
 
 ## What this idea is

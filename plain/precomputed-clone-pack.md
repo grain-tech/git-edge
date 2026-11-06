@@ -1,7 +1,7 @@
 # Precomputed pack slices for clone
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/precomputed-clone-pack.md) · [review](../reviews/precomputed-clone-pack.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/precomputed-clone-pack.md) · [review](../research/reviews/precomputed-clone-pack.md)
 
 
 ## What this idea is

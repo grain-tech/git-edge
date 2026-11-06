@@ -1,5 +1,5 @@
 //! GC chain (CONTRACTS.md 5): GcMark -> GcConsolidate -> GcSweep, ported from
-//! proofs-v2/gc-and-repack-alarm. All durable state lives in tables (marked, gc_frontier,
+//! research/proofs/gc-and-repack-alarm. All durable state lives in tables (marked, gc_frontier,
 //! gc_seen, gc_parts, gc.* meta), so a requeued 'running' row resumes mid-flight and a kill
 //! mid-slice replays idempotently.
 

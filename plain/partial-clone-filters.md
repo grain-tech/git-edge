@@ -1,7 +1,7 @@
 # Shallow and partial clone as first-class filters
 
 > Verdict: **risky** · feasibility 3/5 · reliability 4/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/partial-clone-filters.md) · [review](../reviews/partial-clone-filters.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/partial-clone-filters.md) · [review](../research/reviews/partial-clone-filters.md)
 
 
 ## What this idea is

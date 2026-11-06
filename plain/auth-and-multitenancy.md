@@ -1,7 +1,7 @@
 # Auth and multi-tenancy: owner/repo routing to DO ids
 
 > Verdict: **lands with caveats** · feasibility 5/5 · reliability 4/5 · correctness 4/5 · effort: days
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/auth-and-multitenancy.md) · [review](../reviews/auth-and-multitenancy.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/auth-and-multitenancy.md) · [review](../research/reviews/auth-and-multitenancy.md)
 
 
 ## What this idea is

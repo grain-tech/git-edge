@@ -1,7 +1,7 @@
 # Offline-first browser client with OPFS and the same Wasm core
 
 > Verdict: **risky** · feasibility 3/5 · reliability 3/5 · correctness 2/5 · effort: months
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/offline-browser-client.md) · [review](../reviews/offline-browser-client.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/offline-browser-client.md) · [review](../research/reviews/archived/offline-browser-client.md)
 
 
 ## What this idea is

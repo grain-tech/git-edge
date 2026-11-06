@@ -1,7 +1,7 @@
 # Push from a sibling workspace DO over RPC, no HTTP
 
 > Verdict: **lands with caveats** · feasibility 4/5 · reliability 3/5 · correctness 3/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/tui-rpc-push.md) · [review](../reviews/tui-rpc-push.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/tui-rpc-push.md) · [review](../research/reviews/tui-rpc-push.md)
 
 
 ## What this idea is

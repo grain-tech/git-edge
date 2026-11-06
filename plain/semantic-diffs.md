@@ -1,7 +1,7 @@
 # Semantic diffs via tree-sitter in Wasm
 
 > Verdict: **risky** · feasibility 3/5 · reliability 3/5 · correctness 2/5 · effort: weeks
-> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../proofs/semantic-diffs.md) · [review](../reviews/semantic-diffs.md)
+> Read the words in [how-to-read.md](../findings/how-to-read.md). Engineers: [proof](../research/proofs/archived/semantic-diffs.md) · [review](../research/reviews/archived/semantic-diffs.md)
 
 
 ## What this idea is
