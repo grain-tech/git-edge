@@ -47,17 +47,16 @@ Cloudflare's concern, not the operator's — it's part of the managed product.
 | Who runs it | Cloudflare operates it | You (`wrangler deploy`) |
 | Object storage | Git objects primarily in the DO SQLite (chunked ~2 MB rows); R2 for snapshots | Packfiles in R2; the DO holds refs, the object index, and job/GC state |
 | API surface | Native Workers API (create/fork/import + mint tokens) + REST + git remote | Stock git smart-HTTP + `/_admin/*` (tokens, import, delete, pin, export) |
-| Forks / notes | First-class fork API; notes via stock `git notes` (no notes REST) | No managed fork graph; raw `refs/notes/*` round-trips — product surfaces are reserved out-of-tree sisters (below) |
+| Forks / notes | First-class fork API; notes via stock `git notes` (no notes REST) | No managed fork graph; raw `refs/notes/*` round-trips — a managed fork graph is a reserved out-of-tree sister (below) |
 | Large repos | ArtifactFS lazy-mount client over any git remote | `artifact-fs` is client-compatible with git-edge — the upstream FUSE client mounts it unchanged (e2e-verified, see [findings/afs-e2e.md](findings/afs-e2e.md)); nothing server-side to build. Plain clones ride consolidated single-pack / `packfile-uris` |
 | Continuous-write GC | Managed internally | Explicit alarm-driven GC: mark → consolidate → sweep, opt-in `GE_GC_BARRIER`, G4a compaction (`GE_COMPACT_*`), live-pack admission (`GE_MAX_LIVE_PACKS`) |
 
 They are complementary, not competitors-to-conflate: Artifacts is the managed
 product; git-edge is the open-source, self-deployed remote for when you want
 pack-in-R2, operator-visible GC, and full control of the Worker on your own
-account. Managed extras deliberately stay out-of-tree as reserved sister
-repos — [git-edge-fork](https://github.com/idl3/git-edge-fork) for a managed
-fork graph and [git-edge-notes](https://github.com/idl3/git-edge-notes) for a
-product notes API — both deferred; core intentionally has neither.
+account. A managed fork graph deliberately stays out-of-tree as the reserved
+sister repo — [git-edge-fork](https://github.com/idl3/git-edge-fork) —
+deferred; core intentionally has no fork concept.
 
 ## What works today
 

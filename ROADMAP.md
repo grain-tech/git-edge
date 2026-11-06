@@ -139,5 +139,6 @@ The original (private-repo) benchmark flushed out two real bugs, both long fixed
 - Self-serve multi-tenant SaaS — auth is tokens, not accounts
 - Managed fork graph — reserved as the deferred out-of-tree sister
   `idl3/git-edge-fork`; core has no fork concept
-- Product notes API — reserved as the deferred out-of-tree sister
-  `idl3/git-edge-notes`; core already round-trips raw `refs/notes/*`
+- Product notes API / notes JSON layer — no product surface; core already
+  round-trips raw `refs/notes/*` as ordinary refs, which is all stock
+  `git notes` needs
