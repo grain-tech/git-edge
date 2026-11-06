@@ -20,8 +20,12 @@ deploy` creates the bucket and runs the DO migration.
   free tier).
 - Rust toolchain with the wasm target:
   `rustup target add wasm32-unknown-unknown`
-- Node ≥ 18 for wrangler; the repo pins it via `server/package.json`:
-  `cd server && npm ci` — `worker-build` (Rust→wasm→worker glue) comes with it.
+- Node ≥ 22 for wrangler (wrangler@4 engines); the repo pins it via
+  `server/package.json`: `cd server && npm ci` pins wrangler only.
+  `worker-build` — the Rust→wasm→worker glue that `wrangler.jsonc`'s
+  `build.command` (`worker-build --release`) runs — is a separate cargo
+  tool: `cargo install worker-build`. It does not come from npm (the npm
+  `worker-build` package is unrelated).
 - `wrangler login` (or `CLOUDFLARE_API_TOKEN` for CI).
 
 ## Secrets
@@ -71,16 +75,22 @@ one datapoint per request; delete the binding line if you don't want it.
 ## Deploy
 
 ```bash
+cargo install worker-build               # Rust→wasm glue for wrangler.jsonc
+                                         # build.command — once per machine
 cd server
-npm ci                                   # pinned wrangler + worker-build
+npm ci                                   # pins wrangler
 wrangler r2 bucket create git-edge       # the bucket wrangler.jsonc binds
 wrangler deploy                          # builds wasm, runs the DO migration, uploads
 ```
 
 The output prints the workers.dev URL. Then verify with the conformance
-suite — it is the deterministic acceptance gate, not a vibes check:
+suite — it is the deterministic acceptance gate, not a vibes check. Run it
+from the repo root (the deploy block left the shell in `server/`) with the
+write token exported in this shell:
 
 ```bash
+cd ..
+# export GE_WRITE_TOKEN=<the value you `wrangler secret put` above> first
 GE_URL="https://test:$GE_WRITE_TOKEN@git-edge.<acct>.workers.dev" \
 GE_CONFORMANCE_GC=1 GE_CONFORMANCE_PURGE=1 GE_CONFORMANCE_IMPORT=1 \
 GE_CONFORMANCE_LIMITS=1 GE_CONFORMANCE_URIS=1 \

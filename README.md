@@ -37,9 +37,8 @@ repo's Durable Object SQLite (chunked under the ~2 MB row cap), R2 holds
 snapshots, and access is a native Workers API (create / fork / import, token
 minting) plus REST and a plain git remote — with first-class forks and
 git-notes, and [ArtifactFS](https://developers.cloudflare.com/artifacts/concepts/how-artifacts-works/)
-for lazy-mounting large repos from any remote. Garbage collection is managed
-internally
-([how it works](https://developers.cloudflare.com/artifacts/concepts/how-artifacts-works/)).
+for lazy-mounting large repos from any remote. Storage lifecycle is
+Cloudflare's concern, not the operator's — it's part of the managed product.
 
 | | Cloudflare Artifacts | git-edge |
 |---|---|---|
@@ -113,8 +112,11 @@ pack, clones get cheaper still.
 To run it yourself against your deploy:
 
 ```bash
+# SLICE_* match the published table's ≤8k-object / ≤30 MiB pushes —
+# the script defaults (30k objects / 60 MiB) can stall ingest on the live Worker.
 EDGE_BASE=https://git-edge.<acct>.workers.dev EDGE_TOKEN=… \
 BENCH_PREFIX=bench BENCH_REPOS="https://github.com/pallets/flask" \
+SLICE_OBJS=8000 SLICE_MIB=30 \
   tests/bench/oss-bench.sh        # -> bench/flask, one markdown row per repo
 ```
 

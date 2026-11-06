@@ -7,12 +7,15 @@ is [SETUP.md](SETUP.md).
 
 ## Option A — your own Cloudflare account
 
-Durable Objects need a **paid** Cloudflare plan. Prerequisites: Node ≥ 18, a
-Rust toolchain with the wasm target, and `wrangler`.
+Durable Objects need a **paid** Cloudflare plan. Prerequisites: Node ≥ 22,
+a Rust toolchain with the wasm target plus `worker-build`
+(`cargo install worker-build`), and `wrangler`.
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cd server && npm ci
+cargo install worker-build        # Rust→wasm→worker glue for wrangler.jsonc's
+                                  # build.command — a cargo tool, NOT an npm package
+cd server && npm ci               # pins wrangler
 wrangler login
 wrangler r2 bucket create git-edge      # the bucket wrangler.jsonc binds
 
@@ -28,8 +31,12 @@ wrangler deploy                         # builds wasm, runs the DO migration
 The deploy prints your URL: `https://git-edge.<acct>.workers.dev`. Verify:
 
 ```bash
+cd ..   # back to the repo root — the deploy block left the shell in server/
+
 curl https://git-edge.<acct>.workers.dev/healthz    # -> ok
 
+# export the write token in this shell first — $GE_WRITE_TOKEN expands below:
+#   export GE_WRITE_TOKEN=<the value you `wrangler secret put` above>
 GE_URL="https://test:$GE_WRITE_TOKEN@git-edge.<acct>.workers.dev" \
   bash tests/conformance/run.sh                     # -> == PASS
 ```
@@ -48,9 +55,11 @@ For a custom domain instead of `*.workers.dev`, add a `routes` entry to
 ## Option B — local (`wrangler dev`)
 
 ```bash
+cargo install worker-build        # once per machine — wrangler.jsonc build.command;
+                                  # not provided by npm ci
 cd server
 cp .dev.vars.example .dev.vars    # edit tokens if you like; the example works
-npm ci
+npm ci                           # pins wrangler
 wrangler dev                      # serves http://localhost:8787
 ```
 

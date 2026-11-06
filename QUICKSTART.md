@@ -50,8 +50,19 @@ curl -u "edge:$GE_TOKEN" -X POST "$GE_HOST/$GE_REPO/_admin/tokens" \
 # -> {"id":"…","token":"ge_…","level":"write","name":"ci"}   (shown once)
 ```
 
-Use the `ge_…` value as `$GE_TOKEN` for pushes to this repo; revoke with
-`curl -u "edge:$GE_TOKEN" -X DELETE "$GE_HOST/$GE_REPO/_admin/tokens/<id>"`.
+Don't overwrite `$GE_TOKEN` — `/_admin/*` calls (revoke below, imports,
+minting more keys) authenticate with the deployment write token, and scoped
+`ge_*` tokens are refused there. Keep the scoped key in its own variable
+for pushes:
+
+```bash
+export GE_CI_TOKEN=ge_…    # the scoped key shown once, above
+
+GE_TOKEN="$GE_CI_TOKEN" gitge push "$GE_HOST/$GE_REPO" main   # scoped push
+
+# revoke still uses the admin token:
+curl -u "edge:$GE_TOKEN" -X DELETE "$GE_HOST/$GE_REPO/_admin/tokens/<id>"
+```
 
 ## 4. (Optional) URL-import a public repo
 
