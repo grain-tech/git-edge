@@ -109,7 +109,7 @@ HEAD symref, so a url import lands exactly the source's tip set.
 | Pack storage | loose + packed on disk | normalized full-object packs in R2, indexed in per-repo SQLite |
 | Wire deltas on fetch | yes (thin packs) | **never** — all entries sent as full objects (larger fetch bodies, simpler/constant memory) |
 | Delta compression at rest | yes | no — deltas resolved at ingest, stored inflated |
-| GC / repack | `git gc`, manual or auto | automatic mark→consolidate→sweep via DO alarms; `GC_QUIET=10 min`, 1 h grace before R2 deletion |
+| GC / repack | `git gc`, manual or auto | automatic mark→consolidate→sweep via DO alarms (`GE_GC_QUIET_MS` 10 min, `GE_GC_GRACE_MS` 1 h); opt-in barrier mode (`GE_GC_BARRIER`) for mark-under-write; automatic tiered compaction (`GE_COMPACT_FANIN`/`_MIN_AGE_MS`/`_MAX_ROWS`) bounds live-pack growth without reachability; `GE_MAX_LIVE_PACKS` caps live+ingesting packs |
 | Job slices | n/a | 20 s wall / 400 subrequest slices, resumable cursors, lease-fenced, dead-lettered |
 | Quarantine on push | quarantine dir | `pending/` R2 key + `open` push row; ref update is a CAS transaction |
 
@@ -205,7 +205,12 @@ truncation, or corrupted ref state.
     subrequest limits are all confirmed against a live deployment
     (`git-edge.<acct>.workers.dev`); the ~100 MB body cap is real.
 
-## Verified performance envelope (local workerd)
+## Verified performance envelope
+
+Published headline numbers come from `tests/bench/oss-bench.sh` against a real
+Paid-plan Worker + Durable Object + R2 deploy — see the README benchmark
+table. The rows below are the wider envelope: **local workerd unless marked
+(prod)**.
 
 | Workload | Result |
 |---|---|

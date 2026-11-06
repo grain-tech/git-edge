@@ -236,7 +236,9 @@ locking, or custom transfer adapters.
 
 No push-options, no hooks, no rename. `--atomic` is supported (the
 whole push rejects on any failing ref). GC is automatic
-(mark→consolidate→sweep via DO alarms, 1 h grace before R2 deletion).
+(mark→consolidate→sweep via DO alarms, 1 h grace before R2 deletion),
+with opt-in barrier mode (`GE_GC_BARRIER`) and automatic tiered compaction
+(`GE_COMPACT_*`) bounding live-pack growth under continuous writes.
 
 Full reference: `COMPATIBILITY.md`; evidence: `findings/implementation.md`;
 end-to-end example: `tests/conformance/run.sh`.

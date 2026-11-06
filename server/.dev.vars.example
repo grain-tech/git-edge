@@ -14,5 +14,10 @@ GE_URL_SIGNING_KEY=dev-only-signing-key-32-bytes-minimum-ok
 # GE_RATE_PUSHES_PER_MIN=30
 # live+ingesting pack admission cap — over it, push/import begin refuse 503 + Retry-After
 # GE_MAX_LIVE_PACKS=1000
-# GE_GC_QUIET_MS=…
-# GE_GC_GRACE_MS=…
+# GC tuning (defaults in parens) — see SETUP.md
+# GE_GC_QUIET_MS=600000      # quiet period before GC consolidates after a push
+# GE_GC_GRACE_MS=3600000     # grace before dead packs are swept
+# GE_GC_BARRIER=0            # 1 = barrier-mode mark (opt-in, per GC chain)
+# GE_COMPACT_FANIN=16        # min same-tier live packs that trigger a compact (min 2)
+# GE_COMPACT_MIN_AGE_MS=60000
+# GE_COMPACT_MAX_ROWS=100000

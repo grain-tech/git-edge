@@ -1,7 +1,10 @@
 # Setting up git-edge
 
 A deterministic deploy guide: from a fresh checkout to a verified running
-service, then what to put in front of it for production.
+service, then what to put in front of it for production. For the short path —
+first deploy or local `wrangler dev` in ~10 minutes — see
+[INSTALL.md](INSTALL.md); for first-repo commands see
+[QUICKSTART.md](QUICKSTART.md).
 
 ## What you're deploying
 
@@ -54,9 +57,13 @@ All have defaults; set in `wrangler.jsonc` `[vars]` or `wrangler dev --var`:
 | `GE_QUOTA_MAX_BYTES` | 4 GiB | Stored bytes per repo (the normalized pack — undeltified ~6× the wire size) |
 | `GE_QUOTA_MAX_REPOS_PER_OWNER` | 50 | Live repo claims per `owner/` prefix |
 | `GE_RATE_PUSHES_PER_MIN` | 30 | Pushes per credential per repo per minute |
-| `GE_MAX_LIVE_PACKS` | 1,000 | Live+ingesting packs per repo; min 2 when enabled, ≤0 disables — over-cap pushes/imports get 503 + `Retry-After: 60` |
-| `GE_GC_QUIET_MS` | (ms) | Quiet period before GC consolidates after a push |
-| `GE_GC_GRACE_MS` | (ms) | Grace before dead packs are swept |
+| `GE_GC_QUIET_MS` | 600,000 (10 min) | Quiet period before GC consolidates after a push |
+| `GE_GC_GRACE_MS` | 3,600,000 (1 h) | Grace before dead packs are swept |
+| `GE_GC_BARRIER` | 0 (off) | Barrier-mode mark: pending page during the walk, retirement fence at sweep, no `refs_version` fence mid-walk — keeps marking correct while pushes keep landing. Captured once per GC chain at mark-init (persisted as `gc.barrier=1`); arms read the meta, not the env, so it applies per-chain, not retroactively |
+| `GE_COMPACT_FANIN` | 16 (min 2) | G4a compaction: minimum same-tier live packs that trigger a lossless compact |
+| `GE_COMPACT_MIN_AGE_MS` | 60,000 | Minimum pack age before a pack can join a compact cohort |
+| `GE_COMPACT_MAX_ROWS` | 100,000 | Object-row budget per compact cohort (packs over `max_rows`/2 objects are ineligible) |
+| `GE_MAX_LIVE_PACKS` | 1,000 | Live+ingesting packs per repo; min 2 when enabled, ≤0 disables — over-cap pushes/imports get 503 + `Retry-After: 60`. Compaction (`GE_COMPACT_*`) is what normally keeps live packs under this cap |
 
 `GE_METRICS` (Analytics Engine binding in `wrangler.jsonc`) is optional —
 one datapoint per request; delete the binding line if you don't want it.
@@ -76,7 +83,7 @@ suite — it is the deterministic acceptance gate, not a vibes check:
 ```bash
 GE_URL="https://test:$GE_WRITE_TOKEN@git-edge.<acct>.workers.dev" \
 GE_CONFORMANCE_GC=1 GE_CONFORMANCE_PURGE=1 GE_CONFORMANCE_IMPORT=1 \
-GE_CONFORMANCE_LIMITS=1 GE_CONFORMANCE_LFS=1 GE_CONFORMANCE_URIS=1 \
+GE_CONFORMANCE_LIMITS=1 GE_CONFORMANCE_URIS=1 \
 bash tests/conformance/run.sh     # ... == PASS
 ```
 
