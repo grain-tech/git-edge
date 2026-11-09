@@ -88,6 +88,23 @@ pub fn peak_bytes() -> usize {
     HEAP.peak()
 }
 
+/// Wasm linear memory in bytes — the ceiling `live_bytes` grows toward.
+/// It NEVER shrinks (pages are not returned to the runtime), so it
+/// measures the isolate's high-water mark, not current pressure; the
+/// pass-B guard pairs it with `live_bytes` for exactly that reason (see
+/// LINEAR_HARD in pack::ingest). Native builds have no such ceiling:
+/// returns 0 so the linear-aware trip stays inert, and tests inject their
+/// own reading through `mem_guard`'s `linear` parameter.
+#[cfg(target_arch = "wasm32")]
+pub fn linear_bytes() -> usize {
+    // memory_size reports 64 KiB pages for memory index 0
+    core::arch::wasm32::memory_size(0) * 65_536
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn linear_bytes() -> usize {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

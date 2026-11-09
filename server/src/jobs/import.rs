@@ -845,6 +845,9 @@ async fn resume_drain<'a>(
         obj_kind: p.kind(),
         res_depth: 0,
         chain_live: 0,
+        // the DO path keeps the generous chain bound and no heap guard —
+        // its alarm slices carry their own budget
+        mem: None,
     };
     let toc = Toc::Sql { sql, push: &p.push };
     #[derive(Deserialize)]

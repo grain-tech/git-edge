@@ -53,13 +53,32 @@ const WINDOW: u64 = 8 << 20;
 /// entry table, the window, and a part buffer inside a 128 MiB isolate.
 const CACHE: usize = 48 << 20;
 const EDGE_CACHE: usize = 24 << 20;
-/// Pass-B memory guard (edge path): wasm linear memory is a hard ~128 MiB
-/// ceiling and an over-budget allocation aborts inside the futures queue —
-/// the request then hangs instead of answering. At each entry boundary the
-/// guard sheds the object cache past MEM_SOFT; still above MEM_HARD it fails
-/// with an in-band Limit the client can act on (smaller slices).
+/// Pass-B memory guard (edge path): the ceilings below compare the
+/// counting allocator's LIVE heap — an over-budget allocation aborts
+/// inside the futures queue and the request hangs instead of answering.
+/// At each entry boundary (and inside delta-chain walks — see
+/// `Cx::mem_relief`) the guard sheds the object cache past MEM_SOFT;
+/// still above MEM_HARD — or over the linear-aware trip — it fails with
+/// an in-band Limit the client can act on (smaller slices).
+///
+/// Why live bytes and not `memory.size` alone: wasm linear memory never
+/// shrinks, so a size-only guard would wedge an isolate forever after one
+/// large push — and lowering these live thresholds to match the linear
+/// ratio would reject pushes that measured fine. Measured on real pushes:
+/// a single unsliced push runs ~57-62 MiB live / ~80-91 MiB linear; two
+/// concurrent pass-Bs ~89 live / ~131 linear (the slots gate exists for
+/// that); a 1-slot 5-way run ~66 / ~98; a 150 MiB-linear isolate survived
+/// — the original "hung" failure was a failed grow near ~137 MiB, not a
+/// hard wall at 128.
 const MEM_SOFT: usize = 80 << 20;
 const MEM_HARD: usize = 96 << 20;
+/// Wasm-only second hard trip, in bytes of LINEAR memory. Once linear
+/// reaches LINEAR_HARD only ~8 MiB of headroom remains to the wall, so a
+/// heap still over MEM_SOFT after the shed fails in-band instead of
+/// gambling on the grow. The `live > MEM_SOFT` half is load-bearing: with
+/// a size-only check the guard would reject every later push on the
+/// isolate forever (linear never comes back down) — see the note above.
+const LINEAR_HARD: usize = 120 << 20;
 /// Live heap must grow this far past the last shed before the cache clears
 /// again — hysteresis so a heap parked between MEM_SOFT and MEM_HARD doesn't
 /// shed at every entry boundary (each shed makes delta chains re-resolve
@@ -67,6 +86,12 @@ const MEM_HARD: usize = 96 << 20;
 const MEM_HYSTERESIS: usize = 8 << 20;
 const MAX_DEPTH: usize = 64; // git's default delta depth is 50
 const MAX_CHAIN_BYTES: u64 = 64 << 20; // chain holds raw compressed delta bodies
+/// Edge-path bound on compressed bytes ONE resolve_at chain may retain —
+/// tighter than MAX_CHAIN_BYTES so a single chain cannot by itself fill
+/// the headroom the memory guard needs around it (window + cache + decode
+/// buffers live alongside the chain). Over it the walk fails in-band
+/// ("delta chain too large for one request") so the client can slice.
+const EDGE_CHAIN_BYTES: u64 = 24 << 20;
 /// Rows per push_links INSERT; it keeps one statement at <= 90 bound params,
 /// A6's 90-batch headroom convention under the 100 guard (50 rows = 100 params
 /// was legal but had zero headroom).
@@ -489,6 +514,16 @@ impl AnySink<'_, '_> {
             AnySink::Job(s) => s.post(rows, budget).await,
         }
     }
+    /// Rows buffered before a `post` flush — the edge posts each batch as
+    /// index rows over the stub, so it flushes at INDEX_BATCH to keep both
+    /// the rows Vec and every serialized body small; the DO job inserts
+    /// straight into SQLite and keeps its own 10,000-row convention.
+    fn row_batch(&self) -> usize {
+        match self {
+            AnySink::Edge(_) => super::run::INDEX_BATCH,
+            AnySink::Job(_) => 10_000,
+        }
+    }
     /// 2.5 links bookkeeping — bounded by MAX_LINKS either way.
     pub fn push_links(&mut self, links: Vec<ObjectId>) -> Result<(), Error> {
         match self {
@@ -649,6 +684,32 @@ pub struct Cx<'a> {
     /// Compressed bytes held by in-flight delta chains across ALL nested resolve_at
     /// calls — decremented when a chain finishes or aborts.
     pub chain_live: u64,
+    /// Pass-B memory guard state — `Some` only on the edge receive-pack
+    /// path (`resolve_and_normalize`). The DO import job leaves it `None`:
+    /// its alarm slices carry their own budget and keep the generous
+    /// MAX_CHAIN_BYTES bound with no heap checks.
+    pub mem: Option<MemGuard>,
+}
+
+impl Cx<'_> {
+    /// Edge-path heap relief at a safe point inside pass B — entry
+    /// boundaries AND inside delta-chain walks, where a single resolve_at
+    /// can otherwise hold ~chain bytes plus window/cache/decode buffers
+    /// before control returns to the boundary guard. Sheds the cache over
+    /// MEM_SOFT (hysteresis) and fails in-band over MEM_HARD / the linear
+    /// trip. A no-op on the DO path (`mem` is `None` there).
+    fn mem_relief(&mut self) -> Result<(), Error> {
+        if let Some(m) = self.mem.as_mut() {
+            mem_guard(
+                &mut self.cache,
+                crate::mem::live_bytes,
+                crate::mem::linear_bytes,
+                receive_packs,
+                m,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// One decode_entry over `[PACK v2][base as a level-0 zlib full entry][delta re-headed as ofs-delta][digest-width zero trailer]`.
@@ -729,6 +790,8 @@ pub async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> 
         .await?
         .pop()
         .ok_or_else(|| Error::Storage("base read".into()))?;
+    // decode_entry materializes the whole base object — in-walk relief
+    cx.mem_relief()?;
     let (k, d) = codec::decode_entry(&entry)?;
     Ok(cx.cache.put(Key::Id(id), k, d))
 }
@@ -774,6 +837,9 @@ pub async fn resolve_at(
     start: u64,
     budget: &mut ReqBudget,
 ) -> Result<Base, Error> {
+    // the edge path tightens the per-chain byte bound: one chain must not
+    // be able to fill the headroom the memory guard needs around it
+    let chain_cap = if cx.mem.is_some() { EDGE_CHAIN_BYTES } else { MAX_CHAIN_BYTES };
     let (mut off, mut chain, mut chain_bytes) = (start, Vec::new(), 0u64);
     let (kind, mut data) = loop {
         if let Some(hit) = cx.cache.get(&Key::Off(off)) {
@@ -786,14 +852,19 @@ pub async fn resolve_at(
             .by_off(off)?
             .ok_or_else(|| unpack("delta base is not an entry"))?;
         let raw = cx.win.entry(&rec, budget).await?;
+        // the walk can hold ~chain_cap of compressed bodies plus the
+        // window, cache, and decode buffers before control returns to the
+        // entry-boundary guard — shed over MEM_SOFT / fail over MEM_HARD
+        // right here, before the body joins `chain` or a decode grows
+        cx.mem_relief()?;
         // the chain holds each delta's compressed bytes: 64 × ~16 MiB worst case is a
         // GiB-scale allocation — bound the bytes, not just the depth. chain_live bounds
         // the SAME memory summed across every nested resolve_at frame.
         chain_bytes = chain_bytes.saturating_add(raw.len() as u64);
         cx.chain_live = cx.chain_live.saturating_add(raw.len() as u64);
-        if chain_bytes > MAX_CHAIN_BYTES || cx.chain_live > MAX_CHAIN_LIVE {
+        if chain_bytes > chain_cap || cx.chain_live > MAX_CHAIN_LIVE {
             cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
-            return Err(unpack("delta chain too large"));
+            return Err(chain_too_large(cx.mem.is_some()));
         }
         match rec.kind_or_delta {
             Header::OfsDelta { base_distance } => {
@@ -818,12 +889,18 @@ pub async fn resolve_at(
                     // here rather than surfacing decode_mini's allocation-limit error
                     return Err(unpack("delta base exceeds 16 MiB and cannot be resolved"));
                 }
+                // decode_mini grows the re-deflated base plus the delta
+                // body plus the output object — check before it allocates
+                cx.mem_relief()?;
                 let (k, d) = decode_mini(&mut cx.z, None, &raw, cx.obj_kind)?;
                 break cx.cache.put(Key::Off(off), k, d);
             }
         }
     };
     while let Some((o, raw)) = chain.pop() {
+        // each apply decodes a <= 16 MiB object on top of the bytes the
+        // rest of the chain still retains — same in-walk relief
+        cx.mem_relief()?;
         let (_, d) = decode_mini(&mut cx.z, Some((kind, &data)), &raw, cx.obj_kind)?;
         data = cx.cache.put(Key::Off(o), kind, d).1;
     }
@@ -831,28 +908,44 @@ pub async fn resolve_at(
     Ok(Base::Ready((kind, data)))
 }
 
-/// The guard's memory across entry boundaries: `cleared_at` is the
-/// live_bytes() reading that triggered the last shed. The first crossing
-/// always sheds; later sheds inside the soft band need MEM_HYSTERESIS of
-/// growth. Above MEM_HARD the shed always runs — it is the last relief
-/// before the Limit, not hysteresis fodder.
+/// Chain-byte-limit failure: the edge path reports an in-band Limit the
+/// client can slice around; the DO job keeps the unpack wording.
+fn chain_too_large(edge: bool) -> Error {
+    if edge {
+        Error::Limit("delta chain too large for one request".into())
+    } else {
+        unpack("delta chain too large")
+    }
+}
+
+/// The guard's memory across entry boundaries AND inside chain walks:
+/// `cleared_at` is the live_bytes() reading taken AFTER the last
+/// `cache.clear()` — the post-shed level, so hysteresis measures regrowth
+/// from the drained heap. The first crossing always sheds; later sheds
+/// inside the soft band need MEM_HYSTERESIS of growth. Above MEM_HARD the
+/// shed always runs — it is the last relief before the Limit, not
+/// hysteresis fodder.
 #[derive(Default)]
-struct MemGuard {
+pub struct MemGuard {
     cleared_at: Option<usize>,
 }
 
-/// Pass-B memory guard, run at each entry boundary of the edge resolve loop.
-/// `live` reads the counting allocator's live bytes and `peers` the
+/// Pass-B memory guard, run at each entry boundary of the edge resolve
+/// loop and inside delta-chain walks (`Cx::mem_relief`). `live` reads the
+/// counting allocator's live bytes, `linear` the wasm linear-memory size
+/// (0 on native — the LINEAR_HARD trip is inert there), and `peers` the
 /// isolate's in-progress receive-pack count (pass A included — this push's
 /// own request counts as 1). Clearing the cache is the soft relief
 /// (resolved objects re-resolve lazily), and only a reading still above
-/// MEM_HARD after the clear earns the client an in-band Limit. The message
-/// is honest about cause: another receive-pack in flight means the isolate
+/// MEM_HARD — or a near-wall linear memory with a heap over MEM_SOFT —
+/// after the clear earns the client an in-band Limit. The message is
+/// honest about cause: another receive-pack in flight means the isolate
 /// was busy — retry — while an alone push really is too big for one
 /// request and smaller slices will do.
 fn mem_guard(
     cache: &mut Cache,
     live: impl Fn() -> usize,
+    linear: impl Fn() -> usize,
     peers: impl Fn() -> usize,
     state: &mut MemGuard,
 ) -> Result<(), Error> {
@@ -865,9 +958,15 @@ fn mem_guard(
         .is_some_and(|at| now.saturating_sub(at) >= MEM_HYSTERESIS);
     if now > MEM_HARD || state.cleared_at.is_none() || grew {
         cache.clear();
-        state.cleared_at = Some(now);
+        // the hysteresis baseline is the POST-shed reading: the shed just
+        // drained the heap, so recording the pre-shed `now` would measure
+        // regrowth from a level the cache no longer explains — a heap
+        // parked just over MEM_SOFT could then sit above MEM_HARD without
+        // ever shedding again
+        state.cleared_at = Some(live());
     }
-    if live() > MEM_HARD {
+    let after = live();
+    if after > MEM_HARD || (linear() >= LINEAR_HARD && after > MEM_SOFT) {
         return Err(Error::Limit(if peers() > 1 {
             INGEST_BUSY_MSG.into()
         } else {
@@ -907,6 +1006,7 @@ pub async fn resolve_and_normalize(
         obj_kind,
         res_depth: 0,
         chain_live: 0,
+        mem: Some(MemGuard::default()),
     };
     let (mut pre, mut sum) = (Vec::new(), 0u64);
     if let Externals::Map(bases) = &cx.externals {
@@ -935,7 +1035,6 @@ pub async fn resolve_and_normalize(
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
     let toc = Toc::Mem(entries);
     let mut rows = Vec::new();
-    let mut mem = MemGuard::default();
     // A REF_DELTA may name a base that appears LATER in the same pack — including
     // mid-chain inside another delta. `one_entry` returns `Await(base)` for those;
     // resolving an entry wakes exactly its waiters (index-pack parity, O(n) not O(n^2)).
@@ -943,7 +1042,7 @@ pub async fn resolve_and_normalize(
     let mut order: Vec<usize> = (0..entries.len()).collect();
     let mut i = 0;
     while i < order.len() {
-        mem_guard(&mut cx.cache, crate::mem::live_bytes, receive_packs, &mut mem)?;
+        cx.mem_relief()?;
         let at = order[i];
         i += 1;
         match one_entry(&mut cx, &toc, at, need_ids, out, &mut sink, &mut rows, budget, 0).await? {
@@ -1022,6 +1121,9 @@ pub async fn one_entry(
     if let AnySink::Job(s) = sink {
         crate::testhooks::failpoint_async(s.d, "import.entry.after_read").await?;
     }
+    // the entry's own decode grows re-deflated base + body + output on top
+    // of whatever the base walk just retained — last in-walk relief point
+    cx.mem_relief()?;
     let (kind, data) =
         decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw, cx.obj_kind)?;
     let id = gix_object::compute_hash(cx.obj_kind, kind, &data).map_err(|_| unpack("hash collision"))?;
@@ -1065,7 +1167,7 @@ pub async fn one_entry(
         cx.by_id.insert(id, i);
     }
     cx.cache.put(Key::Off(rec.offset), kind, data);
-    if rows.len() >= 10_000 {
+    if rows.len() >= sink.row_batch() {
         sink.post(rows, budget).await?;
         rows.clear();
     }
@@ -1158,7 +1260,7 @@ async fn stream_blob(
     if need_ids {
         cx.by_id.insert(id, i);
     }
-    if rows.len() >= 10_000 {
+    if rows.len() >= sink.row_batch() {
         sink.post(rows, budget).await?;
         rows.clear();
     }
@@ -1230,15 +1332,15 @@ mod tests {
         let mut c = Cache::default();
         c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
         let mut g = MemGuard::default();
-        mem_guard(&mut c, || MEM_SOFT, || 1, &mut g).unwrap();
+        mem_guard(&mut c, || MEM_SOFT, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_some());
         // first crossing past soft but under hard: cache shed, push continues
-        mem_guard(&mut c, || MEM_SOFT + 1, || 1, &mut g).unwrap();
+        mem_guard(&mut c, || MEM_SOFT + 1, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_none());
         // still above hard: typed Limit, actionable message
         let mut c = Cache::default();
         let mut g = MemGuard::default();
-        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1, &mut g).unwrap_err();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 0, || 1, &mut g).unwrap_err();
         assert!(matches!(err, Error::Limit(_)));
         assert!(err.message().contains("smaller slices"), "{err}");
     }
@@ -1250,11 +1352,32 @@ mod tests {
     fn mem_guard_message_names_busy_when_peers_run() {
         let mut c = Cache::default();
         let mut g = MemGuard::default();
-        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1, &mut g).unwrap_err();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 0, || 1, &mut g).unwrap_err();
         assert!(err.message().contains("smaller slices"), "{err}");
         let mut g = MemGuard::default();
-        let err = mem_guard(&mut c, || MEM_HARD + 1, || 2, &mut g).unwrap_err();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 0, || 2, &mut g).unwrap_err();
         assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
+    }
+
+    /// The linear-aware hard trip (wasm32 only — `linear` reads 0 on
+    /// native): once linear memory reaches LINEAR_HARD, a heap still over
+    /// MEM_SOFT after the shed fails in-band even under MEM_HARD. A calm
+    /// heap on the same near-wall isolate keeps working — linear never
+    /// shrinks, so a size-only check would wedge it forever.
+    #[test]
+    fn mem_guard_linear_trip_needs_real_heap_pressure() {
+        // near-wall linear + heap in the soft band: Limit
+        let mut c = Cache::default();
+        let mut g = MemGuard::default();
+        let err = mem_guard(&mut c, || MEM_SOFT + 1, || LINEAR_HARD, || 1, &mut g).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(err.message().contains("smaller slices"), "{err}");
+        // same near-wall linear but a calm heap: fine — the AND is load-bearing
+        let mut g = MemGuard::default();
+        mem_guard(&mut c, || MEM_SOFT, || LINEAR_HARD, || 1, &mut g).unwrap();
+        // linear just under the trip: the soft band alone never fails
+        let mut g = MemGuard::default();
+        mem_guard(&mut c, || MEM_SOFT + 1, || LINEAR_HARD - 1, || 1, &mut g).unwrap();
     }
 
     /// Between MEM_SOFT and MEM_HARD the cache sheds once per MEM_HYSTERESIS
@@ -1267,20 +1390,62 @@ mod tests {
         c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
         let mut g = MemGuard::default();
         // first crossing sheds and records the reading
-        mem_guard(&mut c, || MEM_SOFT + 1, || 1, &mut g).unwrap();
+        mem_guard(&mut c, || MEM_SOFT + 1, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_none());
         assert_eq!(g.cleared_at, Some(MEM_SOFT + 1));
         // the cache refills; heap grew < MEM_HYSTERESIS since the shed and
         // stays under MEM_HARD: no shed — the whole point of the hysteresis
         c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
         let live = MEM_SOFT + 1 + MEM_HYSTERESIS - 1;
-        mem_guard(&mut c, || live, || 1, &mut g).unwrap();
+        mem_guard(&mut c, || live, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(2)).is_some(), "sub-hysteresis growth keeps the cache");
         // heap grew >= MEM_HYSTERESIS since the last shed: shed again
         let live = MEM_SOFT + 1 + MEM_HYSTERESIS;
-        mem_guard(&mut c, || live, || 1, &mut g).unwrap();
+        mem_guard(&mut c, || live, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(2)).is_none(), "full hysteresis growth sheds again");
         assert_eq!(g.cleared_at, Some(live));
+    }
+
+    /// `cleared_at` records the POST-shed reading, not the pre-shed one:
+    /// the shed drains the heap, so hysteresis must measure regrowth from
+    /// the drained level — a baseline taken before the clear would sit
+    /// above what the cache explains and could leave the soft band unable
+    /// to shed again while the heap stays over MEM_HARD.
+    #[test]
+    fn mem_guard_hysteresis_baseline_is_post_shed() {
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        // live() call order inside mem_guard: pre-shed `now`, the
+        // post-clear `cleared_at` write, then the post-shed hard check.
+        // The shed drains 90 -> 82 MiB here.
+        let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
+            90usize << 20,
+            82 << 20,
+            82 << 20,
+            // second guard call: `now` then `after` — heap parked at 85,
+            // only 3 MiB over the DRAINED baseline: no shed
+            85 << 20,
+            85 << 20,
+            // third call: 90 again — 8 MiB over the drained baseline:
+            // sheds again and records ITS post-shed reading (84)
+            90 << 20,
+            84 << 20,
+            84 << 20,
+        ]));
+        let live = || readings.borrow_mut().pop_front().unwrap_or(84 << 20);
+        let mut g = MemGuard::default();
+        mem_guard(&mut c, live, || 0, || 1, &mut g).unwrap();
+        assert_eq!(g.cleared_at, Some(82 << 20), "baseline is the post-shed reading");
+        assert!(c.get(&Key::Off(1)).is_none());
+        // regrowth measured from 82, not 90: 85 - 82 = 3 < MEM_HYSTERESIS
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        mem_guard(&mut c, live, || 0, || 1, &mut g).unwrap();
+        assert!(c.get(&Key::Off(2)).is_some(), "sub-hysteresis growth keeps the cache");
+        // 90 - 82 = 8 >= MEM_HYSTERESIS: sheds — with the buggy pre-shed
+        // baseline (90) this would NOT have shed (90 - 90 = 0)
+        mem_guard(&mut c, live, || 0, || 1, &mut g).unwrap();
+        assert!(c.get(&Key::Off(2)).is_none(), "full hysteresis growth sheds again");
+        assert_eq!(g.cleared_at, Some(84 << 20));
     }
 
     /// Above MEM_HARD the shed is not hysteretic — it is the last relief
@@ -1291,8 +1456,19 @@ mod tests {
         c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
         let mut g = MemGuard::default();
         g.cleared_at = Some(MEM_HARD); // a shed just happened — still sheds
-        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1, &mut g).unwrap_err();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 0, || 1, &mut g).unwrap_err();
         assert!(matches!(err, Error::Limit(_)));
         assert!(c.get(&Key::Off(1)).is_none(), "hard-band shed ignores hysteresis");
+    }
+
+    /// The edge chain cap reports an in-band Limit the client can slice
+    /// around; the DO path keeps the unpack wording.
+    #[test]
+    fn chain_too_large_names_edge_limit() {
+        assert!(matches!(chain_too_large(true), Error::Limit(_)));
+        assert!(chain_too_large(true).message().contains("delta chain too large for one request"));
+        assert!(matches!(chain_too_large(false), Error::Unpack(_)));
+        // the edge cap is the tighter of the two bounds
+        assert!(EDGE_CHAIN_BYTES < MAX_CHAIN_BYTES);
     }
 }

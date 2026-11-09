@@ -40,13 +40,16 @@ pub struct ReqBudget {
 impl ReqBudget {
     /// Paid-plan subrequest ceiling (7.1) — the x-ge-subrequests denominator.
     pub const PAID_SUBREQUESTS: u32 = 9_000;
+    /// Paid-plan request wall clock (7.1): 240 s. The pass-B admission
+    /// gate's permit lease derives from it (pack::run::PERMIT_LEASE_MS).
+    pub const MAX_MS: f64 = 240_000.0;
     /// Paid-plan request budget (7.1): 9,000 subrequests, 240 s wall clock.
     pub fn paid() -> Self {
         Self {
             max_subrequests: Self::PAID_SUBREQUESTS,
             used: 0,
             started_ms: js_sys::Date::now(),
-            max_ms: 240_000.0,
+            max_ms: Self::MAX_MS,
             sink: None,
         }
     }
