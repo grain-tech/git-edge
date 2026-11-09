@@ -1844,6 +1844,18 @@ mod tests {
         assert!(crate::try_grow::is_retry(&err), "{err}");
     }
 
+    /// The EOF-tail reserve refused at its own site is the in-band retry Limit.
+    #[test]
+    fn upload_body_refused_tail_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let site = guarded_site("\n    crate::try_grow::vec(&mut body, reader.buffered().len())?;");
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(0));
+        let mut reader = BodyReader::from_chunks(vec![vec![0u8; FILL_STEP], vec![0u8; 100]], None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+    }
+
     /// The header accumulator refuses BEFORE the push that would take it
     /// over the cap: pr.buf stays at or under CMD_CAP.
     #[test]
