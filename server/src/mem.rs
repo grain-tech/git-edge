@@ -22,6 +22,20 @@ impl Tally {
     pub const fn new() -> Self {
         Self { live: AtomicUsize::new(0), peak: AtomicUsize::new(0) }
     }
+    /// `alloc` side, split from the pointer so the null case is testable:
+    /// a failed allocation (null) counts nothing.
+    fn on_alloc(&self, ptr_is_null: bool, size: usize) {
+        if !ptr_is_null {
+            self.alloc(size);
+        }
+    }
+    /// `realloc` side: a null replacement is a failed realloc — the old
+    /// block still stands, so live is unchanged.
+    fn on_realloc(&self, ptr_is_null: bool, old: usize, new: usize) {
+        if !ptr_is_null {
+            self.realloc(old, new);
+        }
+    }
     /// A successful `alloc`: live grows, peak follows the new high-water mark.
     fn alloc(&self, n: usize) {
         let live = self.live.fetch_add(n, Ordering::Relaxed).saturating_add(n);
@@ -54,9 +68,7 @@ struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
-        if !p.is_null() {
-            HEAP.alloc(l.size());
-        }
+        HEAP.on_alloc(p.is_null(), l.size());
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -65,9 +77,7 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
         let np = System.realloc(p, l, new_size);
-        if !np.is_null() {
-            HEAP.realloc(l.size(), new_size);
-        }
+        HEAP.on_realloc(np.is_null(), l.size(), new_size);
         np
     }
 }
@@ -79,7 +89,27 @@ static ALLOC: Counting = Counting;
 /// memory guard compares against its ceilings. JS-heap copies (Uint8Array
 /// uploads, request bodies) live outside wasm linear memory and are not
 /// counted; the guard's headroom covers them.
+#[cfg(test)]
+thread_local! {
+    /// Scripted reading for pressure tests — `None` uses the real tally.
+    static LIVE_OVERRIDE: std::cell::RefCell<Option<std::rc::Rc<dyn Fn() -> usize>>> =
+        const { std::cell::RefCell::new(None) };
+    static LINEAR_OVERRIDE: std::cell::RefCell<Option<std::rc::Rc<dyn Fn() -> usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn set_live_override(f: Option<std::rc::Rc<dyn Fn() -> usize>>) {
+    LIVE_OVERRIDE.with(|c| *c.borrow_mut() = f);
+}
+#[cfg(test)]
+pub(crate) fn set_linear_override(f: Option<std::rc::Rc<dyn Fn() -> usize>>) {
+    LINEAR_OVERRIDE.with(|c| *c.borrow_mut() = f);
+}
 pub fn live_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(f) = LIVE_OVERRIDE.with(|c| c.borrow().clone()) {
+        return f();
+    }
     HEAP.live()
 }
 
@@ -102,6 +132,10 @@ pub fn linear_bytes() -> usize {
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub fn linear_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(f) = LINEAR_OVERRIDE.with(|c| c.borrow().clone()) {
+        return f();
+    }
     0
 }
 
@@ -135,6 +169,37 @@ mod tests {
         assert_eq!(t.peak(), 300);
         t.realloc(50, 50);
         assert_eq!(t.live(), 50);
+    }
+
+    /// The allocator's null checks, exercised through the same entry points
+    /// `Counting` calls: a failed alloc or realloc must not move the tally.
+    /// (Deleting the `!p.is_null()` guard in `Counting` changes nothing
+    /// natively — these tests pin the contract it implements.)
+    #[test]
+    fn tally_ignores_failed_alloc_and_realloc() {
+        let t = Tally::new();
+        t.on_alloc(true, 1 << 20);
+        assert_eq!(t.live(), 0, "failed alloc counted");
+        assert_eq!(t.peak(), 0);
+        t.on_alloc(false, 100);
+        assert_eq!(t.live(), 100);
+        t.on_realloc(true, 100, 1 << 20);
+        assert_eq!(t.live(), 100, "failed realloc moved live");
+        assert_eq!(t.peak(), 100);
+        t.on_realloc(false, 100, 400);
+        assert_eq!(t.live(), 400);
+        assert_eq!(t.peak(), 400);
+    }
+
+    /// dealloc pairs with alloc by Layout size — the count must come back
+    /// down or every guard reading drifts high forever.
+    #[test]
+    fn tally_dealloc_returns_live() {
+        let t = Tally::new();
+        t.on_alloc(false, 256);
+        t.dealloc(256);
+        assert_eq!(t.live(), 0);
+        assert_eq!(t.peak(), 256, "peak keeps the high-water mark");
     }
 
     #[test]

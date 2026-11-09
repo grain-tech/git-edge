@@ -92,13 +92,13 @@ impl SliceBudget {
             .unwrap_or(320)
             .min(320);
         Self {
-            started_ms: js_sys::Date::now(),
-            req: ReqBudget { max_subrequests: 400, used: 0, started_ms: js_sys::Date::now(), max_ms: 20_000.0, sink: None },
+            started_ms: crate::wall_now(),
+            req: ReqBudget { max_subrequests: 400, used: 0, started_ms: crate::wall_now(), max_ms: 20_000.0, sink: None },
             yield_after,
         }
     }
     pub fn spent_80pct(&self) -> bool {
-        let elapsed = js_sys::Date::now() - self.started_ms;
+        let elapsed = crate::wall_now() - self.started_ms;
         elapsed > 16_000.0 || self.req.used > self.yield_after
     }
 }
@@ -443,7 +443,7 @@ async fn dispatch_inner(d: &RepoDo, pick: Pick) -> Result<Option<Report>, Error>
     if let Some(rep) = out.as_ref().err().and_then(|e| crash_report(d, e, &job)) {
         return Ok(Some(rep));
     }
-    let dur_ms = (js_sys::Date::now() - budget.started_ms).max(0.0) as i64;
+    let dur_ms = (crate::wall_now() - budget.started_ms).max(0.0) as i64;
     worker::console_log!("job {}#{} attempts={} -> {}", job.kind.as_str(), job.id, job.attempts,
         match &out { Ok(SliceOutcome::Done) => "done".into(),
             Ok(SliceOutcome::Continue { .. }) => "continue".into(),

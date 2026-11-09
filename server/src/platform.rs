@@ -2,6 +2,13 @@
 
 use crate::error::Error;
 
+#[cfg(test)]
+pub fn now_ms() -> i64 {
+    // js_sys::Date::now() panics on native targets — tests get the shared
+    // deterministic clock instead (lib.rs::test_clock).
+    crate::test_clock::now() as i64
+}
+#[cfg(not(test))]
 pub fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }

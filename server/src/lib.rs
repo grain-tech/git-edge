@@ -20,6 +20,35 @@ use std::rc::Rc;
 
 use error::Error;
 
+/// A deterministic clock for tests — `js_sys::Date::now()` panics on native
+/// targets, so every wall-clock read in the crate routes here under
+/// `cfg(test)`. Tests advance it to simulate elapsed request/lease time.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+    thread_local! {
+        static NOW: Cell<f64> = const { Cell::new(0.0) };
+    }
+    pub fn now() -> f64 {
+        NOW.with(|c| c.get())
+    }
+    pub fn set(ms: f64) {
+        NOW.with(|c| c.set(ms));
+    }
+    pub fn advance(ms: f64) {
+        NOW.with(|c| c.set(c.get() + ms));
+    }
+}
+
+/// Wall clock in milliseconds — js_sys on wasm, the test clock under
+/// `cfg(test)` so budgets and leases are drivable natively.
+pub(crate) fn wall_now() -> f64 {
+    #[cfg(test)]
+    return test_clock::now();
+    #[cfg(not(test))]
+    js_sys::Date::now()
+}
+
 /// Request-wide subrequest tally shared by every ReqBudget the request creates.
 /// It outlives each individual budget, so `respond` can stamp x-ge-subrequests
 /// on error responses after the charging budget has been dropped (audit P3).
@@ -48,7 +77,7 @@ impl ReqBudget {
         Self {
             max_subrequests: Self::PAID_SUBREQUESTS,
             used: 0,
-            started_ms: js_sys::Date::now(),
+            started_ms: wall_now(),
             max_ms: Self::MAX_MS,
             sink: None,
         }
@@ -63,7 +92,7 @@ impl ReqBudget {
     /// admission wait caps itself at this minus a reserve, so a queued push
     /// can't spend the time pass B itself needs (CONTRACTS.md 7.1).
     pub fn ms_left(&self) -> f64 {
-        (self.started_ms + self.max_ms - js_sys::Date::now()).max(0.0)
+        (self.started_ms + self.max_ms - wall_now()).max(0.0)
     }
     /// A small fresh budget for must-run cleanup — the push abort. The
     /// request's own budget is often WHY cleanup runs (it timed out or hit
@@ -73,7 +102,7 @@ impl ReqBudget {
         Self {
             max_subrequests: 8,
             used: 0,
-            started_ms: js_sys::Date::now(),
+            started_ms: wall_now(),
             max_ms: 10_000.0,
             sink: Some(Rc::clone(spend)),
         }
@@ -90,9 +119,14 @@ impl ReqBudget {
     pub fn charge(&mut self, n: u32) -> Result<(), Error> {
         self.used = self.used.saturating_add(n);
         self.report(n);
-        if self.used > self.max_subrequests || js_sys::Date::now() - self.started_ms > self.max_ms {
+        if self.used > self.max_subrequests || wall_now() - self.started_ms > self.max_ms {
             return Err(Error::Budget);
         }
+        // a charge IS progress on the edge pass-B path — renew the held
+        // permit/peer leases so a working push never ages past the sweep.
+        // No-op everywhere else (the thread-locals are only set inside the
+        // gated span).
+        pack::run::renew_lease()?;
         Ok(())
     }
 }
