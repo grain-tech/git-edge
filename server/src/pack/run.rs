@@ -940,7 +940,7 @@ where
     let ticket = ADMISSION.with(|a| a.borrow_mut().enqueue(now()));
     let _ticket = AdmitTicket(ticket);
     let started = now();
-    // the deadline bounds every attempt after the first — Codex's injected
+    // the deadline bounds every attempt after the first — an injected
     // clock acquired at 240,001 ms on a 100 ms bound because the check ran
     // only AFTER try_acquire. First try is unconditional (an uncontended
     // push admits even on a zero bound); every retry checks the bound first.
@@ -1093,7 +1093,7 @@ mod tests {
         assert_eq!(done.get(), "abort");
     }
 
-    /// Codex r8 #3: the externals map's growth for a lookup's hits is
+    /// The externals map's growth for a lookup's hits is
     /// preflighted (misses cost nothing) and reserved fallibly; a refusal
     /// leaves the map as it was.
     #[test]
@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(ext.len(), 500);
     }
 
-    /// Codex/Claude r11: collect_bases' "grow:bases" preflight must be able
+    /// Collect_bases' "grow:bases" preflight must be able
     /// to refuse — a heap already over MEM_HARD answers the in-band Limit
     /// before the id list reserves. Replacing the `?` with `.ok()` lets
     /// this return Ok and fails here.
@@ -1234,7 +1234,7 @@ mod tests {
         r
     }
 
-    /// Codex #4: posts split by serialized BYTES too. 2,500 commit rows
+    /// Posts split by serialized BYTES too. 2,500 commit rows
     /// with 100 parents each serialize to ~11 MiB — far over one 4 MiB
     /// body — so the batch splits early; each post's recorded length is
     /// the exact JSON length the edge allocates, and the preflight bound
@@ -1782,7 +1782,7 @@ mod tests {
         drop(live);
         assert_eq!(receive_packs_at(2_000 + PERMIT_LEASE_MS), 0);
     }
-    /// Codex's mutant: a waiter must NOT acquire after its wait bound —
+    /// A waiter must NOT acquire after its wait bound —
     /// the deadline is checked BEFORE every attempt after the first, so
     /// an injected clock at 240,001 ms on a 100 ms bound can never admit.
     #[test]
@@ -1801,7 +1801,7 @@ mod tests {
         drop(hold);
     }
 
-    /// Claude r8 #2: a fence entry expires EVICTED_FENCE_MS after its
+    /// A fence entry expires EVICTED_FENCE_MS after its
     /// eviction. A leaked holder that never drains and keeps the heap busy
     /// blocks admission inside that window and no longer after it; the
     /// memory guard takes over from there.
@@ -1892,7 +1892,7 @@ mod tests {
         ))
     }
 
-    /// Codex #1 / Claude #1 and #7: lease identity is per request. A leaked
+    /// Lease identity is per request. A leaked
     /// holder ages out even while a bystander request charges the whole
     /// time; once a new holder is admitted, the evicted holder's next
     /// renew fails with Limit while the new holder (and the bystander)
@@ -1951,7 +1951,7 @@ mod tests {
         drop((guard_a, guard_b, guard_c));
     }
 
-    /// Claude #7: RECEIVE_PACKS renewals are per request too. Request A's
+    /// RECEIVE_PACKS renewals are per request too. Request A's
     /// entry survives B entering and leaving (B can't steal the renew
     /// slot), and a leaked guard's entry is never re-inserted by anyone
     /// else's charges — it ages out.

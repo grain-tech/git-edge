@@ -2421,7 +2421,7 @@ mod tests {
         assert!(c.get(&Key::Off(1)).is_some(), "no forced clear when the check passes");
     }
 
-    /// Claude #3: sticky high linear with a low live heap. Linear sits over
+    /// Sticky high linear with a low live heap. Linear sits over
     /// the cap from an earlier push, but live + incoming + FRAG_MARGIN fits
     /// inside it — the allocation reuses free pages, so it is admitted and
     /// the cache is not cleared.
@@ -3105,7 +3105,7 @@ mod tests {
         assert_eq!(prefetch_locs(&bases, ok).unwrap().len(), 1, "one byte of payload over the cap with metadata");
     }
 
-    /// Codex r8 #3: many few-byte bases stop at PREFETCH_MAX_LOCS rows,
+    /// Many few-byte bases stop at PREFETCH_MAX_LOCS rows,
     /// the preflight sees the rows' metadata bytes BEFORE the batch is
     /// built, and a refusal (or a failed reservation) builds nothing.
     #[test]
@@ -3408,7 +3408,7 @@ mod tests {
         assert_eq!(sink.tags.len(), 1, "the tag was recorded");
     }
 
-    /// Codex #7 / Claude #6: a blob over MAX_OBJ rides stream_blob — every
+    /// A blob over MAX_OBJ rides stream_blob — every
     /// grow:blob-* site and its index post preflight fire, and the streamed
     /// object hashes to the right id.
     #[test]
@@ -3949,7 +3949,7 @@ mod tests {
         assert_eq!(PER_OBJECT_DECODE, MEM_HARD - (40 << 20));
     }
 
-    /// Codex r8 #5: each decode term is pinned on its own, with fixtures
+    /// Each decode term is pinned on its own, with fixtures
     /// where dropping a factor changes the asserted value. The 512 KiB
     /// scratch is outside both terms, so it cannot mask a mutation.
     #[test]
@@ -3994,7 +3994,7 @@ mod tests {
         cx
     }
 
-    /// Codex r8 #2: the mini-pack and the work Vec are reserved once at
+    /// The mini-pack and the work Vec are reserved once at
     /// their exact sizes. A real delta over an incompressible 3 MiB base
     /// decodes inside both reservations: the NoGrow writer would fail an
     /// overflowing mini-pack, and the returned `out` keeps exactly the
@@ -4073,7 +4073,7 @@ mod tests {
     }
 
     /// id_map_bound covers hashbrown's load-factor + power-of-two rounding.
-    /// Claude r8 #1: the sink-side links bound is the NEW block only.
+    /// The sink-side links bound is the NEW block only.
     /// ~16 MiB of links doubling to ~32 MiB adds ~32 MiB on top of the
     /// live reading, which already holds the old 16 MiB. The bound must
     /// cover what extend really allocates and must not count the old
@@ -4098,7 +4098,7 @@ mod tests {
         assert_eq!(vec_growth_peak::<u8>(0, 0, 1), 4 + crate::store::ALLOC_OVERHEAD, "Vec's minimum non-zero capacity");
     }
 
-    /// Codex #5: tiny objects are bounded too. Each entry pays
+    /// Tiny objects are bounded too. Each entry pays
     /// CACHE_ENTRY_OVERHEAD, so a budget of N overheads holds at most N
     /// empty objects however many are put, and the map and queue stop
     /// growing with it. Re-puts of one key keep the queue bounded as well.
@@ -4120,7 +4120,7 @@ mod tests {
         assert!(CACHE_ENTRY_OVERHEAD >= 2 * (std::mem::size_of::<(Key, Obj)>() + 1 + std::mem::size_of::<Key>()));
     }
 
-    /// Codex #5: map and queue growth preflights. The bound is 0 while
+    /// Map and queue growth preflights. The bound is 0 while
     /// both have room and covers the old plus the new table when the next
     /// insert resizes; checked against what HashMap/VecDeque really do.
     #[test]
@@ -4157,7 +4157,7 @@ mod tests {
         assert!(any.tags_growth_bound() > 0, "an empty map allocates on first insert");
     }
 
-    /// Claude #4: the pass-A pre-size trusts evidence. A header claiming
+    /// The pass-A pre-size trusts evidence. A header claiming
     /// 750k objects reserves at most PRESIZE_RECORDS (2 MiB), and a small
     /// declared body caps it at what the body can physically hold.
     #[test]
@@ -4212,7 +4212,7 @@ mod tests {
         assert!(sites_of(&preflight_sites()).contains(&"grow:pass-a-entries"));
     }
 
-    /// Claude r8 #1: the last pass-A doubling, 524,288 -> 750,000 records,
+    /// The last pass-A doubling, 524,288 -> 750,000 records,
     /// runs through the REAL guard and the real reserve at realistic
     /// readings and passes. Live holds the 32 MiB table plus pass A's part
     /// buffer; linear sits at the high-water mark of the previous growth.
@@ -4294,7 +4294,7 @@ mod tests {
         }
     }
 
-    /// Claude r8 #4: pending rows flush by held bytes, not only by count.
+    /// Pending rows flush by held bytes, not only by count.
     /// Commits with many parents each keep a parents Vec until the batch
     /// posts; once the held bytes reach the sink's mark the batch posts
     /// early, far below INDEX_BATCH rows. Parentless blobs of the same

@@ -2003,7 +2003,7 @@ mod tests {
         assert!(buf.capacity() <= 16, "cap={}", buf.capacity());
     }
 
-    /// Codex #6: a budget failure at the seal aborts an ordinary finish's
+    /// A budget failure at the seal aborts an ordinary finish's
     /// upload but KEEPS a resumable finish's checkpointed upload, so the
     /// import retry resumes instead of rebuilding its output.
     #[test]
@@ -2025,7 +2025,7 @@ mod tests {
         assert_eq!(fresh.used, 2, "the seal charges exactly one subrequest");
     }
 
-    /// Claude r8 #1: the preflight is the NEW block. A retained 16 MiB
+    /// The preflight is the NEW block. A retained 16 MiB
     /// buffer growing to 24 MiB allocates the full 24 MiB before it frees
     /// the old 16 MiB, so the bound is 24 MiB plus overhead — not the
     /// 8 MiB net delta. The old 16 MiB is already in the live reading, so
@@ -2056,7 +2056,7 @@ mod tests {
     /// cap: 16 MiB of incompressible bytes is deflate's worst case, and a
     /// bound that lands short lets `room` under-reserve so `extend` falls
     /// back to Vec's doubling — a part-buffer spike the guard can't see.
-    /// Codex r8 #4: the finish path's growth. An 8 MiB buffer holding just
+    /// The finish path's growth. An 8 MiB buffer holding just
     /// under one part grows to 16 MiB for a 20-byte trailer, then splits
     /// one 8 MiB part off. The bound names both blocks. A tail that stays
     /// under one part with the trailer needs neither.
