@@ -13,6 +13,7 @@ pub mod repo_do;
 pub mod sign;
 pub mod store;
 pub mod testhooks;
+pub(crate) mod try_grow;
 pub mod wire;
 
 use std::cell::Cell;
