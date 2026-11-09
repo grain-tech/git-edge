@@ -239,4 +239,46 @@ mod tests {
         }
         assert!(peak_bytes() >= live_bytes());
     }
+
+    /// The counting allocator is the process's global allocator: a block
+    /// allocated through `Vec` moves `live_bytes` by its size and moves it
+    /// back on drop. Parallel tests share the tally, so a clean window is
+    /// rare — retry until one shows the whole block.
+    #[test]
+    fn global_allocator_counts_allocated_bytes() {
+        set_live_override(None);
+        set_linear_override(None);
+        const SIZE: usize = 8 << 20;
+        for _ in 0..1_000 {
+            let before = live_bytes();
+            let v = Vec::<u8>::with_capacity(SIZE);
+            let during = live_bytes();
+            drop(v);
+            let after = live_bytes();
+            if during.saturating_sub(before) >= SIZE && during.saturating_sub(after) >= SIZE {
+                return;
+            }
+        }
+        panic!("live_bytes never tracked an {SIZE}-byte block");
+    }
+
+    /// `realloc` moves the tally by the growth, not the new size: doubling
+    /// a block adds only the delta. Same shared-tally retry as above.
+    #[test]
+    fn global_allocator_counts_realloc_growth() {
+        set_live_override(None);
+        set_linear_override(None);
+        const SIZE: usize = 8 << 20;
+        for _ in 0..1_000 {
+            let mut v = Vec::<u8>::with_capacity(SIZE);
+            let before = live_bytes();
+            v.reserve(SIZE * 2);
+            let during = live_bytes();
+            drop(v);
+            if during.saturating_sub(before) >= SIZE {
+                return;
+            }
+        }
+        panic!("realloc growth never moved live_bytes by {SIZE}");
+    }
 }
