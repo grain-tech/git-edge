@@ -1,7 +1,7 @@
 //! Phase one of the two-phase push (CONTRACTS.md 2.4-2.5, 3 ordering), in the edge Worker.
 //! Ported from research/proofs/two-phase-push.md.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 use gix_hash::ObjectId;
@@ -288,10 +288,12 @@ const INGEST_LOW_WATER: usize = 40 << 20;
 /// in-flight subrequest to land.
 const PERMIT_LEASE_MS: i64 = ReqBudget::MAX_MS as i64 + 30_000;
 /// A head ticket that has not polled for this long is evicted — its waiter
-/// was leaked by the same cancellation path. Ten poll intervals: a live
-/// waiter refreshes its stamp every INGEST_POLL_MS, so only a dead one
-/// can be a full ten behind.
-const TICKET_STALE_MS: i64 = 10 * INGEST_POLL_MS as i64;
+/// was leaked by the same cancellation path. Thirty seconds: a live waiter
+/// whose timers the isolate delayed past the stale mark re-inserts its
+/// ticket on the next poll (try_acquire), so only a truly dead head ever
+/// reaches eviction — and it still clears well before the waiters' own
+/// deadlines.
+const TICKET_STALE_MS: i64 = 30_000;
 /// The in-band busy message, shared by the admit timeout and a peer-contended
 /// MEM_HARD trip: a retry helps, smaller slices would not have.
 pub(crate) const INGEST_BUSY_MSG: &str =
@@ -321,7 +323,8 @@ struct Admission {
     next_ticket: u64,
     /// ticket -> last poll time (platform ms). Only the head's stamp
     /// matters for liveness — a stale head is evicted so the line can't
-    /// wedge behind it.
+    /// wedge behind it, and a still-live waiter that was evicted early
+    /// (isolate stalled its timers) re-inserts on its next poll.
     waiting: BTreeMap<u64, i64>,
 }
 
@@ -389,9 +392,17 @@ impl Admission {
     /// gate: every ticket acquires — there is no contention to order.
     fn try_acquire(&mut self, ticket: u64, heap_busy: bool, now: i64) -> Option<u64> {
         // this call IS the waiter's poll — stamp it before the sweep so a
-        // live head is never evicted for a gap it just closed
-        if let Some(t) = self.waiting.get_mut(&ticket) {
-            *t = now;
+        // live head is never evicted for a gap it just closed. A ticket a
+        // younger waiter's sweep already evicted goes back in at its old
+        // BTreeMap position: the isolate can stall timers past
+        // TICKET_STALE_MS while the waiter is still alive, and without the
+        // re-insert it would wait out its whole bound behind a line it
+        // silently left.
+        match self.waiting.get_mut(&ticket) {
+            Some(t) => *t = now,
+            None => {
+                self.waiting.insert(ticket, now);
+            }
         }
         self.sweep(now);
         if self.slots != 0 && self.waiting.first_key_value().map(|(t, _)| *t) != Some(ticket) {
@@ -438,31 +449,93 @@ thread_local! {
     /// included (pass A isn't gated but still holds heap). The pass-B memory
     /// guard reads this to pick "server busy" over "smaller slices": a peer
     /// in pass A can push a lone pass B over MEM_HARD just like a peer in
-    /// pass B can.
-    static RECEIVE_PACKS: Cell<usize> = const { Cell::new(0) };
+    /// pass B can. Entries carry a start time and expire after
+    /// PERMIT_LEASE_MS — the same leak shape as the permits: a cancelled
+    /// invocation can leave the guard behind, and an evergreen count would
+    /// make a lone too-big push report "busy" forever.
+    static RECEIVE_PACKS: RefCell<ReceivePacks> = const { RefCell::new(ReceivePacks::new()) };
+}
+
+/// The isolate's in-flight receive-pack entries: id -> start ms. The map's
+/// length IS the live count, so a swept entry can't desync it — the same
+/// shape as `Admission::permits`.
+struct ReceivePacks {
+    entries: BTreeMap<u64, i64>,
+    next: u64,
+}
+impl ReceivePacks {
+    const fn new() -> Self {
+        Self { entries: BTreeMap::new(), next: 0 }
+    }
+    /// Count one in-progress receive-pack request; returns its entry id.
+    fn enter(&mut self, now: i64) -> u64 {
+        self.sweep(now);
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.entries.insert(id, now);
+        id
+    }
+    /// The request ended (or its guard dropped): its entry leaves. A late
+    /// drop after the sweep reclaimed the entry is a no-op.
+    fn leave(&mut self, id: u64) {
+        self.entries.remove(&id);
+    }
+    /// Reclaim entries older than PERMIT_LEASE_MS — a real request's wall
+    /// clock (ReqBudget::MAX_MS) plus margin bounds any legitimate hold.
+    /// One log line per reclaimed entry.
+    fn sweep(&mut self, now: i64) {
+        let stale: Vec<(u64, i64)> = self
+            .entries
+            .iter()
+            .filter(|(_, at)| now.saturating_sub(**at) > PERMIT_LEASE_MS)
+            .map(|(id, at)| (*id, *at))
+            .collect();
+        for (id, at) in stale {
+            self.entries.remove(&id);
+            admit_log(format_args!(
+                "git-edge ingest admit: reclaimed leaked receive-pack entry {id} (held {}ms)",
+                now.saturating_sub(at)
+            ));
+        }
+    }
+    /// Live entries after the lease sweep — `now` is injected so tests run
+    /// natively (js_sys::Date is wasm-only).
+    fn len(&mut self, now: i64) -> usize {
+        self.sweep(now);
+        self.entries.len()
+    }
 }
 
 /// Counts one in-progress receive-pack request for the isolate — held for
 /// the whole edge handler so pass-A heap pressure counts toward the memory
 /// guard's busy-vs-slices message. try_with: a drop during thread-local
 /// teardown must not panic.
-pub(crate) struct ReceivePackGuard;
+pub(crate) struct ReceivePackGuard(u64);
 impl ReceivePackGuard {
     pub(crate) fn new() -> Self {
-        RECEIVE_PACKS.with(|c| c.set(c.get() + 1));
-        Self
+        Self(RECEIVE_PACKS.with(|c| c.borrow_mut().enter(crate::platform::now_ms())))
+    }
+    #[cfg(test)]
+    fn at(now: i64) -> Self {
+        Self(RECEIVE_PACKS.with(|c| c.borrow_mut().enter(now)))
     }
 }
 impl Drop for ReceivePackGuard {
     fn drop(&mut self) {
-        let _ = RECEIVE_PACKS.try_with(|c| c.set(c.get().saturating_sub(1)));
+        let _ = RECEIVE_PACKS.try_with(|c| c.borrow_mut().leave(self.0));
     }
 }
 
 /// In-progress receive-pack requests in this isolate, the caller's own
 /// included — mem_guard's "is the isolate busy" signal.
 pub(crate) fn receive_packs() -> usize {
-    RECEIVE_PACKS.with(|c| c.get())
+    receive_packs_at(crate::platform::now_ms())
+}
+
+/// `receive_packs` with an injected clock — the lease sweep is testable
+/// natively (js_sys::Date is wasm-only, so tests pass `now` explicitly).
+fn receive_packs_at(now: i64) -> usize {
+    RECEIVE_PACKS.with(|c| c.borrow_mut().len(now))
 }
 
 /// Pass-B ingests inside the gated span, this request's permit included —
@@ -826,6 +899,36 @@ mod tests {
         assert_eq!(a.waiting_len(), 0, "both tickets left the queue");
     }
 
+    /// A LIVE head evicted by a younger waiter's sweep (the isolate stalled
+    /// its timers past TICKET_STALE_MS) must not be stranded: its next poll
+    /// re-inserts the ticket at its old FIFO position and it is admitted in
+    /// order once a slot frees — ahead of the younger waiter that evicted it.
+    #[test]
+    fn admission_live_head_reinserts_after_stale_eviction() {
+        let mut a = Admission::new(1);
+        let holder = a.enqueue(0);
+        let p = a.try_acquire(holder, false, 0).unwrap();
+        // w1 queues behind the held slot and polls once at t=100
+        let w1 = a.enqueue(100);
+        assert!(a.try_acquire(w1, false, 100).is_none());
+        // the isolate stalls past the stale mark; w2 polls first and its
+        // sweep evicts the still-alive head — the slot is still held, so
+        // w2 only waits (and becomes head)
+        let w2 = a.enqueue(TICKET_STALE_MS + 200);
+        assert!(a.try_acquire(w2, false, TICKET_STALE_MS + 200).is_none());
+        assert_eq!(a.waiting_len(), 1, "w1's ticket was evicted, w2's remains");
+        a.release(p);
+        // w1 resumes: its missing ticket goes back in ahead of w2 (BTreeMap
+        // key order IS the FIFO), so it takes the freed slot first
+        assert!(
+            a.try_acquire(w1, false, TICKET_STALE_MS + 300).is_some(),
+            "the evicted live head must re-queue and win its FIFO place"
+        );
+        assert_eq!(a.in_flight(), 1);
+        assert!(a.try_acquire(w2, false, TICKET_STALE_MS + 400).is_none(), "w2 still waits its turn");
+        assert_eq!(a.waiting_len(), 1, "only w2 remains queued");
+    }
+
     /// GE_EDGE_INGEST_* parsing: defaults when absent/unparseable (env_i64's
     /// rule), <= 0 slots disables, <= 0 wait fails fast instead of waiting.
     #[test]
@@ -1141,5 +1244,27 @@ mod tests {
         assert_eq!(ingest_in_flight(), 1);
         drop(p);
         assert_eq!(ingest_in_flight(), 0);
+    }
+
+    /// A receive-pack guard leaked by a cancelled invocation (mem::forget —
+    /// the same path that leaks permits) must not pin the isolate's peer
+    /// count forever: entries expire after PERMIT_LEASE_MS, so a lone
+    /// too-big push still gets the "smaller slices" answer, not "busy".
+    #[test]
+    fn receive_packs_lease_expires_forgotten_guard() {
+        let g = ReceivePackGuard::at(1_000);
+        assert_eq!(receive_packs_at(1_000), 1);
+        std::mem::forget(g); // Drop never runs — the entry stays
+        assert_eq!(receive_packs_at(1_000 + PERMIT_LEASE_MS), 1, "inside the lease it still counts");
+        assert_eq!(
+            receive_packs_at(1_000 + PERMIT_LEASE_MS + 1),
+            0,
+            "past the lease the leaked entry is swept"
+        );
+        // a live guard inside its lease is untouched by the sweep
+        let live = ReceivePackGuard::at(2_000);
+        assert_eq!(receive_packs_at(2_000 + PERMIT_LEASE_MS), 1, "age == lease still counts");
+        drop(live);
+        assert_eq!(receive_packs_at(2_000 + PERMIT_LEASE_MS), 0);
     }
 }

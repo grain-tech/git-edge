@@ -710,15 +710,152 @@ impl Cx<'_> {
         }
         Ok(())
     }
+
+    /// Decode preflight: `incoming` is the bound the caller computed for the
+    /// ONE decode it is about to run (decode_mini_bound / decode_entry_bound).
+    /// Same shed-then-check as mem_relief, but pressure is judged on
+    /// live + incoming — a decode whose working set would cross MEM_HARD
+    /// fails in-band here, before it allocates, instead of hanging the
+    /// isolate mid-decode. A no-op on the DO path (`mem` is `None` there).
+    fn mem_decode(&mut self, incoming: usize) -> Result<(), Error> {
+        if let Some(m) = self.mem.as_mut() {
+            mem_guard_peak(
+                &mut self.cache,
+                crate::mem::live_bytes,
+                crate::mem::linear_bytes,
+                receive_packs,
+                m,
+                incoming,
+                DECODE_TOO_BIG_MSG,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Bound for decode_mini's level-0 re-deflate of the base: zlib level 0
+/// stores — input plus 5 bytes per <=64 KiB-1 block plus the 6-byte wrapper.
+/// len/8192 is ~1.6x the real per-block overhead; +64 covers wrapper+rounding.
+fn stored_deflate_bound(len: usize) -> usize {
+    len.saturating_add(len / 8_192).saturating_add(64)
+}
+
+/// One git delta-header size varint (7 bits per byte, high bit = continue) —
+/// mirrors gix-pack's delta::decode_header_size, which is pub(crate) there.
+fn delta_varint(d: &[u8]) -> Option<(u64, usize)> {
+    let mut shift = 0u32;
+    let mut size = 0u64;
+    let mut consumed = 0usize;
+    for &cmd in d {
+        if shift >= u64::BITS {
+            return None;
+        }
+        consumed = consumed.saturating_add(1);
+        size |= u64::from(cmd & 0x7f) << shift;
+        shift += 7;
+        if cmd & 0x80 == 0 {
+            return Some((size, consumed));
+        }
+    }
+    None
+}
+
+/// The delta's result size from its instruction header — the same cheap
+/// probe gix-pack's decode_delta_object_size runs: the first two u64
+/// varints of the decompressed delta carry base size then result size, so
+/// inflating <= 32 bytes is enough. `None` when the stream won't produce or
+/// parse them — the caller then bounds by MAX_OBJ (the decode fails on a
+/// header that can't inflate this far anyway).
+fn delta_result_size(body: &[u8], z: &mut Inflate) -> Option<u64> {
+    z.reset();
+    let mut buf = [0u8; 32];
+    let (_status, _consumed_in, out) = z.once(body, &mut buf).ok()?;
+    let d = buf.get(..out)?;
+    let (_base, off) = delta_varint(d)?;
+    let (result, _used) = delta_varint(d.get(off..)?)?;
+    Some(result)
+}
+
+/// Upper bound on the live bytes ONE decode_mini adds at its peak — run
+/// BEFORE anything allocates so the guard can reject in-band. Counts the
+/// copies the decode actually makes:
+///   mini   — the synthetic pack Vec: 12-byte header, the re-deflated base
+///            (level 0 ≈ stored), the re-headed entry header, the raw entry
+///            body verbatim, and the digest-width trailer. It stays alive
+///            through decode_entry; ×2 covers Vec's amortized capacity.
+///   out    — decode_entry's work Vec: for a delta, two biggest-result
+///            buffers plus the decompressed instruction stream (the result
+///            size comes from the delta header probe); for a full entry,
+///            the object itself. Sized exactly, then floored at 2× the
+///            instruction region for Vec's amortized growth.
+///   scratch — zlib states and small vecs the size terms don't name.
+fn decode_mini_bound(
+    z: &mut Inflate,
+    base_len: Option<usize>,
+    e: &PackEntry,
+    raw: &[u8],
+    obj_kind: H,
+) -> usize {
+    let hlen = e.header_size();
+    let body_len = raw.len().saturating_sub(hlen);
+    let mut mini_len = 12usize
+        .saturating_add(32) // re-headed entry header: kind + size varints (+ ofs distance)
+        .saturating_add(body_len)
+        .saturating_add(obj_kind.len_in_bytes()); // zero digest trailer
+    if let Some(b) = base_len {
+        mini_len = mini_len
+            .saturating_add(32) // base entry header
+            .saturating_add(stored_deflate_bound(b));
+    }
+    let mini_alloc = mini_len.saturating_mul(2);
+    let instr = usize::try_from(e.decompressed_size)
+        .unwrap_or(usize::MAX)
+        .min(MAX_OBJ as usize);
+    let out_alloc = if e.header.is_delta() {
+        // resolve_deltas sizes `out` = 2*biggest_result + instruction bytes;
+        // biggest is max(base len, result claim) and claims over MAX_OBJ
+        // are rejected by the alloc limit before the resize — clamp here.
+        let result = delta_result_size(raw.get(hlen..).unwrap_or(&[]), z)
+            .and_then(|r| usize::try_from(r).ok())
+            .unwrap_or(MAX_OBJ as usize)
+            .min(MAX_OBJ as usize);
+        let biggest = base_len.unwrap_or(0).max(result).min(MAX_OBJ as usize);
+        biggest
+            .saturating_mul(2)
+            .saturating_add(instr)
+            .max(instr.saturating_mul(2))
+    } else {
+        instr
+    };
+    mini_alloc.saturating_add(out_alloc).saturating_add(DECODE_SCRATCH)
+}
+
+/// Bound for codec::decode_entry (external bases, the prefetch batch): it
+/// allocates exactly the header's decompressed size plus one Inflate state —
+/// the entry bytes are already live. Unparseable headers bound at MAX_OBJ;
+/// the decode errors on them anyway.
+fn decode_entry_bound(entry: &[u8]) -> usize {
+    let size = codec::entry_header(entry).map(|(_, s, _)| s).unwrap_or(MAX_OBJ);
+    usize::try_from(size)
+        .unwrap_or(usize::MAX)
+        .min(MAX_OBJ as usize)
+        .saturating_add(DECODE_SCRATCH)
 }
 
 /// One decode_entry over `[PACK v2][base as a level-0 zlib full entry][delta re-headed as ofs-delta][digest-width zero trailer]`.
+/// `cx` supplies the inflate, the object format, and — on the edge path —
+/// the memory guard: the decode's peak working set is preflighted against
+/// MEM_HARD before `mini` or `out` allocate (a ~16 MiB base plus ~16 MiB of
+/// delta instructions would otherwise grow ~80 MiB inside this one call).
 pub fn decode_mini(
-    z: &mut Inflate,
+    cx: &mut Cx<'_>,
     base: Option<(Kind, &[u8])>,
     raw: &[u8],
-    obj_kind: H,
 ) -> Result<(Kind, Vec<u8>), Error> {
+    let obj_kind = cx.obj_kind;
+    let e = PackEntry::from_bytes(raw, 0, obj_kind).map_err(|e| unpack(e.to_string()))?;
+    let bound = decode_mini_bound(&mut cx.z, base.map(|(_, d)| d.len()), &e, raw, obj_kind);
+    cx.mem_decode(bound)?;
     let mut mini = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
     if let Some((k, d)) = base {
         let hk = match k {
@@ -732,10 +869,7 @@ pub fn decode_mini(
         w.write_all(d).and_then(|_| std::io::Write::flush(&mut w)).map_err(internal)?;
         mini = w.into_inner();
     }
-    let (at, e) = (
-        mini.len() as u64,
-        PackEntry::from_bytes(raw, 0, obj_kind).map_err(|e| unpack(e.to_string()))?,
-    );
+    let at = mini.len() as u64;
     let body = raw.get(e.header_size()..).ok_or_else(|| unpack("short entry"))?;
     let hdr = match (e.header.is_delta(), base) {
         (true, Some(_)) => Header::OfsDelta { base_distance: at.saturating_sub(12) },
@@ -753,7 +887,7 @@ pub fn decode_mini(
         .decode_entry(
             file.entry(at).map_err(|e| unpack(e.to_string()))?,
             &mut out,
-            z,
+            &mut cx.z,
             &|_, _| None,
             &mut gix_pack::cache::Never,
         )
@@ -790,8 +924,9 @@ pub async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> 
         .await?
         .pop()
         .ok_or_else(|| Error::Storage("base read".into()))?;
-    // decode_entry materializes the whole base object — in-walk relief
-    cx.mem_relief()?;
+    // decode_entry materializes the whole base object — preflight its size
+    // in-walk, not just the ambient heap
+    cx.mem_decode(decode_entry_bound(&entry))?;
     let (k, d) = codec::decode_entry(&entry)?;
     Ok(cx.cache.put(Key::Id(id), k, d))
 }
@@ -890,9 +1025,9 @@ pub async fn resolve_at(
                     return Err(unpack("delta base exceeds 16 MiB and cannot be resolved"));
                 }
                 // decode_mini grows the re-deflated base plus the delta
-                // body plus the output object — check before it allocates
+                // body plus the output object — it preflights its own bound
                 cx.mem_relief()?;
-                let (k, d) = decode_mini(&mut cx.z, None, &raw, cx.obj_kind)?;
+                let (k, d) = decode_mini(cx, None, &raw)?;
                 break cx.cache.put(Key::Off(off), k, d);
             }
         }
@@ -901,7 +1036,7 @@ pub async fn resolve_at(
         // each apply decodes a <= 16 MiB object on top of the bytes the
         // rest of the chain still retains — same in-walk relief
         cx.mem_relief()?;
-        let (_, d) = decode_mini(&mut cx.z, Some((kind, &data)), &raw, cx.obj_kind)?;
+        let (_, d) = decode_mini(cx, Some((kind, &data)), &raw)?;
         data = cx.cache.put(Key::Off(o), kind, d).1;
     }
     cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
@@ -930,6 +1065,19 @@ pub struct MemGuard {
     cleared_at: Option<usize>,
 }
 
+/// The alone-case wording for a pressure trip: the push's aggregate heap is
+/// what needs slicing.
+const MEM_PRESSURE_MSG: &str =
+    "push needs more memory than one request allows; push it in smaller slices";
+/// The alone-case wording for a decode preflight trip: ONE decode's working
+/// set is what needs slicing — the rest of the push may be fine.
+const DECODE_TOO_BIG_MSG: &str = "object too large for one request; push it in smaller slices";
+/// Flat scratch allowance inside a decode bound: the re-deflate's zlib state
+/// (~200 KiB), a fresh Inflate for codec::decode_entry (~40 KiB), the delta
+/// probe buffer, and small vec growth — everything a single decode allocates
+/// that the size terms don't name.
+const DECODE_SCRATCH: usize = 512 << 10;
+
 /// Pass-B memory guard, run at each entry boundary of the edge resolve
 /// loop and inside delta-chain walks (`Cx::mem_relief`). `live` reads the
 /// counting allocator's live bytes, `linear` the wasm linear-memory size
@@ -949,7 +1097,27 @@ fn mem_guard(
     peers: impl Fn() -> usize,
     state: &mut MemGuard,
 ) -> Result<(), Error> {
-    let now = live();
+    mem_guard_peak(cache, live, linear, peers, state, 0, MEM_PRESSURE_MSG)
+}
+
+/// `mem_guard` with `incoming` — bytes the caller is about to allocate —
+/// added to the pressure reading, and `alone_msg` naming the alone-case
+/// failure. The decode preflight uses it so a single decode that would
+/// cross MEM_HARD sheds the cache and fails in-band BEFORE it allocates,
+/// instead of discovering the wall mid-decode where the isolate hangs.
+/// Hysteresis still applies: the shed triggers on the projected reading,
+/// and `cleared_at` keeps recording the POST-shed actual live bytes.
+#[allow(clippy::too_many_arguments)]
+fn mem_guard_peak(
+    cache: &mut Cache,
+    live: impl Fn() -> usize,
+    linear: impl Fn() -> usize,
+    peers: impl Fn() -> usize,
+    state: &mut MemGuard,
+    incoming: usize,
+    alone_msg: &'static str,
+) -> Result<(), Error> {
+    let now = live().saturating_add(incoming);
     if now <= MEM_SOFT {
         return Ok(());
     }
@@ -965,12 +1133,12 @@ fn mem_guard(
         // ever shedding again
         state.cleared_at = Some(live());
     }
-    let after = live();
+    let after = live().saturating_add(incoming);
     if after > MEM_HARD || (linear() >= LINEAR_HARD && after > MEM_SOFT) {
         return Err(Error::Limit(if peers() > 1 {
             INGEST_BUSY_MSG.into()
         } else {
-            "push needs more memory than one request allows; push it in smaller slices".into()
+            alone_msg.into()
         }));
     }
     Ok(())
@@ -1028,6 +1196,7 @@ pub async fn resolve_and_normalize(
     // batch; every base still resolves lazily through `external()`
     if let Ok(entries) = bucket.read_entries(&pre, budget).await {
         for (id, entry) in entries {
+            cx.mem_decode(decode_entry_bound(&entry))?;
             let (k, d) = codec::decode_entry(&entry)?;
             cx.cache.put(Key::Id(id), k, d);
         }
@@ -1125,7 +1294,7 @@ pub async fn one_entry(
     // of whatever the base walk just retained — last in-walk relief point
     cx.mem_relief()?;
     let (kind, data) =
-        decode_mini(&mut cx.z, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw, cx.obj_kind)?;
+        decode_mini(cx, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw)?;
     let id = gix_object::compute_hash(cx.obj_kind, kind, &data).map_err(|_| unpack("hash collision"))?;
     let links = extract_links(kind, &data, cx.obj_kind)?;
     // protected refs: extract_links puts a commit's tree first, then parents
@@ -1470,5 +1639,140 @@ mod tests {
         assert!(matches!(chain_too_large(false), Error::Unpack(_)));
         // the edge cap is the tighter of the two bounds
         assert!(EDGE_CHAIN_BYTES < MAX_CHAIN_BYTES);
+    }
+
+    /// git's delta-header varints: 7 bits per byte, high bit continues,
+    /// least-significant group first.
+    fn put_varint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    /// A raw pack entry holding one ofs-delta: header + zlib(delta stream).
+    /// The stream is base_size varint + result_size varint + instruction bytes.
+    fn delta_raw(base_size: u64, result_size: u64, instr: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut d = Vec::new();
+        put_varint(base_size, &mut d);
+        put_varint(result_size, &mut d);
+        d.extend_from_slice(instr);
+        let mut body = Vec::new();
+        {
+            let mut w = gix_zlib::stream::deflate::Write::new(&mut body, Compression::DEFAULT);
+            w.write_all(&d).unwrap();
+            std::io::Write::flush(&mut w).unwrap();
+        }
+        let mut raw = Vec::new();
+        Header::OfsDelta { base_distance: 1 }
+            .write_to(d.len() as u64, &mut raw)
+            .unwrap();
+        raw.extend_from_slice(&body);
+        raw
+    }
+
+    /// The delta-header probe reads the result size gix-pack's own probe
+    /// would: first varint base size, second result size.
+    #[test]
+    fn delta_result_size_probes_header_varints() {
+        let raw = delta_raw(1_000, 65_536, &[0x91, 0x00]);
+        let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
+        let body = &raw[e.header_size()..];
+        let mut z = Inflate::default();
+        assert_eq!(delta_result_size(body, &mut z), Some(65_536));
+        // garbage input can't produce the header -> None -> MAX_OBJ bound
+        assert_eq!(delta_result_size(b"not zlib", &mut z), None);
+        // round-trips through delta_varint at the edges
+        assert_eq!(delta_varint(&[0x80, 0x80, 0x01]), Some((16_384, 3)));
+        assert_eq!(delta_varint(&[]), None);
+        assert_eq!(delta_varint(&[0x80]), None, "truncated varint");
+    }
+
+    /// decode_mini_bound counts the mini-pack copy (raw body + re-deflated
+    /// base) AND decode_entry's work Vec (2*biggest result + instructions).
+    #[test]
+    fn decode_mini_bound_counts_mini_and_work_buffers() {
+        let mut z = Inflate::default();
+        // full (non-delta) entry: out = decompressed size, mini = raw copy
+        let mut enc = Vec::new();
+        codec::encode_entry(Kind::Blob, &[7u8; 4_096], &mut enc).unwrap();
+        let e = PackEntry::from_bytes(&enc, 0, H::Sha1).unwrap();
+        let bound = decode_mini_bound(&mut z, None, &e, &enc, H::Sha1);
+        // mini alone is ~2x the raw wire bytes; out adds the 4 KiB object
+        assert!(bound >= enc.len().saturating_mul(2), "{bound} < 2*raw");
+        assert!(bound >= 4_096 + DECODE_SCRATCH, "{bound}");
+        // delta entry: biggest = max(base, result) drives the 2x work buffers
+        let raw = delta_raw(2 << 20, 1 << 20, &[0u8; 1_000]);
+        let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
+        let bound = decode_mini_bound(&mut z, Some(2 << 20), &e, &raw, H::Sha1);
+        // out term alone is 2*biggest(2 MiB) + instr(~1 KiB+hdr); mini adds
+        // ~2x (stored base + raw body)
+        assert!(bound >= (2 << 20) * 2, "{bound}");
+        assert!(bound >= raw.len() * 2, "{bound}");
+        // a bigger claimed result size lifts the bound
+        let raw_big = delta_raw(1 << 10, 8 << 20, &[0u8; 10]);
+        let e_big = PackEntry::from_bytes(&raw_big, 0, H::Sha1).unwrap();
+        let bound_big = decode_mini_bound(&mut z, Some(1 << 10), &e_big, &raw_big, H::Sha1);
+        assert!(bound_big > bound, "{bound_big} <= {bound}");
+        // codec::decode_entry bound: header size + scratch, capped at MAX_OBJ
+        assert_eq!(decode_entry_bound(&enc), 4_096 + DECODE_SCRATCH);
+        assert_eq!(decode_entry_bound(b"junk"), MAX_OBJ as usize + DECODE_SCRATCH);
+    }
+
+    /// stored_deflate_bound stays above the real level-0 overhead
+    /// (5 bytes per <=64 KiB-1 stored block + 6-byte zlib wrapper).
+    #[test]
+    fn stored_deflate_bound_covers_level0_overhead() {
+        for len in [0usize, 1, 65_535, 65_536, 1 << 20, MAX_OBJ as usize] {
+            let real_blocks = len / 65_535 + usize::from(len % 65_535 != 0);
+            let real = len + 5 * real_blocks + 6;
+            assert!(stored_deflate_bound(len) >= real, "len {len}");
+        }
+    }
+
+    /// The preflight projects live + incoming: a decode whose working set
+    /// would cross MEM_HARD sheds the cache then fails in-band — alone with
+    /// the "object too large" wording, busy with peers — while a fitting
+    /// decode passes.
+    #[test]
+    fn mem_guard_peak_preflight_projects_incoming() {
+        // fits: calm heap + small decode -> untouched
+        let mut c = Cache::default();
+        let mut g = MemGuard::default();
+        mem_guard_peak(&mut c, || MEM_SOFT - (2 << 20), || 0, || 1, &mut g, 1 << 20, DECODE_TOO_BIG_MSG).unwrap();
+        // alone + too big even after shed: Limit naming the object, cache shed
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
+            90usize << 20, // now = live + incoming -> over hard, shed runs
+            60 << 20,      // post-shed live for cleared_at
+            60 << 20,      // after = post-shed live + incoming -> still over
+        ]));
+        let live = || readings.borrow_mut().pop_front().unwrap_or(60 << 20);
+        let err = mem_guard_peak(&mut c, live, || 0, || 1, &mut g, 40 << 20, DECODE_TOO_BIG_MSG).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(err.message().contains("object too large for one request"), "{err}");
+        assert!(c.get(&Key::Off(1)).is_none(), "the shed ran before the Limit");
+        // same pressure with a peer in flight -> the busy wording
+        let mut g = MemGuard::default();
+        let err = mem_guard_peak(&mut c, || 90 << 20, || 0, || 2, &mut g, 40 << 20, DECODE_TOO_BIG_MSG).unwrap_err();
+        assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
+        // shed makes it fit: post-shed live + incoming stays under MEM_HARD
+        let mut c = Cache::default();
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
+            90usize << 20, 50 << 20, 50 << 20,
+        ]));
+        let live = || readings.borrow_mut().pop_front().unwrap_or(50 << 20);
+        let mut g = MemGuard::default();
+        mem_guard_peak(&mut c, live, || 0, || 1, &mut g, 30 << 20, DECODE_TOO_BIG_MSG).unwrap();
+        assert!(c.get(&Key::Off(2)).is_none(), "shed still ran on projected pressure");
     }
 }
