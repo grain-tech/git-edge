@@ -115,8 +115,9 @@ const EDGE_CACHE: usize = 24 << 20;
 /// inside the futures queue and the request hangs instead of answering.
 /// At each entry boundary (and inside delta-chain walks — see
 /// `Cx::mem_relief`) the guard sheds the object cache past MEM_SOFT;
-/// still above MEM_HARD — or over the linear-aware trip — it fails with
-/// an in-band Limit the client can act on (smaller slices).
+/// still above MEM_HARD it fails with an in-band Limit the client can act
+/// on (smaller slices). The linear-aware trip fails with a retry message
+/// instead, since slicing cannot lower the isolate's linear high-water mark.
 ///
 /// Why live bytes and not `memory.size` alone: wasm linear memory never
 /// shrinks, so a size-only guard would wedge an isolate forever after one
