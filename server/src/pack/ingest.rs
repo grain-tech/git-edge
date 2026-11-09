@@ -791,6 +791,16 @@ impl AnySink<'_, '_> {
     /// index rows over the stub, so it flushes at INDEX_BATCH to keep both
     /// the rows Vec and every serialized body small; the DO job inserts
     /// straight into SQLite and keeps its own 10,000-row convention.
+    /// Held row bytes that flush a batch early, whatever its row count: a
+    /// batch of octopus commits holds every parent id until it posts.
+    /// INDEX_POST_BYTES for every shape; the test sink may lower it.
+    fn row_bytes(&self) -> usize {
+        match self {
+            AnySink::Edge(_) | AnySink::Job(_) => super::run::INDEX_POST_BYTES,
+            #[cfg(test)]
+            AnySink::Mem(s) => s.row_bytes.unwrap_or(super::run::INDEX_POST_BYTES),
+        }
+    }
     fn row_batch(&self) -> usize {
         match self {
             AnySink::Edge(_) => super::run::INDEX_BATCH,
@@ -902,6 +912,8 @@ pub struct MemSink {
     /// Rows per flush — None is the edge's INDEX_BATCH; tests lower it to
     /// drive the index-post preflights with a handful of entries.
     pub batch: Option<usize>,
+    /// Held row bytes per flush — None is INDEX_POST_BYTES.
+    pub row_bytes: Option<usize>,
 }
 
 /// DO-side sink for the import job: objects rows and links batches go straight
@@ -1018,6 +1030,11 @@ pub struct Cx<'a> {
     /// Compressed bytes held by in-flight delta chains across ALL nested resolve_at
     /// calls — decremented when a chain finishes or aborts.
     pub chain_live: u64,
+    /// Heap bytes the unposted `rows` hold (see `row_held_bytes`) — reset
+    /// whenever `rows` holds at most the row just pushed, so a caller
+    /// that clears `rows` itself needs no bookkeeping. One commit row
+    /// keeps its whole parents Vec until the batch posts.
+    pub rows_held: usize,
     /// Pass-B memory guard state — `Some` only on the edge receive-pack
     /// path (`resolve_and_normalize`). The DO import job leaves it `None`:
     /// its alarm slices carry their own budget and keep the generous
@@ -1867,6 +1884,28 @@ fn prefetch_locs(
     Ok(out)
 }
 
+/// Heap bytes one unposted ObjRow holds: the row itself plus its parents
+/// Vec's block.
+fn row_held_bytes(row: &ObjRow) -> usize {
+    std::mem::size_of::<ObjRow>().saturating_add(
+        row.parents
+            .as_ref()
+            .map_or(0, |p| p.capacity().saturating_mul(std::mem::size_of::<ObjectId>())),
+    )
+}
+
+/// Account the row just pushed and say whether the batch must post now:
+/// at the sink's row count, or once the held bytes reach its byte mark.
+fn row_flush_due(cx: &mut Cx<'_>, sink: &AnySink<'_, '_>, rows: &[ObjRow]) -> bool {
+    if rows.len() <= 1 {
+        cx.rows_held = 0;
+    }
+    if let Some(row) = rows.last() {
+        cx.rows_held = cx.rows_held.saturating_add(row_held_bytes(row));
+    }
+    rows.len() >= sink.row_batch() || cx.rows_held >= sink.row_bytes()
+}
+
 /// `sink` posts `/_do/push/index` in 10,000-row batches and collects links (2.5).
 /// `externals` is the thin-pack base view — a prefetched map here, the live index
 /// itself for an in-DO job (see jobs/import.rs).
@@ -1896,6 +1935,7 @@ pub async fn resolve_and_normalize<O: PackOut>(
         obj_kind,
         res_depth: 0,
         chain_live: 0,
+        rows_held: 0,
         mem: Some(MemGuard { cleared_at: None, lease: budget.lease.clone() }),
     };
     // plan the batch, preflight its metadata, then build it fallibly —
@@ -2119,7 +2159,7 @@ pub async fn one_entry<O: PackOut>(
         cx.by_id.insert(id, i)?;
     }
     cx.cache_put(Key::Off(rec.offset), kind, data, "grow:cache-entry")?;
-    if rows.len() >= sink.row_batch() {
+    if row_flush_due(cx, sink, rows) {
         // each index post's JSON body (plus its request copy) is a pass-B
         // allocation too — commit rows carry parents, so price it first
         cx.mem_grow(sink.post_bound(rows)?, None, "grow:index-entry")?;
@@ -2222,7 +2262,7 @@ async fn stream_blob<O: PackOut>(
     if need_ids {
         cx.by_id.insert(id, i)?;
     }
-    if rows.len() >= sink.row_batch() {
+    if row_flush_due(cx, sink, rows) {
         cx.mem_grow(sink.post_bound(rows)?, None, "grow:index-blob")?;
         sink.post(rows, budget).await?;
         rows.clear();
@@ -3186,6 +3226,7 @@ mod tests {
             obj_kind: H::Sha1,
             res_depth: 0,
             chain_live: 0,
+            rows_held: 0,
             mem: Some(MemGuard::default()),
         }
     }
@@ -3958,6 +3999,51 @@ mod tests {
             Err(e) => assert!(crate::try_grow::is_retry(&e), "{e}"),
             Ok(_) => panic!("the 1 MiB decode must be refused"),
         }
+    }
+
+    /// Claude r8 #4: pending rows flush by held bytes, not only by count.
+    /// Commits with many parents each keep a parents Vec until the batch
+    /// posts; once the held bytes reach the sink's mark the batch posts
+    /// early, far below INDEX_BATCH rows. Parentless blobs of the same
+    /// count stay under the mark and post nothing mid-loop.
+    #[test]
+    fn pending_rows_flush_by_held_parent_bytes() {
+        let tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let commit = |n: usize| {
+            let mut c = format!("tree {tree}\n");
+            for p in 0..50 {
+                c.push_str(&format!("parent {:040x}\n", n * 100 + p));
+            }
+            c.push_str(&format!("author A <a@e> {n} +0000\ncommitter A <a@e> {n} +0000\n\nm\n"));
+            c.into_bytes()
+        };
+        let commits: Vec<Vec<u8>> = (0..10).map(commit).collect();
+        let objs: Vec<(Kind, &[u8])> = commits.iter().map(|c| (Kind::Commit, c.as_slice())).collect();
+        let (pack, recs) = mk_pack(&objs);
+        let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
+        let key = "pending/p-octopus.pack";
+        let mut mem = MemReads::new(crate::store::RepoId("o/r".into()));
+        mem.put(key, pack);
+        let one_row = std::mem::size_of::<ObjRow>() + 50 * std::mem::size_of::<ObjectId>();
+        let mut out = MemPackOut { buf: Vec::new() };
+        let mut sink = MemSink { row_bytes: Some(3 * one_row), ..MemSink::default() };
+        let tail = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink)).unwrap();
+        assert_eq!(sink.posts, 3, "every third commit row reaches the byte mark");
+        assert_eq!(sink.rows.len(), 9);
+        assert_eq!(tail.len(), 1);
+        assert!(sink.rows.iter().all(|r| r.parents.as_ref().map(Vec::len) == Some(50)));
+        // parentless rows stay under the same mark: count alone decides
+        let blobs: Vec<Vec<u8>> = (0..10u8).map(|n| vec![n; 16]).collect();
+        let objs: Vec<(Kind, &[u8])> = blobs.iter().map(|b| (Kind::Blob, b.as_slice())).collect();
+        let (pack, recs) = mk_pack(&objs);
+        mem.put(key, pack);
+        let mut out = MemPackOut { buf: Vec::new() };
+        let mut sink = MemSink { row_bytes: Some(3 * one_row), ..MemSink::default() };
+        let tail = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink)).unwrap();
+        assert_eq!((sink.posts, tail.len()), (0, 10));
+        // production marks: every sink shape flushes at INDEX_POST_BYTES
+        let mut plain = MemSink::default();
+        assert_eq!(AnySink::Mem(&mut plain).row_bytes(), super::super::run::INDEX_POST_BYTES);
     }
 
     #[test]
