@@ -1093,7 +1093,7 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
     // admission-gated but still holds heap, so the whole handler counts.
     // Created only AFTER auth: an unauthenticated request must not count as
     // an in-progress receive-pack peer (it would skew busy-vs-slices).
-    let _receive_pack = pack::run::ReceivePackGuard::new();
+    let receive_pack_guard = pack::run::ReceivePackGuard::new();
     // A27: sha1 of the presented token is the rate-limit bucket key — the raw
     // credential never crosses the stub boundary (8.1)
     let rate_key = auth::presented_hash(&req)?;
@@ -1122,7 +1122,8 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
     }
 
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
-    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, admin, spend).await {
+    let lease = receive_pack_guard.lease();
+    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, admin, spend, lease).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             // A27/G2b: a throttled or over-cap push answers a real HTTP
@@ -1163,6 +1164,7 @@ async fn receive_header(body: &mut BodyReader) -> Result<(wire::ReceiveHeader, V
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_inner(
     body: &mut BodyReader,
     env: &Env,
@@ -1172,8 +1174,11 @@ async fn receive_inner(
     rate_key: &str,
     admin: bool,
     spend: &Spend,
+    lease: std::rc::Rc<pack::run::Lease>,
 ) -> Result<Response, Error> {
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    // the budget carries this request's lease: its charges (and the pass-B
+    // guard, which borrows the handle) renew only this request's leases
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend).leased(lease));
     let push = PushId::random()?;
     #[derive(serde::Deserialize)]
     struct Begin {

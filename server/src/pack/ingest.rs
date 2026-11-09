@@ -1322,6 +1322,10 @@ fn chain_too_large(edge: bool) -> Error {
 #[derive(Default)]
 pub struct MemGuard {
     cleared_at: Option<usize>,
+    /// The owning request's lease handle (from its ReqBudget): every guard
+    /// call renews THIS request's permit, and an evicted holder learns of
+    /// its eviction here. None renews nothing.
+    lease: Option<Rc<super::run::Lease>>,
 }
 
 /// The alone-case wording for a pressure trip: the push's aggregate heap is
@@ -1409,9 +1413,12 @@ fn mem_guard_peak(
     let _ = site; // used only by the cfg(test) probe
     #[cfg(test)]
     preflight_log(site, incoming);
-    // a guard call IS progress on the edge pass-B path — renew the held
-    // permit's lease; an evicted holder learns here and stops in-band
-    crate::pack::run::renew_lease()?;
+    // a guard call IS progress on the edge pass-B path — renew this
+    // request's own permit lease; an evicted holder learns here and stops
+    // in-band
+    if let Some(l) = &state.lease {
+        l.renew()?;
+    }
     let live_now = live();
     // the hysteresis baseline follows the heap back down: cleared_at is the
     // lowest live reading since the last shed, so regrowth is measured from
@@ -1597,7 +1604,7 @@ pub async fn resolve_and_normalize<O: PackOut>(
         obj_kind,
         res_depth: 0,
         chain_live: 0,
-        mem: Some(MemGuard::default()),
+        mem: Some(MemGuard { cleared_at: None, lease: budget.lease.clone() }),
     };
     let pre = match &cx.externals {
         Externals::Map(bases) => prefetch_locs(bases),
@@ -2583,7 +2590,7 @@ mod tests {
     }
 
     fn test_budget() -> ReqBudget {
-        ReqBudget { max_subrequests: 9_000, used: 0, started_ms: crate::wall_now(), max_ms: ReqBudget::MAX_MS, sink: None }
+        ReqBudget { max_subrequests: 9_000, used: 0, started_ms: crate::wall_now(), max_ms: ReqBudget::MAX_MS, sink: None, lease: None }
     }
 
     /// Run the real resolve loop over `recs` served from `mem` at `key`,

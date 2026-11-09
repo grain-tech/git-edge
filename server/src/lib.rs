@@ -65,6 +65,10 @@ pub struct ReqBudget {
     /// Where charges are mirrored for the response header; None keeps the old
     /// behaviour for budgets that own the whole spend (jobs, DO internals).
     pub sink: Option<Spend>,
+    /// The owning receive-pack request's lease handle — `charge` renews
+    /// THIS request's permit and receive-pack entry, never another's. None
+    /// for every other budget: a bystander's charges touch no lease.
+    pub lease: Option<Rc<pack::run::Lease>>,
 }
 impl ReqBudget {
     /// Paid-plan subrequest ceiling (7.1) — the x-ge-subrequests denominator.
@@ -80,12 +84,19 @@ impl ReqBudget {
             started_ms: wall_now(),
             max_ms: Self::MAX_MS,
             sink: None,
+            lease: None,
         }
     }
     /// Mirror every charge into `spend` — the request-wide tally the edge
     /// stamps as x-ge-subrequests, including on error responses.
     pub fn reporting(mut self, spend: &Spend) -> Self {
         self.sink = Some(Rc::clone(spend));
+        self
+    }
+    /// Bind the request's lease handle: every charge on this budget renews
+    /// that request's own leases (see pack::run::Lease).
+    pub fn leased(mut self, lease: Rc<pack::run::Lease>) -> Self {
+        self.lease = Some(lease);
         self
     }
     /// Wall-clock milliseconds left in this budget's window — the pass-B
@@ -105,6 +116,7 @@ impl ReqBudget {
             started_ms: wall_now(),
             max_ms: 10_000.0,
             sink: Some(Rc::clone(spend)),
+            lease: None,
         }
     }
     /// Subrequests already spent elsewhere in the request (e.g. the DO's R2
@@ -122,11 +134,12 @@ impl ReqBudget {
         if self.used > self.max_subrequests || wall_now() - self.started_ms > self.max_ms {
             return Err(Error::Budget);
         }
-        // a charge IS progress on the edge pass-B path — renew the held
+        // a charge IS progress on a receive-pack request — renew its own
         // permit/peer leases so a working push never ages past the sweep.
-        // No-op everywhere else (the thread-locals are only set inside the
-        // gated span).
-        pack::run::renew_lease()?;
+        // Budgets without a lease (every other request) renew nothing.
+        if let Some(l) = &self.lease {
+            l.renew()?;
+        }
         Ok(())
     }
 }

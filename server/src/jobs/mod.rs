@@ -93,7 +93,7 @@ impl SliceBudget {
             .min(320);
         Self {
             started_ms: crate::wall_now(),
-            req: ReqBudget { max_subrequests: 400, used: 0, started_ms: crate::wall_now(), max_ms: 20_000.0, sink: None },
+            req: ReqBudget { max_subrequests: 400, used: 0, started_ms: crate::wall_now(), max_ms: 20_000.0, sink: None, lease: None },
             yield_after,
         }
     }
