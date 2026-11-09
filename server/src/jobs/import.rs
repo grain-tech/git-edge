@@ -267,7 +267,8 @@ async fn reject_push(sql: &SqlStorage, job: &Job, push: &str, why: &str) -> Resu
 /// A fetch answer that can never succeed — protocol/remote rejection — versus
 /// a transport blip a re-fetch might beat. Only the first kind rejects the push.
 fn deterministic(e: &Error) -> bool {
-    matches!(e, Error::Protocol(_) | Error::Limit(_))
+    // the memory-pressure Limit is transient: the slice retries it
+    matches!(e, Error::Protocol(_) | Error::Limit(_)) && !crate::try_grow::is_retry(e)
 }
 
 /// payload.url set: clone the remote ourselves. ls-refs mints the command set
@@ -375,7 +376,10 @@ async fn fetch_slice(
                     let (Some(band), data) = (d.first(), &d[1..]) else { continue };
                     match *band {
                         1 => {
-                            out.append(data);
+                            if let Err(e) = out.append(data) {
+                                fatal = Some(e);
+                                break 'stream;
+                            }
                             hold.extend_from_slice(data);
                             if hold.len() > ds {
                                 let n = hold.len() - ds;
@@ -1064,7 +1068,7 @@ async fn resume_drain<'a>(
             u32::try_from(n).unwrap_or(0),
             cs.lo.and_then(|v| u64::try_from(v).ok()).unwrap_or(u64::MAX),
             cs.hi.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
-        );
+        )?;
     }
     // re-attempt parked entries rather than trusting the cursor's base ids: a base
     // may have resolved since the cursor saved (crash slices lose wake bookkeeping)

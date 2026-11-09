@@ -31,12 +31,16 @@ fn room_target(len: usize, cap: usize, part: usize, extra: usize) -> usize {
     need.div_ceil(step).saturating_mul(step)
 }
 
-/// Grow `buf` for `extra` incoming bytes in whole-part steps.
-pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) {
+/// Grow `buf` for `extra` incoming bytes in whole-part steps. The growth
+/// is fallible (`try_reserve_exact`): a block the allocator cannot place
+/// returns the in-band memory Limit, and the caller's write that follows
+/// then fits the capacity without growing.
+pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) -> Result<(), Error> {
     let target = room_target(buf.len(), buf.capacity(), part, extra);
     if target > buf.capacity() {
-        buf.reserve_exact(target.saturating_sub(buf.len()));
+        crate::try_grow::vec_exact(buf, target.saturating_sub(buf.len()))?;
     }
+    Ok(())
 }
 
 /// Per-allocation overhead a growing buffer can add on top of its byte
@@ -68,6 +72,17 @@ pub(crate) fn room_growth(buf: &Vec<u8>, part: usize, extra: usize) -> usize {
 /// rounding and page granularity.
 pub(crate) fn growth_incoming(new_cap: usize) -> usize {
     new_cap.saturating_add(ALLOC_OVERHEAD)
+}
+
+/// The bytes a writer's finish adds to the heap before its last upload,
+/// for a part buffer `part`, a uniform part size and a `ds`-byte trailer:
+/// the trailer's whole-part growth of the buffer (`room_growth`), plus the
+/// split's exact-size head copy when the buffer and the trailer reach a
+/// whole part. The last part is moved out of the buffer, not copied.
+pub(crate) fn finish_growth(part: &Vec<u8>, part_size: usize, ds: usize) -> usize {
+    let grow = room_growth(part, part_size, ds);
+    let split = if part.len().saturating_add(ds) >= part_size { growth_incoming(part_size) } else { 0 };
+    grow.saturating_add(split)
 }
 
 /// Upper bound on `codec::encode_entry`'s appended bytes for `n` input bytes:
@@ -108,12 +123,13 @@ fn seal_charge(budget: &mut ReqBudget, mode: Finish) -> Result<(), (Error, bool)
 /// retains a part-sized-plus allocation for one part of data, and neither
 /// branch holds capacity + a second full-size copy: the transient is the
 /// head's `n` bytes on top of `buf`'s existing capacity.
+/// The head copy is fallible: on failure `buf` is unchanged.
 /// Caller guarantees `n <= buf.len()`.
-pub(crate) fn split_part(buf: &mut Vec<u8>, n: usize) -> Vec<u8> {
-    let head = buf[..n].to_vec();
+pub(crate) fn split_part(buf: &mut Vec<u8>, n: usize) -> Result<Vec<u8>, Error> {
+    let head = crate::try_grow::copy(&buf[..n])?;
     buf.copy_within(n.., 0);
     buf.truncate(buf.len() - n);
-    head
+    Ok(head)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -352,7 +368,8 @@ pub mod codec {
             return Err(Error::Limit("object too large (16 MiB max)".into()));
         }
         let z = bytes.get(hlen..).ok_or_else(|| Error::Storage("truncated entry".into()))?;
-        let mut out = vec![0u8; usize::try_from(size).map_err(|_| Error::Limit("size".into()))?];
+        // the inflate target is the decode's one large block: fallible
+        let mut out = crate::try_grow::zeroed(usize::try_from(size).map_err(|_| Error::Limit("size".into()))?)?;
         let (status, used, n) = gix_zlib::Inflate::default()
             .once(z, &mut out)
             .map_err(|e| Error::Storage(format!("inflate: {e}")))?;
@@ -434,6 +451,9 @@ impl Bucket {
         budget: &mut ReqBudget,
     ) -> Result<Vec<u8>, Error> {
         budget.charge(1)?;
+        // the returned body comes from the R2 binding (`bytes()` copies a
+        // JS ArrayBuffer into wasm memory): it cannot reserve fallibly, so
+        // every pass-B caller preflights it through the memory guard
         let obj = self
             .inner
             .get(key)
@@ -458,9 +478,10 @@ impl Bucket {
         budget: &mut ReqBudget,
     ) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
         const MAX_READ: u64 = 48 << 20; // a single call must fit inside the isolate
-        let mut sorted: Vec<&(ObjectId, ObjLoc)> = locs.iter().collect();
+        let mut sorted: Vec<&(ObjectId, ObjLoc)> = crate::try_grow::with_capacity(locs.len())?;
+        sorted.extend(locs.iter());
         sorted.sort_by(|a, b| (&a.1.pack.0, a.1.offset).cmp(&(&b.1.pack.0, b.1.offset)));
-        let (mut out, mut i, mut total) = (Vec::with_capacity(locs.len()), 0usize, 0u64);
+        let (mut out, mut i, mut total) = (crate::try_grow::with_capacity(locs.len())?, 0usize, 0u64);
         while let Some(first) = sorted.get(i) {
             let (start, mut end, mut j) =
                 (first.1.offset, first.1.offset.saturating_add(u64::from(first.1.len)), i + 1);
@@ -490,7 +511,7 @@ impl Bucket {
                 let entry = bytes
                     .get(lo..hi)
                     .ok_or_else(|| Error::Storage(format!("entry outside span in {key}")))?;
-                out.push((e.0, entry.to_vec()));
+                out.push((e.0, crate::try_grow::copy(entry)?));
             }
             i = j;
         }
@@ -585,13 +606,14 @@ impl RawWriter {
         let mpu = bucket.inner.create_multipart_upload(&key).execute().await?;
         Ok(Self { mpu, part: Vec::new(), parts: Vec::new() })
     }
-    pub fn append(&mut self, bytes: &[u8]) {
-        room(&mut self.part, PART, bytes.len());
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        room(&mut self.part, PART, bytes.len())?;
         self.part.extend_from_slice(bytes);
+        Ok(())
     }
     pub async fn flush_if_full(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
         while self.part.len() >= PART {
-            let chunk = split_part(&mut self.part, PART);
+            let chunk = split_part(&mut self.part, PART)?;
             let n = u16::try_from(self.parts.len().saturating_add(1))
                 .map_err(|_| Error::Limit("too many parts".into()))?;
             budget.charge(1)?;
@@ -641,7 +663,7 @@ impl RawWriter {
 pub trait PackOut {
     fn offset(&self) -> u64;
     fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error>;
-    fn raw_extend(&mut self, bytes: &[u8]);
+    fn raw_extend(&mut self, bytes: &[u8]) -> Result<(), Error>;
     fn raw_entry_done(&mut self, kind: Kind, start: u64) -> Result<(u64, u32), Error>;
     /// Capacity bytes `room` would add for `extra` incoming bytes — the
     /// memory guard's preflight size for append paths (0 when it fits).
@@ -721,7 +743,7 @@ impl PackWriter {
     /// Sync; buffers. Returns (offset, len): the `objects` row and the range a reader asks for.
     pub fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error> {
         let start = self.part.len();
-        room(&mut self.part, self.part_size, encoded_bound(data.len()));
+        room(&mut self.part, self.part_size, encoded_bound(data.len()))?;
         codec::encode_entry(kind, data, &mut self.part)?;
         let entry = self.part.get(start..).ok_or_else(|| Error::Internal("part buffer".into()))?;
         let len = u32::try_from(entry.len()).map_err(|_| Error::Limit("entry too long".into()))?;
@@ -751,25 +773,28 @@ impl PackWriter {
     /// GC resume counterpart of `buffered_bytes`: load a persisted tail back into
     /// the buffer. `extra`/`lo`/`hi` fold the tail's already-completed entries back
     /// into the writer's counters (their `ObjRow`s were posted at the yield).
-    pub fn resume_tail(&mut self, bytes: &[u8], extra: u32, lo: u64, hi: u64) {
-        self.offset = self
+    pub fn resume_tail(&mut self, bytes: &[u8], extra: u32, lo: u64, hi: u64) -> Result<(), Error> {
+        let offset = self
             .offset
             .saturating_sub(self.part.len() as u64)
             .saturating_add(bytes.len() as u64);
         self.part.clear();
-        room(&mut self.part, self.part_size, bytes.len());
+        room(&mut self.part, self.part_size, bytes.len())?;
         self.part.extend_from_slice(bytes);
+        self.offset = offset;
         self.count = self.count.saturating_add(extra);
         self.commit_lo = self.commit_lo.min(lo);
         self.commit_hi = self.commit_hi.max(hi);
+        Ok(())
     }
     /// Append raw pack bytes verbatim: any chunk of an entry's `varint header + zlib
     /// body`, exactly as it appeared in the source pack. The caller ends each logical
     /// entry with `raw_entry_done` — checkpoints and index rows must never split one.
-    pub fn raw_extend(&mut self, bytes: &[u8]) {
-        room(&mut self.part, self.part_size, bytes.len());
+    pub fn raw_extend(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        room(&mut self.part, self.part_size, bytes.len())?;
         self.part.extend_from_slice(bytes);
         self.offset = self.offset.saturating_add(bytes.len() as u64);
+        Ok(())
     }
     /// Seal an entry appended via `raw_extend`; `start` was `offset()` before its first
     /// chunk. Returns (offset, len) for the index row — same contract as append_entry.
@@ -786,7 +811,7 @@ impl PackWriter {
     /// Uploads whole uniform parts while the buffer holds that much.
     pub async fn flush_if_full(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
         while self.part.len() >= self.part_size {
-            let chunk = split_part(&mut self.part, self.part_size);
+            let chunk = split_part(&mut self.part, self.part_size)?;
             let n = u16::try_from(self.parts.len().saturating_add(1))
                 .map_err(|_| Error::Limit("too many parts".into()))?;
             budget.charge(1)?;
@@ -794,6 +819,12 @@ impl PackWriter {
             self.parts.push(self.mpu.upload_part(n, chunk).await?);
         }
         Ok(())
+    }
+    /// The memory guard's preflight for `finish` (see `finish_growth`).
+    /// The edge push runs it before finish, while it can still abort the
+    /// upload cleanly; the growth itself is also fallible.
+    pub fn finish_bound(&self) -> usize {
+        finish_growth(&self.part, self.part_size, self.kind.len_in_bytes())
     }
     /// Trailer, last part, complete. When this returns the pack is durable: section 3 step 1.
     pub async fn finish(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
@@ -857,7 +888,9 @@ impl PackWriter {
             h.update(&self.part);
             h.fin()
         };
-        room(&mut self.part, self.part_size, trailer.len());
+        // fallible: a failed trailer growth or split returns the in-band
+        // Limit, and the caller's finish path decides abort vs keep
+        room(&mut self.part, self.part_size, trailer.len())?;
         self.part.extend_from_slice(&trailer);
         self.flush_if_full(budget).await?;
         if !self.part.is_empty() {
@@ -884,7 +917,7 @@ impl PackWriter {
     pub fn append_stored(&mut self, entry: &[u8]) -> Result<(u64, u32), Error> {
         let (kind, _size, _hlen) = codec::entry_header(entry)?;
         let len = u32::try_from(entry.len()).map_err(|_| Error::Limit("entry too long".into()))?;
-        room(&mut self.part, self.part_size, entry.len());
+        room(&mut self.part, self.part_size, entry.len())?;
         self.part.extend_from_slice(entry);
         let offset = self.offset;
         self.offset = offset.saturating_add(u64::from(len));
@@ -909,7 +942,7 @@ impl PackWriter {
         if self.part.len() < self.part_size {
             return Ok(None);
         }
-        let chunk = split_part(&mut self.part, self.part_size);
+        let chunk = split_part(&mut self.part, self.part_size)?;
         let n = u16::try_from(self.parts.len().saturating_add(1))
             .map_err(|_| Error::Limit("too many parts".into()))?;
         budget.charge(1)?;
@@ -1041,7 +1074,7 @@ impl PackOut for PackWriter {
     fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error> {
         self.append_entry(kind, data)
     }
-    fn raw_extend(&mut self, bytes: &[u8]) {
+    fn raw_extend(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.raw_extend(bytes)
     }
     fn raw_entry_done(&mut self, kind: Kind, start: u64) -> Result<(u64, u32), Error> {
@@ -1729,7 +1762,7 @@ mod tests {
         buf.reserve_exact(64); // the part buffer's spare capacity
         let mut flat = Vec::new();
         while buf.len() >= 8 {
-            let head = split_part(&mut buf, 8);
+            let head = split_part(&mut buf, 8).unwrap();
             assert_eq!(head.len(), head.capacity(), "uploaded chunk is exact-size");
             flat.extend_from_slice(&head);
         }
@@ -1748,14 +1781,14 @@ mod tests {
         // tail (15) > head (8): head exact-size, tail keeps the buffer
         let mut buf: Vec<u8> = (0..23u8).collect();
         let cap = buf.capacity();
-        let head = split_part(&mut buf, 8);
+        let head = split_part(&mut buf, 8).unwrap();
         assert_eq!(head, (0..8u8).collect::<Vec<_>>());
         assert_eq!(head.len(), head.capacity(), "head copy is exact-size");
         assert_eq!(buf.as_slice(), &(8..23u8).collect::<Vec<_>>()[..]);
         assert_eq!(buf.capacity(), cap, "tail keeps the part buffer");
         // tail (2) <= head (8): same form — head exact-size, tail tight
         let mut buf: Vec<u8> = (0..10u8).collect();
-        let head = split_part(&mut buf, 8);
+        let head = split_part(&mut buf, 8).unwrap();
         assert_eq!(head, (0..8u8).collect::<Vec<_>>());
         assert_eq!(head.len(), head.capacity(), "head is exact-size, never the donor's spare");
         assert_eq!(buf.as_slice(), &[8u8, 9]);
@@ -1815,12 +1848,12 @@ mod tests {
     #[test]
     fn room_bounds_capacity_to_part_multiple() {
         let mut buf = vec![0u8; 16];
-        room(&mut buf, 8, 1); // need 17 -> target 24, doubling would give 32
+        room(&mut buf, 8, 1).unwrap(); // need 17 -> target 24, doubling would give 32
         assert!(buf.capacity() >= 17 && buf.capacity() < 32, "cap={}", buf.capacity());
         let mut buf = Vec::new();
-        room(&mut buf, 8, 3); // small need -> one whole part
+        room(&mut buf, 8, 3).unwrap(); // small need -> one whole part
         assert!(buf.capacity() >= 3 && buf.capacity() <= 16, "cap={}", buf.capacity());
-        room(&mut buf, 8, 5); // need 5 still fits the reserved part -> no regrow
+        room(&mut buf, 8, 5).unwrap(); // need 5 still fits the reserved part -> no regrow
         assert!(buf.capacity() <= 16, "cap={}", buf.capacity());
     }
 
@@ -1862,7 +1895,7 @@ mod tests {
         // the bound covers the new block room really allocates; the old
         // block is already in the live reading the guard adds this to
         let want = room_growth(&buf, 8 * MIB, 1);
-        room(&mut buf, 8 * MIB, 1);
+        room(&mut buf, 8 * MIB, 1).unwrap();
         assert!(buf.capacity() <= want, "new block {} > bound {want}", buf.capacity());
         assert!(want < cap + buf.capacity(), "the old block must not be counted twice");
         // a fit allocates nothing and preflights nothing
@@ -1877,6 +1910,55 @@ mod tests {
     /// cap: 16 MiB of incompressible bytes is deflate's worst case, and a
     /// bound that lands short lets `room` under-reserve so `extend` falls
     /// back to Vec's doubling — a part-buffer spike the guard can't see.
+    /// Codex r8 #4: the finish path's growth. An 8 MiB buffer holding just
+    /// under one part grows to 16 MiB for a 20-byte trailer, then splits
+    /// one 8 MiB part off. The bound names both blocks. A tail that stays
+    /// under one part with the trailer needs neither.
+    #[test]
+    fn finish_growth_counts_trailer_growth_and_split() {
+        const MIB: usize = 1 << 20;
+        let mut part: Vec<u8> = Vec::with_capacity(8 * MIB);
+        part.resize(8 * MIB - 1, 0);
+        assert_eq!(part.capacity(), 8 * MIB);
+        assert_eq!(
+            finish_growth(&part, 8 * MIB, 20),
+            growth_incoming(16 * MIB) + growth_incoming(8 * MIB)
+        );
+        // the real finish allocations stay inside the bound
+        let want = finish_growth(&part, 8 * MIB, 20);
+        room(&mut part, 8 * MIB, 20).unwrap();
+        part.extend_from_slice(&[1u8; 20]);
+        let grown = part.capacity();
+        let head = split_part(&mut part, 8 * MIB).unwrap();
+        assert!(grown + head.capacity() <= want, "{} > {want}", grown + head.capacity());
+        // a small tail: the trailer fits the capacity and no split runs
+        let mut small: Vec<u8> = Vec::with_capacity(8 * MIB);
+        small.resize(MIB, 0);
+        assert_eq!(finish_growth(&small, 8 * MIB, 20), 0);
+        // exactly one part with the trailer: no growth, one split
+        let mut exact: Vec<u8> = Vec::with_capacity(8 * MIB);
+        exact.resize(8 * MIB - 20, 0);
+        assert_eq!(finish_growth(&exact, 8 * MIB, 20), growth_incoming(8 * MIB));
+    }
+
+    /// The writer's growth and split fail in-band, never panic, when the
+    /// allocator refuses the block — and leave the buffer as it was.
+    #[test]
+    fn writer_growth_and_split_fail_in_band() {
+        let mut part: Vec<u8> = vec![7u8; 100];
+        crate::try_grow::fail_above(Some(150));
+        let grow = room(&mut part, 64, 100);
+        crate::try_grow::fail_above(Some(10));
+        let split_refused = split_part(&mut part, 50);
+        crate::try_grow::fail_above(Some(150));
+        let split = split_part(&mut part, 99);
+        crate::try_grow::fail_above(None);
+        assert!(crate::try_grow::is_retry(&grow.unwrap_err()), "a 256-byte block over a 150-byte cap");
+        assert!(crate::try_grow::is_retry(&split_refused.unwrap_err()));
+        assert_eq!(split.unwrap().len(), 99, "a 99-byte head fits the cap, the refused split left all 100 bytes");
+        assert_eq!(part, vec![7u8; 1]);
+    }
+
     #[test]
     fn encoded_bound_covers_incompressible_max_obj() {
         let mut data = vec![0u8; MAX_OBJECT as usize];

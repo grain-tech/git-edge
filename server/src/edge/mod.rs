@@ -596,7 +596,10 @@ async fn lfs_object(req: Request, env: &Env, _route: &RepoRoute, oid: &str, op: 
                     if n == 0 {
                         break;
                     }
-                    out.append(body.buffered());
+                    if let Err(e) = out.append(body.buffered()) {
+                        err = Some(e);
+                        break;
+                    }
                     body.consume(n);
                     if let Err(e) = out.flush_if_full(&mut budget).await {
                         err = Some(e);
@@ -848,7 +851,10 @@ async fn import_stage(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
                 if n == 0 {
                     break;
                 }
-                out.append(body.buffered());
+                if let Err(e) = out.append(body.buffered()) {
+                    err = Some(e);
+                    break;
+                }
                 body.consume(n);
                 total = total.saturating_add(n as u64);
                 if let Err(e) = out.flush_if_full(&mut budget).await {

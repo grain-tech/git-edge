@@ -320,7 +320,7 @@ async fn stream_inner(
     if body.buffered().get(..ds) != Some(want.as_slice()) {
         return Err(unpack("bad pack checksum"));
     }
-    out.append(want.as_slice());
+    out.append(want.as_slice())?;
     body.consume(ds);
     if body.fill(1).await? {
         return Err(Error::Protocol("bytes after pack trailer".into()));
@@ -337,7 +337,7 @@ async fn take(
 ) -> Result<(), Error> {
     let bytes = body.buffered().get(..n).ok_or_else(|| unpack("pack truncated"))?;
     h.update(bytes);
-    out.append(bytes);
+    out.append(bytes)?;
     body.consume(n);
     out.flush_if_full(budget).await
 }
@@ -1451,7 +1451,8 @@ pub struct MemGuard {
 
 /// The linear-memory trip's wording: the isolate's high-water mark, not
 /// this push's size, is the wall — slicing would not help, a retry will.
-const LINEAR_PRESSURE_MSG: &str = "server under memory pressure; retry in a minute";
+/// The same words a failed fallible reservation answers with.
+const LINEAR_PRESSURE_MSG: &str = crate::try_grow::MEM_RETRY_MSG;
 /// The alone-case wording for a pressure trip: the push's aggregate heap is
 /// what needs slicing.
 const MEM_PRESSURE_MSG: &str =
@@ -1971,7 +1972,7 @@ pub async fn one_entry<O: PackOut>(
         codec::encode_entry(kind, &data, &mut enc)?;
         let tail = usize::try_from(skip.min(enc.len() as u64)).map_err(internal)?;
         let start = out.offset().saturating_sub(tail as u64);
-        out.raw_extend(&enc[tail..]);
+        out.raw_extend(&enc[tail..])?;
         out.raw_entry_done(kind, start)?
     };
     // each flush splits one tight part_size chunk held across the upload —
@@ -2030,7 +2031,7 @@ async fn stream_blob<O: PackOut>(
     {
         let s = usize::try_from(skip.min(hdr.len() as u64)).map_err(internal)?;
         cx.mem_grow(out.growth_bound(hdr.len() - s) + STREAM_SLACK, None, "grow:blob-hdr")?;
-        out.raw_extend(&hdr[s..]);
+        out.raw_extend(&hdr[s..])?;
         skip -= s as u64;
     }
     cx.mem_grow((1 << 20) + STREAM_SLACK, None, "grow:blob-sinkbuf")?;
@@ -2067,7 +2068,7 @@ async fn stream_blob<O: PackOut>(
         }
         let s = usize::try_from(skip.min(chunk.len() as u64)).map_err(internal)?;
         cx.mem_grow(out.growth_bound(chunk.len() - s) + STREAM_SLACK, None, "grow:blob-raw")?;
-        out.raw_extend(&chunk[s..]);
+        out.raw_extend(&chunk[s..])?;
         skip -= s as u64;
         cx.mem_grow(out.chunk_bound() + STREAM_SLACK, None, "grow:blob-flush")?;
         out.flush_if_full(budget).await?;
@@ -2850,14 +2851,15 @@ mod tests {
         }
         fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error> {
             let start = self.buf.len();
-            crate::store::room(&mut self.buf, crate::store::PART, crate::store::encoded_bound(data.len()));
+            crate::store::room(&mut self.buf, crate::store::PART, crate::store::encoded_bound(data.len()))?;
             codec::encode_entry(kind, data, &mut self.buf)?;
             let len = u32::try_from(self.buf.len() - start).map_err(|_| Error::Limit("entry too long".into()))?;
             Ok((start as u64, len))
         }
-        fn raw_extend(&mut self, bytes: &[u8]) {
-            crate::store::room(&mut self.buf, crate::store::PART, bytes.len());
+        fn raw_extend(&mut self, bytes: &[u8]) -> Result<(), Error> {
+            crate::store::room(&mut self.buf, crate::store::PART, bytes.len())?;
             self.buf.extend_from_slice(bytes);
+            Ok(())
         }
         fn raw_entry_done(&mut self, _kind: Kind, start: u64) -> Result<(u64, u32), Error> {
             let len = u32::try_from(self.buf.len() as u64 - start).map_err(|_| Error::Limit("entry too long".into()))?;

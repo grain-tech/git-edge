@@ -193,6 +193,13 @@ pub async fn run(
     };
     drop(entries);
     drop(external);
+    // finish grows the part buffer for the trailer and splits one part off
+    // it: preflight both while the upload can still abort cleanly (the
+    // growth itself is fallible too, and finish aborts on its failure)
+    if let Err(e) = super::ingest::mem_preflight(budget.lease.as_ref(), out.finish_bound(), "grow:writer-finish") {
+        out.abort().await;
+        return Err(e);
+    }
     let meta = out.finish(budget).await?; // section 3 (1): pack durable in R2
     // the tail rows' serialization is pass-B memory too: preflight the
     // largest post before any body is built
