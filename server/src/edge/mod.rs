@@ -1911,4 +1911,31 @@ mod tests {
             pr.buf.len()
         );
     }
+
+    /// An unterminated receive header is refused at the cap and the error
+    /// propagates — a caller that swallows header_push's error would spin
+    /// forever on the unconsumed chunk, so the run is bounded by a timeout.
+    #[test]
+    fn receive_header_refuses_an_oversized_header_and_stops() {
+        let line = b"0035shallow 0000000000000000000000000000000000000000\n";
+        let mut stream = Vec::new();
+        while stream.len() <= CMD_CAP {
+            stream.extend_from_slice(line);
+        }
+        let chunks: Vec<Vec<u8>> = stream.chunks(FILL_STEP).map(|c| c.to_vec()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BodyReader::from_chunks(chunks, None);
+            let _ = tx.send(block_on(receive_header(&mut reader)));
+        });
+        let err = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("receive_header completed an oversized header"),
+            Err(_) => panic!("receive_header did not stop after a refused push"),
+        };
+        assert!(
+            matches!(&err, Error::Protocol(m) if m == "receive header > 1 MiB"),
+            "{err}"
+        );
+    }
 }
