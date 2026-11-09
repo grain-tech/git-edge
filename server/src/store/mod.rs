@@ -45,27 +45,29 @@ pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) {
 /// three for a single allocation.
 pub(crate) const ALLOC_OVERHEAD: usize = 64 << 10;
 
-/// The PEAK bytes `room` can need for `extra` incoming bytes — the memory
-/// guard's preflight size for append paths. 0 when the need already fits
-/// (no allocation). Otherwise `reserve_exact` may move the buffer: the new
-/// block is allocated in full before the old one is freed, so the peak is
-/// old capacity + new capacity + ALLOC_OVERHEAD, not the net delta. The
-/// guard compares this against live and linear memory, which already
-/// count the old block, so it over-counts by the old block when the
-/// realloc happens in place. That is the safe side.
+/// The bytes `room` adds to the heap for `extra` incoming bytes — the
+/// memory guard's preflight size for append paths. 0 when the need
+/// already fits (no allocation). Otherwise the bound is the new block plus
+/// ALLOC_OVERHEAD (see `growth_incoming`): the old block is already inside
+/// the live and linear readings the guard adds this to.
 pub(crate) fn room_growth(buf: &Vec<u8>, part: usize, extra: usize) -> usize {
     let cap = buf.capacity();
     let target = room_target(buf.len(), cap, part, extra);
     if target <= cap {
         return 0;
     }
-    moving_peak(cap, target)
+    growth_incoming(target)
 }
 
-/// Bytes a moving reallocation from `old_cap` to `new_cap` bytes holds at
-/// its peak: both blocks plus one allocation's overhead.
-pub(crate) fn moving_peak(old_cap: usize, new_cap: usize) -> usize {
-    old_cap.saturating_add(new_cap).saturating_add(ALLOC_OVERHEAD)
+/// The incoming bytes a growth to `new_cap` bytes adds on top of what the
+/// guard already reads. A moving reallocation holds the old and the new
+/// block at once, but the old block is already counted in live bytes and
+/// sits inside linear memory, so the peak is live + new_cap. On the linear
+/// side the worst case is the same: the new block needs at most new_cap
+/// bytes of fresh pages. One ALLOC_OVERHEAD covers the allocator's header,
+/// rounding and page granularity.
+pub(crate) fn growth_incoming(new_cap: usize) -> usize {
+    new_cap.saturating_add(ALLOC_OVERHEAD)
 }
 
 /// Upper bound on `codec::encode_entry`'s appended bytes for `n` input bytes:
@@ -1844,28 +1846,31 @@ mod tests {
         assert_eq!(fresh.used, 2, "the seal charges exactly one subrequest");
     }
 
-    /// Codex #3 / Claude #5: the preflight is the moving-realloc PEAK. A
-    /// retained 16 MiB buffer growing to 24 MiB allocates the full 24 MiB
-    /// before freeing the old 16 MiB, so the bound is 40 MiB plus
-    /// overhead — not the 8 MiB net delta.
+    /// Claude r8 #1: the preflight is the NEW block. A retained 16 MiB
+    /// buffer growing to 24 MiB allocates the full 24 MiB before it frees
+    /// the old 16 MiB, so the bound is 24 MiB plus overhead — not the
+    /// 8 MiB net delta. The old 16 MiB is already in the live reading, so
+    /// counting it again would reject growth that fits.
     #[test]
-    fn room_growth_counts_the_moving_peak() {
+    fn room_growth_counts_only_the_new_block() {
         const MIB: usize = 1 << 20;
         let mut buf: Vec<u8> = vec![0; 16 * MIB];
         let cap = buf.capacity();
         // need 16 MiB + 1 -> target 24 MiB in 8 MiB parts
         assert_eq!(room_target(buf.len(), cap, 8 * MIB, 1), 24 * MIB);
-        assert_eq!(room_growth(&buf, 8 * MIB, 1), cap + 24 * MIB + ALLOC_OVERHEAD);
-        // the bound covers what room really allocates
+        assert_eq!(room_growth(&buf, 8 * MIB, 1), 24 * MIB + ALLOC_OVERHEAD);
+        // the bound covers the new block room really allocates; the old
+        // block is already in the live reading the guard adds this to
         let want = room_growth(&buf, 8 * MIB, 1);
         room(&mut buf, 8 * MIB, 1);
-        assert!(cap + buf.capacity() <= want, "peak {} > bound {want}", cap + buf.capacity());
+        assert!(buf.capacity() <= want, "new block {} > bound {want}", buf.capacity());
+        assert!(want < cap + buf.capacity(), "the old block must not be counted twice");
         // a fit allocates nothing and preflights nothing
         buf.truncate(MIB);
         assert_eq!(room_growth(&buf, 8 * MIB, MIB), 0);
         // an empty buffer pays its first part plus overhead only
         assert_eq!(room_growth(&Vec::new(), 8 * MIB, 3), 8 * MIB + ALLOC_OVERHEAD);
-        assert_eq!(moving_peak(5, 7), 12 + ALLOC_OVERHEAD);
+        assert_eq!(growth_incoming(7), 7 + ALLOC_OVERHEAD);
     }
 
     /// encoded_bound stays above the encoder's real output at the object

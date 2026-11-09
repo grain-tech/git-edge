@@ -64,8 +64,8 @@ fn pass_a_presize(count: u32, declared_len: Option<u64>) -> usize {
     claim.min(by_body).min(PRESIZE_RECORDS)
 }
 
-/// The next capacity for a full entry table and the moving peak that
-/// growth holds: double (at least PRESIZE_RECORDS), never past `bound`
+/// The next capacity for a full entry table and the incoming bytes that
+/// growth adds (the new block, see `growth_incoming`): double (at least PRESIZE_RECORDS), never past `bound`
 /// (the header's claim, capped at MAX_ENTRIES). None while there is room
 /// or nothing more may be reserved.
 fn entries_growth(len: usize, cap: usize, bound: usize) -> Option<(usize, usize)> {
@@ -74,11 +74,11 @@ fn entries_growth(len: usize, cap: usize, bound: usize) -> Option<(usize, usize)
     }
     let target = cap.saturating_mul(2).max(PRESIZE_RECORDS).min(bound);
     let elem = std::mem::size_of::<EntryRec>();
-    Some((target, crate::store::moving_peak(cap.saturating_mul(elem), target.saturating_mul(elem))))
+    Some((target, crate::store::growth_incoming(target.saturating_mul(elem))))
 }
 
 /// Grow a full pass-A entry table after `preflight` admits the growth's
-/// moving peak — the doubling is evidenced by entries that really arrived.
+/// incoming bytes — the doubling is evidenced by entries that really arrived.
 fn reserve_entries(
     recs: &mut Vec<EntryRec>,
     bound: usize,
@@ -378,10 +378,10 @@ impl Cache {
     fn get(&self, k: &Key) -> Option<Obj> {
         self.map.get(k).cloned()
     }
-    /// Peak bytes the NEXT `put` can allocate for bookkeeping: a map table
-    /// resize and a queue resize, each holding its old and new block at
-    /// once. 0 when both have room. The payload Vec is already allocated
-    /// by the caller (and its decode was preflighted).
+    /// Incoming bytes the NEXT `put` can allocate for bookkeeping: a new
+    /// map table and a new queue block (the old ones are already in the
+    /// live reading). 0 when both have room. The payload Vec is already
+    /// allocated by the caller (and its decode was preflighted).
     fn put_growth_bound(&self) -> usize {
         map_growth_peak::<(Key, Obj)>(self.map.len(), self.map.capacity())
             .saturating_add(vec_growth_peak::<Key>(self.order.len(), self.order.capacity(), 1))
@@ -813,13 +813,13 @@ impl AnySink<'_, '_> {
         let t = self.tags_mut();
         map_growth_peak::<(ObjectId, ObjectId)>(t.len(), t.capacity())
     }
-    /// Peak bytes `push_links`' extend can need for `adding` more links —
-    /// the memory guard's preflight for the sink-side growth. 0 when the
-    /// links fit the current capacity. Otherwise Vec's amortized growth
-    /// picks max(2 x cap, need), and a moving realloc holds the old and the
-    /// new block at once, so the bound is old + new capacity plus one
-    /// allocation's overhead. The DO job's links spill to SQL in 10k
-    /// batches — bounded, ungated.
+    /// Incoming bytes `push_links`' extend can need for `adding` more
+    /// links — the memory guard's preflight for the sink-side growth. 0
+    /// when the links fit the current capacity. Otherwise Vec's amortized
+    /// growth picks max(2 x cap, need), and the bound is that new block
+    /// plus one allocation's overhead: the old block is already in the
+    /// live reading. The DO job's links spill to SQL in 10k batches —
+    /// bounded, ungated.
     pub fn links_growth_bound(&self, adding: usize) -> usize {
         #[cfg(test)]
         let links = match self {
@@ -1484,22 +1484,22 @@ fn table_bytes<T>(items: usize) -> usize {
     buckets.saturating_mul(std::mem::size_of::<T>().saturating_add(1)).saturating_add(16)
 }
 
-/// Peak bytes one more insert can need in a HashMap of `len` entries and
-/// `cap` capacity: 0 while it has room, else the old table plus a new one
-/// sized for at least cap + 1 entries (hashbrown at least doubles), held
-/// at once while entries move, plus one allocation's overhead.
+/// Incoming bytes one more insert can need in a HashMap of `len` entries
+/// and `cap` capacity: 0 while it has room, else a new table sized for at
+/// least cap + 1 entries (hashbrown at least doubles) plus one
+/// allocation's overhead. The old table is already in the live reading.
 fn map_growth_peak<T>(len: usize, cap: usize) -> usize {
     if len < cap {
         return 0;
     }
     let grown = cap.saturating_add(1).max(len.saturating_add(1)).saturating_mul(2);
-    crate::store::moving_peak(table_bytes::<T>(cap), table_bytes::<T>(grown))
+    crate::store::growth_incoming(table_bytes::<T>(grown))
 }
 
-/// Peak bytes a `Vec<T>` of `len`/`cap` can hold while `extend` grows it
+/// Incoming bytes a `Vec<T>` of `len`/`cap` adds while `extend` grows it
 /// for `adding` more elements: 0 if they fit, else Vec's amortized target
-/// (max(2 x cap, need), at least 4) plus the old block a moving realloc
-/// still holds, plus one allocation's overhead.
+/// (max(2 x cap, need), at least 4) plus one allocation's overhead. The
+/// old block is already in the live reading.
 fn vec_growth_peak<T>(len: usize, cap: usize, adding: usize) -> usize {
     let need = len.saturating_add(adding);
     if need <= cap {
@@ -1507,7 +1507,7 @@ fn vec_growth_peak<T>(len: usize, cap: usize, adding: usize) -> usize {
     }
     let elem = std::mem::size_of::<T>();
     let new_cap = need.max(cap.saturating_mul(2)).max(4);
-    crate::store::moving_peak(cap.saturating_mul(elem), new_cap.saturating_mul(elem))
+    crate::store::growth_incoming(new_cap.saturating_mul(elem))
 }
 
 /// Names the ONE object a decode preflight is about to materialize — rendered
@@ -3446,33 +3446,28 @@ mod tests {
     }
 
     /// id_map_bound covers hashbrown's load-factor + power-of-two rounding.
-    /// Codex #3 / Claude #5: the sink-side links bound is the moving-realloc
-    /// peak. ~16 MiB of links doubling to ~32 MiB holds both blocks at
-    /// once — ~48 MiB — so the preflight must say so, and it must cover
-    /// what extend really allocates.
+    /// Claude r8 #1: the sink-side links bound is the NEW block only.
+    /// ~16 MiB of links doubling to ~32 MiB adds ~32 MiB on top of the
+    /// live reading, which already holds the old 16 MiB. The bound must
+    /// cover what extend really allocates and must not count the old
+    /// block a second time.
     #[test]
-    fn links_growth_bound_counts_the_moving_peak() {
+    fn links_growth_bound_counts_the_new_block() {
         let elem = std::mem::size_of::<ObjectId>();
         let cap = (16 << 20) / elem;
         let mut sink = MemSink { links: vec![ObjectId::null(H::Sha1); cap], ..MemSink::default() };
         let old = sink.links.capacity();
         let want = AnySink::Mem(&mut sink).links_growth_bound(1);
-        assert_eq!(want, old * elem + 2 * old * elem + crate::store::ALLOC_OVERHEAD);
+        assert_eq!(want, 2 * old * elem + crate::store::ALLOC_OVERHEAD);
         sink.links.extend([ObjectId::null(H::Sha1)]);
-        assert!(
-            (old + sink.links.capacity()) * elem <= want,
-            "real peak {} > bound {want}",
-            (old + sink.links.capacity()) * elem
-        );
+        assert!(sink.links.capacity() * elem <= want, "new block {} > bound {want}", sink.links.capacity() * elem);
+        assert!(want < (old + sink.links.capacity()) * elem, "the old block must not be counted twice");
         // links that fit preflight nothing; a big batch grows to the need
         let (len, cap_now) = (sink.links.len(), sink.links.capacity());
         let big = 4 * cap_now;
         let any = AnySink::Mem(&mut sink);
         assert_eq!(any.links_growth_bound(0), 0);
-        assert_eq!(
-            any.links_growth_bound(big),
-            cap_now * elem + (len + big) * elem + crate::store::ALLOC_OVERHEAD
-        );
+        assert_eq!(any.links_growth_bound(big), (len + big) * elem + crate::store::ALLOC_OVERHEAD);
         assert_eq!(vec_growth_peak::<u8>(0, 0, 1), 4 + crate::store::ALLOC_OVERHEAD, "Vec's minimum non-zero capacity");
     }
 
@@ -3520,11 +3515,7 @@ mod tests {
             m.insert(id(i), id(i));
             assert!(m.capacity() > cap, "the insert resized");
             let elem = std::mem::size_of::<(ObjectId, ObjectId)>() + 1;
-            assert!(
-                bound >= (cap + m.capacity()) * elem,
-                "n={n}: bound {bound} < old {cap} + new {} slots",
-                m.capacity()
-            );
+            assert!(bound >= m.capacity() * elem, "n={n}: bound {bound} < new {} slots", m.capacity());
             assert_eq!(map_growth_peak::<(ObjectId, ObjectId)>(m.len(), m.capacity()), 0, "room left: no preflight");
         }
         let mut c = Cache::with_budget(usize::MAX);
@@ -3557,7 +3548,7 @@ mod tests {
     }
 
     /// Growth past the pre-size doubles only once the table is full, stops
-    /// at the claim, and preflights the moving peak before it reserves.
+    /// at the claim, and preflights the new block before it reserves.
     #[test]
     fn pass_a_entries_grow_through_the_preflight() {
         let elem = std::mem::size_of::<EntryRec>();
@@ -3565,7 +3556,7 @@ mod tests {
         assert_eq!(entries_growth(10, 10, 10), None, "the claim is reached");
         assert_eq!(
             entries_growth(PRESIZE_RECORDS, PRESIZE_RECORDS, MAX_ENTRIES),
-            Some((2 * PRESIZE_RECORDS, crate::store::moving_peak(PRESIZE_RECORDS * elem, 2 * PRESIZE_RECORDS * elem)))
+            Some((2 * PRESIZE_RECORDS, crate::store::growth_incoming(2 * PRESIZE_RECORDS * elem)))
         );
         assert_eq!(entries_growth(600_000, 600_000, MAX_ENTRIES).unwrap().0, MAX_ENTRIES, "never past the bound");
         assert_eq!(entries_growth(0, 0, 3).unwrap().0, 3, "a tiny claim reserves only itself");
@@ -3573,7 +3564,6 @@ mod tests {
         let rec = EntryRec { offset: 0, header_len: 1, kind_or_delta: Header::Blob, compressed_len: 0, size: 0 };
         let mut recs = Vec::with_capacity(4);
         recs.resize(recs.capacity(), rec);
-        let cap = recs.capacity();
         let mut seen = None;
         reserve_entries(&mut recs, 1_000_000, |peak| {
             seen = Some(peak);
@@ -3581,7 +3571,7 @@ mod tests {
         })
         .unwrap();
         assert!(recs.capacity() >= PRESIZE_RECORDS);
-        assert_eq!(seen, Some(crate::store::moving_peak(cap * elem, PRESIZE_RECORDS * elem)));
+        assert_eq!(seen, Some(crate::store::growth_incoming(PRESIZE_RECORDS * elem)));
         recs.resize(recs.capacity(), rec);
         let cap = recs.capacity();
         let err = reserve_entries(&mut recs, 1_000_000, |_| Err(Error::Limit("busy".into())));
@@ -3592,6 +3582,37 @@ mod tests {
         let mut recs: Vec<EntryRec> = Vec::new();
         reserve_entries(&mut recs, 5, |peak| mem_preflight(None, peak, "grow:pass-a-entries")).unwrap();
         assert!(sites_of(&preflight_sites()).contains(&"grow:pass-a-entries"));
+    }
+
+    /// Claude r8 #1: the last pass-A doubling, 524,288 -> 750,000 records,
+    /// runs through the REAL guard and the real reserve at realistic
+    /// readings and passes. Live holds the 32 MiB table plus pass A's part
+    /// buffer; linear sits at the high-water mark of the previous growth.
+    /// The new block is ~45.8 MiB. Counting the old 32 MiB block a second
+    /// time (~77.8 MiB incoming) would cross MEM_HARD and reject every push
+    /// of 524,289-750,000 objects with a retry that can never succeed.
+    #[test]
+    fn pass_a_last_doubling_passes_the_real_guard() {
+        const MIB: usize = 1 << 20;
+        let elem = std::mem::size_of::<EntryRec>();
+        let (len, live, linear) = (524_288usize, 42 * MIB, 64 * MIB);
+        let (target, incoming) = entries_growth(len, len, MAX_ENTRIES).unwrap();
+        assert_eq!(target, MAX_ENTRIES);
+        assert_eq!(incoming, MAX_ENTRIES * elem + crate::store::ALLOC_OVERHEAD);
+        assert!(live + len * elem + incoming > MEM_HARD, "the old double count would reject this growth");
+        let rec = EntryRec { offset: 0, header_len: 1, kind_or_delta: Header::Blob, compressed_len: 0, size: 0 };
+        let mut recs = Vec::with_capacity(len);
+        recs.resize(len, rec);
+        assert_eq!(recs.capacity(), len);
+        crate::mem::set_live_override(Some(std::rc::Rc::new(move || live)));
+        crate::mem::set_linear_override(Some(std::rc::Rc::new(move || linear)));
+        clear_preflights();
+        let res = reserve_entries(&mut recs, MAX_ENTRIES, |peak| mem_preflight(None, peak, "grow:pass-a-entries"));
+        crate::mem::set_live_override(None);
+        crate::mem::set_linear_override(None);
+        res.unwrap();
+        assert_eq!(recs.capacity(), MAX_ENTRIES);
+        assert_eq!(preflight_sites(), vec![("grow:pass-a-entries", incoming)]);
     }
 
     #[test]
