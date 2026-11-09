@@ -193,8 +193,8 @@ mod tests {
     /// The amortized gate prices Vec's real doubling, not the bare need.
     #[test]
     fn amortized_gate_prices_the_doubling() {
-        let mut v: Vec<u8> = Vec::with_capacity(100);
-        v.resize(100, 0);
+        let mut v: Vec<u8> = vec![0; 100];
+        assert_eq!(v.capacity(), 100);
         fail_above(Some(150));
         let r = vec(&mut v, 1);
         fail_above(None);

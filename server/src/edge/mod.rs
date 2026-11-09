@@ -76,6 +76,13 @@ impl BodyReader {
         r.declared_len = declared_len;
         Ok(r)
     }
+    /// Test-only: a reader over in-memory chunks, so pass A runs natively.
+    #[cfg(test)]
+    pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>, declared_len: Option<u64>) -> Self {
+        let mut r = Self::wrap(futures_util::stream::iter(chunks.into_iter().map(Ok)));
+        r.declared_len = declared_len;
+        r
+    }
     fn wrap<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Vec<u8>, Error>> + 'static,

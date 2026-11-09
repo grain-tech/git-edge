@@ -656,6 +656,21 @@ impl RawWriter {
     }
 }
 
+/// The raw byte sink pass A streams `pending/` into — `RawWriter` (R2
+/// multipart) in production, an in-memory Vec under tests.
+pub trait RawOut {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Error>;
+    fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> impl std::future::Future<Output = Result<(), Error>> + 'a;
+}
+impl RawOut for RawWriter {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        RawWriter::append(self, bytes)
+    }
+    async fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> Result<(), Error> {
+        RawWriter::flush_if_full(self, budget).await
+    }
+}
+
 /// The output-pack write surface pass B drives — `PackWriter` (R2 multipart)
 /// in production, an in-memory Vec under tests. Only the incremental
 /// append/flush calls the resolve loop makes are shared; finish/abort stay

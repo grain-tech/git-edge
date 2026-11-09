@@ -14,7 +14,7 @@ use worker::{SqlStorage, SqlStorageValue as V};
 
 use crate::edge::BodyReader;
 use crate::error::Error;
-use crate::store::{codec, keys, Bucket, ObjLoc, ObjRow, PackOut, PushId, RawWriter};
+use crate::store::{codec, keys, Bucket, ObjLoc, ObjRow, PackOut, PushId, RawOut, RawWriter};
 use crate::ReqBudget;
 
 use super::run::{receive_packs, INGEST_BUSY_MSG};
@@ -236,9 +236,9 @@ pub async fn stream_to_pending(
     }
 }
 
-async fn stream_inner(
+async fn stream_inner<O: RawOut>(
     body: &mut BodyReader,
-    out: &mut RawWriter,
+    out: &mut O,
     kind: gix_hash::Kind,
     budget: &mut ReqBudget,
 ) -> Result<(Vec<EntryRec>, u32), Error> {
@@ -338,10 +338,10 @@ async fn stream_inner(
     Ok((recs, count))
 }
 
-async fn take(
+async fn take<O: RawOut>(
     body: &mut BodyReader,
     h: &mut gix_hash::Hasher,
-    out: &mut RawWriter,
+    out: &mut O,
     n: usize,
     budget: &mut ReqBudget,
 ) -> Result<(), Error> {
@@ -4044,6 +4044,58 @@ mod tests {
         // production marks: every sink shape flushes at INDEX_POST_BYTES
         let mut plain = MemSink::default();
         assert_eq!(AnySink::Mem(&mut plain).row_bytes(), super::super::run::INDEX_POST_BYTES);
+    }
+
+    /// In-memory raw sink for pass A.
+    struct MemRaw(Vec<u8>);
+    impl RawOut for MemRaw {
+        fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+        async fn flush_if_full<'a>(&'a mut self, _budget: &'a mut ReqBudget) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Pass A's real loop grows its entry table through the guard: a pack
+    /// of PRESIZE_RECORDS + 1 entries fills the pre-size, so the next
+    /// entry's growth records grow:pass-a-entries — deleting the
+    /// reserve_entries call fails this test. A refused reservation is the
+    /// in-band retry Limit.
+    #[test]
+    fn pass_a_loop_records_entry_table_growth() {
+        let n = PRESIZE_RECORDS + 1;
+        let mut enc = Vec::new();
+        codec::encode_entry(Kind::Blob, b"", &mut enc).unwrap();
+        let mut pack = gix_pack::data::header::encode(gix_pack::data::Version::V2, n as u32).to_vec();
+        for _ in 0..n {
+            pack.extend_from_slice(&enc);
+        }
+        let mut h = gix_hash::hasher(H::Sha1);
+        h.update(&pack);
+        pack.extend_from_slice(h.try_finalize().unwrap().as_slice());
+        let run = |pack: &Vec<u8>| {
+            let mut body = BodyReader::from_chunks(pack.chunks(1 << 16).map(<[u8]>::to_vec).collect(), Some(pack.len() as u64));
+            let mut out = MemRaw(Vec::new());
+            let mut budget = test_budget();
+            let r = block_on(stream_inner(&mut body, &mut out, H::Sha1, &mut budget));
+            (r, out.0)
+        };
+        let _calm = calm_heap();
+        clear_preflights();
+        let (r, raw) = run(&pack);
+        let (recs, count) = r.unwrap();
+        assert_eq!((recs.len(), count as usize), (n, n));
+        assert_eq!(raw, pack, "pass A streams the body through verbatim");
+        let grows: Vec<_> = preflight_sites().into_iter().filter(|(s, _)| *s == "grow:pass-a-entries").collect();
+        let elem = std::mem::size_of::<EntryRec>();
+        assert_eq!(grows, vec![("grow:pass-a-entries", crate::store::growth_incoming(n * elem))]);
+        // the growth's block refused: in-band, no panic
+        crate::try_grow::fail_above(Some(PRESIZE_RECORDS * elem));
+        let (r, _) = run(&pack);
+        crate::try_grow::fail_above(None);
+        assert!(matches!(&r, Err(e) if crate::try_grow::is_retry(e)));
     }
 
     #[test]
