@@ -613,43 +613,42 @@ async fn pack_get(req: &Request, env: &Env, _route: &RepoRoute, name: &str, spen
 }
 
 /// The lfs_batch gate as a seam: `auth` settles before `body` is invoked —
-/// a failed auth returns its error and the body reader never runs.
-async fn auth_then_body<S, T, A, B, FB>(auth: A, body: B) -> Result<T, Error>
+/// a failed auth returns its error and the body reader never runs. The
+/// auth output comes back with the body so the caller can act on what the
+/// resolution granted.
+async fn auth_then_body<S, T, A, B, FB>(auth: A, body: B) -> Result<(S, T), Error>
 where
     A: Future<Output = Result<S, Error>>,
     B: FnOnce() -> FB,
     FB: Future<Output = Result<T, Error>>,
 {
-    auth.await?;
-    body().await
+    let s = auth.await?;
+    let t = body().await?;
+    Ok((s, t))
 }
 
 /// POST /:owner/:repo/info/lfs/objects/batch — Git LFS batch API (#21, basic
 /// transfer). The operation picks the auth level: download needs read, upload
 /// needs write. The DO does existence checks + mints the signed `/_lfs/` URLs.
 async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
-    // authenticate at the minimum level before the body is read — the
-    // required level depends on `operation`, known only after parsing.
-    // An upload re-checks at Write below. Credentials come out
-    // synchronously so the auth future holds no borrow on `req`.
+    // one resolution before the body is read — the granted level decides
+    // download-vs-upload after `operation` parses, with no second DO call.
+    // Credentials come out synchronously so the resolve future holds no
+    // borrow on `req`.
     let creds = auth::credentials(&req);
-    let body = auth_then_body(
-        auth::authenticate_with(creds, env, Level::Read, route, spend),
+    let (grant, body) = auth_then_body(
+        auth::resolve(creds, env, route, spend),
         || request_body_bytes(&mut req, 1_048_576, "lfs batch body too large"),
     )
     .await?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("lfs batch: {e}")))?;
-    match v.get("operation").and_then(|o| o.as_str()) {
-        Some("download") => {}
-        Some("upload") => {
-            // a second DO call: authenticate_with settles only the
-            // principal, not the resolved grant, so Write is re-checked
-            // against the DO rather than inferred from the Read pass
-            auth::authenticate(&req, env, Level::Write, route, spend).await?;
-        }
+    let need = match v.get("operation").and_then(|o| o.as_str()) {
+        Some("download") => Level::Read,
+        Some("upload") => Level::Write,
         _ => return Err(Error::Protocol("lfs operation must be download or upload".into())),
-    }
+    };
+    auth::admit(grant, need)?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let base = req.url().ok().map(|u| u.origin().ascii_serialization());
     let mut resp = stub_raw(&stub, route, "/_do/lfs/batch", body, &mut budget, base.as_deref()).await?;
@@ -1537,7 +1536,7 @@ mod tests {
 
         let order = Rc::new(std::cell::RefCell::new(Vec::new()));
         let (a, b) = (Rc::clone(&order), Rc::clone(&order));
-        let out = block_on(auth_then_body(
+        let (_, out) = block_on(auth_then_body(
             async move {
                 a.borrow_mut().push("auth");
                 Ok::<(), Error>(())
