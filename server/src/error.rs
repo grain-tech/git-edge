@@ -165,7 +165,11 @@ impl Error {
             Error::NotFound => 404,
             Error::Gone => 410,
             Error::Conflict(_) => 409,
-            Error::Budget | Error::Limit(_) => 413,
+            Error::Budget => 413,
+            // the memory-pressure Limit is transient — a client that waits
+            // and retries can succeed, so it is a 503, not a permanent 413
+            Error::Limit(_) if crate::try_grow::is_retry(self) => 503,
+            Error::Limit(_) => 413,
             Error::RateLimit(_) => 429,
             Error::Busy(_) => 503,
             Error::Unpack(_) | Error::Storage(_) | Error::Internal(_) => 500,
@@ -214,9 +218,26 @@ pub fn respond(r: Result<Response, Error>, git_pkt: bool, subreqs: u32) -> worke
             }
             if let Error::RateLimit(secs) | Error::Busy(secs) = e {
                 resp.headers_mut().set("Retry-After", &secs.max(1).to_string()).ok();
+            } else if crate::try_grow::is_retry(&e) {
+                resp.headers_mut().set("Retry-After", "60").ok();
             }
             stamp_subrequests(&mut resp, subreqs);
             Ok(resp.with_status(status))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The memory-pressure Limit is transient: 503, not the permanent 413
+    /// every other Limit/Budget keeps.
+    #[test]
+    fn retry_memory_limit_maps_to_503_other_limits_to_413() {
+        assert_eq!(Error::Limit(crate::try_grow::MEM_RETRY_MSG.into()).status(), 503);
+        assert_eq!(Error::Limit("pack too big".into()).status(), 413);
+        assert_eq!(Error::Budget.status(), 413);
+        assert_eq!(Error::Busy(5).status(), 503);
     }
 }

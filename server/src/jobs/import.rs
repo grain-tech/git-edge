@@ -1709,4 +1709,13 @@ mod tests {
         assert!(!dead_upload(&Error::Unpack("missing base aa".into())));
         assert!(!dead_upload(&Error::Budget));
     }
+    /// The "treat as temporary" rule: the memory-pressure Limit retries the
+    /// slice; every other Protocol/Limit still rejects the push for good.
+    #[test]
+    fn deterministic_leaves_the_retry_limit_to_the_slice() {
+        assert!(!super::deterministic(&Error::Limit(crate::try_grow::MEM_RETRY_MSG.into())), "the retry Limit is transient");
+        assert!(super::deterministic(&Error::Limit("pack too big".into())), "a real Limit still rejects");
+        assert!(super::deterministic(&Error::Protocol("bad ref".into())), "protocol errors still reject");
+        assert!(!super::deterministic(&Error::Storage("r2 blip".into())), "transport errors were never deterministic");
+    }
 }

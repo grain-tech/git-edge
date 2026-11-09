@@ -89,6 +89,7 @@ pub(crate) fn take_asks() -> Vec<Ask> {
 /// thread. Hold it for the test's whole scope; arm the hooks after
 /// creating it.
 #[cfg(test)]
+#[must_use]
 pub(crate) struct HookGuard;
 
 #[cfg(test)]

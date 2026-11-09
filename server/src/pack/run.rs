@@ -1155,6 +1155,9 @@ mod tests {
     #[test]
     fn collect_bases_refuses_when_its_reservation_fails() {
         let _guard = crate::try_grow::HookGuard;
+        // pin the live reading: parallel tests share the real tally, and an
+        // unpinned heap could trip the preflight before the targeted hook
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 1 << 20)));
         let entries = ref_delta_entries();
         let site = guarded_site("crate::try_grow::with_capacity(n_bases)");
         crate::try_grow::fail_only_at(Some(site));
