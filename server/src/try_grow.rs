@@ -277,4 +277,33 @@ mod tests {
         let r = vec(&mut v, 1);
         assert!(is_retry(&r.unwrap_err()), "101 bytes fit 150 but the doubled 200-byte block does not");
     }
+
+    /// A need equal to the capacity already fits: Ok without the gate.
+    #[test]
+    fn exact_fit_never_asks_the_gate() {
+        let _guard = HookGuard;
+        log_asks();
+        fail_above(Some(0));
+
+        let mut v: Vec<u8> = Vec::with_capacity(64);
+        v.extend_from_slice(&[0u8; 10]);
+        let add = v.capacity() - v.len();
+        assert!(vec_exact(&mut v, add).is_ok());
+
+        let mut m: HashMap<u64, u64> = HashMap::with_capacity(8);
+        for i in 0..4u64 {
+            m.insert(i, i);
+        }
+        let add = m.capacity() - m.len();
+        assert!(map(&mut m, add).is_ok());
+
+        let mut q: VecDeque<u64> = VecDeque::with_capacity(8);
+        for i in 0..4u64 {
+            q.push_back(i);
+        }
+        let add = q.capacity() - q.len();
+        assert!(deque(&mut q, add).is_ok());
+
+        assert!(take_asks().is_empty(), "an exact fit must not reach the gate");
+    }
 }
