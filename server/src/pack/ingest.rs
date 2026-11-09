@@ -700,11 +700,13 @@ impl AnySink<'_, '_> {
             AnySink::Mem(s) => &mut s.tags,
         }
     }
-    /// Capacity bytes `push_links`' extend would add for `adding` more
-    /// links — the memory guard's preflight for the sink-side doubling.
-    /// Vec growth keeps post-extend capacity under ~2x the needed length;
-    /// the delta vs current capacity is what realloc actually moves. The
-    /// DO job's links spill to SQL in 10k batches — bounded, ungated.
+    /// Peak bytes `push_links`' extend can need for `adding` more links —
+    /// the memory guard's preflight for the sink-side growth. 0 when the
+    /// links fit the current capacity. Otherwise Vec's amortized growth
+    /// picks max(2 x cap, need), and a moving realloc holds the old and the
+    /// new block at once, so the bound is old + new capacity plus one
+    /// allocation's overhead. The DO job's links spill to SQL in 10k
+    /// batches — bounded, ungated.
     pub fn links_growth_bound(&self, adding: usize) -> usize {
         #[cfg(test)]
         let links = match self {
@@ -717,9 +719,7 @@ impl AnySink<'_, '_> {
             AnySink::Edge(s) => &s.links,
             AnySink::Job(_) => return 0,
         };
-        let need = links.len().saturating_add(adding);
-        let new_cap_elems = need.saturating_mul(2).saturating_sub(links.capacity());
-        new_cap_elems.saturating_mul(std::mem::size_of::<ObjectId>()).saturating_add(STREAM_SLACK)
+        vec_growth_peak::<ObjectId>(links.len(), links.capacity(), adding)
     }
     /// Total links seen — the A5 bound applies to both shapes.
     pub fn links_total(&self) -> usize {
@@ -1341,6 +1341,20 @@ const DECODE_SCRATCH: usize = 512 << 10;
 /// state, Vec capacity rounding past `room`'s whole-part target, the
 /// UploadedPart bookkeeping, and request plumbing the byte terms don't name.
 const STREAM_SLACK: usize = 1 << 20;
+
+/// Peak bytes a `Vec<T>` of `len`/`cap` can hold while `extend` grows it
+/// for `adding` more elements: 0 if they fit, else Vec's amortized target
+/// (max(2 x cap, need), at least 4) plus the old block a moving realloc
+/// still holds, plus one allocation's overhead.
+fn vec_growth_peak<T>(len: usize, cap: usize, adding: usize) -> usize {
+    let need = len.saturating_add(adding);
+    if need <= cap {
+        return 0;
+    }
+    let elem = std::mem::size_of::<T>();
+    let new_cap = need.max(cap.saturating_mul(2)).max(4);
+    crate::store::moving_peak(cap.saturating_mul(elem), new_cap.saturating_mul(elem))
+}
 
 /// Names the ONE object a decode preflight is about to materialize — rendered
 /// into the alone-case Limit only when the object's own bound is the wall
@@ -3015,6 +3029,36 @@ mod tests {
     }
 
     /// id_map_bound covers hashbrown's load-factor + power-of-two rounding.
+    /// Codex #3 / Claude #5: the sink-side links bound is the moving-realloc
+    /// peak. ~16 MiB of links doubling to ~32 MiB holds both blocks at
+    /// once — ~48 MiB — so the preflight must say so, and it must cover
+    /// what extend really allocates.
+    #[test]
+    fn links_growth_bound_counts_the_moving_peak() {
+        let elem = std::mem::size_of::<ObjectId>();
+        let cap = (16 << 20) / elem;
+        let mut sink = MemSink { links: vec![ObjectId::null(H::Sha1); cap], ..MemSink::default() };
+        let old = sink.links.capacity();
+        let want = AnySink::Mem(&mut sink).links_growth_bound(1);
+        assert_eq!(want, old * elem + 2 * old * elem + crate::store::ALLOC_OVERHEAD);
+        sink.links.extend([ObjectId::null(H::Sha1)]);
+        assert!(
+            (old + sink.links.capacity()) * elem <= want,
+            "real peak {} > bound {want}",
+            (old + sink.links.capacity()) * elem
+        );
+        // links that fit preflight nothing; a big batch grows to the need
+        let (len, cap_now) = (sink.links.len(), sink.links.capacity());
+        let big = 4 * cap_now;
+        let any = AnySink::Mem(&mut sink);
+        assert_eq!(any.links_growth_bound(0), 0);
+        assert_eq!(
+            any.links_growth_bound(big),
+            cap_now * elem + (len + big) * elem + crate::store::ALLOC_OVERHEAD
+        );
+        assert_eq!(vec_growth_peak::<u8>(0, 0, 1), 4 + crate::store::ALLOC_OVERHEAD, "Vec's minimum non-zero capacity");
+    }
+
     #[test]
     fn id_map_bound_covers_load_factor() {
         let b = id_map_bound(1_000);

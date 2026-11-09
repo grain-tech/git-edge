@@ -39,12 +39,33 @@ pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) {
     }
 }
 
-/// The capacity bytes `room` would add for `extra` incoming bytes — the
-/// memory guard's preflight size for append paths (0 when it already fits).
-/// reserve_exact can round up past `target` by allocator slack; callers add
-/// their own flat slack for encoder/stream state.
+/// Per-allocation overhead a growing buffer can add on top of its byte
+/// capacity: the allocator's chunk header and alignment rounding, and
+/// `memory.grow` handing out whole 64 KiB wasm pages. One page covers all
+/// three for a single allocation.
+pub(crate) const ALLOC_OVERHEAD: usize = 64 << 10;
+
+/// The PEAK bytes `room` can need for `extra` incoming bytes — the memory
+/// guard's preflight size for append paths. 0 when the need already fits
+/// (no allocation). Otherwise `reserve_exact` may move the buffer: the new
+/// block is allocated in full before the old one is freed, so the peak is
+/// old capacity + new capacity + ALLOC_OVERHEAD, not the net delta. The
+/// guard compares this against live and linear memory, which already
+/// count the old block, so it over-counts by the old block when the
+/// realloc happens in place. That is the safe side.
 pub(crate) fn room_growth(buf: &Vec<u8>, part: usize, extra: usize) -> usize {
-    room_target(buf.len(), buf.capacity(), part, extra).saturating_sub(buf.capacity())
+    let cap = buf.capacity();
+    let target = room_target(buf.len(), cap, part, extra);
+    if target <= cap {
+        return 0;
+    }
+    moving_peak(cap, target)
+}
+
+/// Bytes a moving reallocation from `old_cap` to `new_cap` bytes holds at
+/// its peak: both blocks plus one allocation's overhead.
+pub(crate) fn moving_peak(old_cap: usize, new_cap: usize) -> usize {
+    old_cap.saturating_add(new_cap).saturating_add(ALLOC_OVERHEAD)
 }
 
 /// Upper bound on `codec::encode_entry`'s appended bytes for `n` input bytes:
@@ -1780,6 +1801,30 @@ mod tests {
         assert!(buf.capacity() >= 3 && buf.capacity() <= 16, "cap={}", buf.capacity());
         room(&mut buf, 8, 5); // need 5 still fits the reserved part -> no regrow
         assert!(buf.capacity() <= 16, "cap={}", buf.capacity());
+    }
+
+    /// Codex #3 / Claude #5: the preflight is the moving-realloc PEAK. A
+    /// retained 16 MiB buffer growing to 24 MiB allocates the full 24 MiB
+    /// before freeing the old 16 MiB, so the bound is 40 MiB plus
+    /// overhead — not the 8 MiB net delta.
+    #[test]
+    fn room_growth_counts_the_moving_peak() {
+        const MIB: usize = 1 << 20;
+        let mut buf: Vec<u8> = vec![0; 16 * MIB];
+        let cap = buf.capacity();
+        // need 16 MiB + 1 -> target 24 MiB in 8 MiB parts
+        assert_eq!(room_target(buf.len(), cap, 8 * MIB, 1), 24 * MIB);
+        assert_eq!(room_growth(&buf, 8 * MIB, 1), cap + 24 * MIB + ALLOC_OVERHEAD);
+        // the bound covers what room really allocates
+        let want = room_growth(&buf, 8 * MIB, 1);
+        room(&mut buf, 8 * MIB, 1);
+        assert!(cap + buf.capacity() <= want, "peak {} > bound {want}", cap + buf.capacity());
+        // a fit allocates nothing and preflights nothing
+        buf.truncate(MIB);
+        assert_eq!(room_growth(&buf, 8 * MIB, MIB), 0);
+        // an empty buffer pays its first part plus overhead only
+        assert_eq!(room_growth(&Vec::new(), 8 * MIB, 3), 8 * MIB + ALLOC_OVERHEAD);
+        assert_eq!(moving_peak(5, 7), 12 + ALLOC_OVERHEAD);
     }
 
     /// encoded_bound stays above the encoder's real output at the object
