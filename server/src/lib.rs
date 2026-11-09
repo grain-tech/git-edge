@@ -5,6 +5,7 @@ pub mod auth;
 pub mod edge;
 pub mod error;
 pub mod jobs;
+pub mod mem;
 pub mod pack;
 pub mod platform;
 pub mod remote;

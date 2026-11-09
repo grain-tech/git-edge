@@ -14,6 +14,28 @@ use crate::wire::http::{stub_json, RepoRoute};
 use crate::ReqBudget;
 
 pub(crate) const MAX_LINKS: usize = 1_000_000; // A5
+/// Rows per /_do/push/index POST. The DO accepts up to 10,000, but a smaller
+/// batch keeps each serialized body (and its JS-heap copy) small inside the
+/// isolate's memory budget — the edge posts these mid-push, where a 10k-row
+/// body was the last big allocation before the memory guard tripped.
+const INDEX_BATCH: usize = 2_500;
+
+/// The /_do/push/index body, borrowed — serializes rows straight from the
+/// slice instead of building a serde_json::Value tree per row.
+#[derive(serde::Serialize)]
+struct IndexPost<'a> {
+    pack: IndexPack<'a>,
+    rows: &'a [ObjRow],
+}
+#[derive(Clone, Copy, serde::Serialize)]
+struct IndexPack<'a> {
+    id: &'a str,
+    push_id: &'a str,
+    count: u32,
+    bytes: u64,
+    commit_lo: i64,
+    commit_hi: u64,
+}
 
 fn unpack(m: impl Into<String>) -> Error {
     Error::Unpack(m.into())
@@ -149,11 +171,31 @@ impl IndexSink<'_> {
         }
         const SAFE_MAX: i64 = (1 << 53) - 1;
         let commit_lo = i64::try_from(meta.commit_lo).unwrap_or(SAFE_MAX).min(SAFE_MAX);
-        let body = serde_json::json!({
-            "pack": { "id": self.pack.0, "push_id": self.push.0, "count": meta.count, "bytes": meta.bytes,
-                      "commit_lo": commit_lo, "commit_hi": meta.commit_hi },
-            "rows": rows,
-        });
+        let pack = IndexPack {
+            id: &self.pack.0,
+            push_id: &self.push.0,
+            count: meta.count,
+            bytes: meta.bytes,
+            commit_lo,
+            commit_hi: meta.commit_hi,
+        };
+        // chunk the rows: an empty post still goes out once — it plants the
+        // 'ingesting' packs row the whole two-phase ordering depends on
+        if rows.is_empty() {
+            return self.post_rows(&pack, &[], budget).await;
+        }
+        for chunk in rows.chunks(INDEX_BATCH) {
+            self.post_rows(&pack, chunk, budget).await?;
+        }
+        Ok(())
+    }
+    async fn post_rows(
+        &self,
+        pack: &IndexPack<'_>,
+        rows: &[ObjRow],
+        budget: &mut ReqBudget,
+    ) -> Result<(), Error> {
+        let body = IndexPost { pack: *pack, rows };
         let _: serde_json::Value =
             stub_json(self.stub, self.repo, "/_do/push/index", &body, budget).await?;
         Ok(())
@@ -180,4 +222,42 @@ pub async fn lookup(
         return Err(Error::Internal("lookup length".into()));
     }
     Ok(ids.iter().copied().zip(res.locs).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gix_object::Kind;
+
+    fn row(i: u32) -> ObjRow {
+        ObjRow {
+            sha: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
+            idx: i,
+            offset: u64::from(i) * 10,
+            len: 100 + i,
+            kind: Kind::Blob,
+            size: 55,
+            parents: None,
+        }
+    }
+
+    /// The borrowed IndexPost must serialize to exactly the body the DO's
+    /// IndexDto deserializes — same shape the old json! Value tree produced.
+    #[test]
+    fn index_post_matches_do_json_shape() {
+        let pack = IndexPack { id: "p1", push_id: "pu", count: 3, bytes: 999, commit_lo: 5, commit_hi: 9 };
+        let rows = [row(0), row(1)];
+        let got = serde_json::to_value(IndexPost { pack, rows: &rows }).unwrap();
+        let want = serde_json::json!({
+            "pack": { "id": "p1", "push_id": "pu", "count": 3, "bytes": 999,
+                      "commit_lo": 5, "commit_hi": 9 },
+            "rows": rows,
+        });
+        assert_eq!(got, want);
+        // rows serialize through ObjRow's own impl: parents omitted when
+        // None (the DO reads it as default)
+        assert!(got["rows"][0].get("parents").is_none());
+        assert_eq!(got["rows"][0]["kind"], 3); // Blob -> git_kind
+        assert!(INDEX_BATCH <= 10_000, "DO push_index caps at 10,000 rows");
+    }
 }

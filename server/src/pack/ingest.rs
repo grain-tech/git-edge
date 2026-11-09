@@ -30,8 +30,8 @@ pub struct EntryRec {
 }
 
 // EntryRec is ~48 B (offset + Header enum + two lengths + u64 size): the record vec
-// alone must leave room for Cache (48 MiB) + window + part buffer inside a 128 MiB
-// isolate — 750k records ≈ 36 MiB keeps the worst-case sum comfortably under it
+// alone must leave room for Cache (24 MiB edge budget) + window + part buffer inside
+// a 128 MiB isolate — 750k records ≈ 36 MiB keeps the worst-case sum under it
 const MAX_ENTRIES: usize = 750_000;
 pub const MAX_OBJ: u64 = 16 << 20; // A7
 /// A8: ceiling on a streamed blob's *decompressed* size, checked from the header in
@@ -48,7 +48,18 @@ pub const MAX_ENTRY_WIRE: u64 = 32 << 20;
 const MAX_CHAIN_LIVE: u64 = 128 << 20;
 const MAX_PENDING: u64 = 2 << 30; // 2 GiB compressed ceiling on one pushed pack
 const WINDOW: u64 = 8 << 20;
-const CACHE: usize = 48 << 20; // 16 MiB resolved LRU + 32 MiB external bases as one cache
+/// Default resolved-object cache budget — the in-DO import path keeps it. The
+/// edge push path runs tighter (EDGE_CACHE): one request must also hold the
+/// entry table, the window, and a part buffer inside a 128 MiB isolate.
+const CACHE: usize = 48 << 20;
+const EDGE_CACHE: usize = 24 << 20;
+/// Pass-B memory guard (edge path): wasm linear memory is a hard ~128 MiB
+/// ceiling and an over-budget allocation aborts inside the futures queue —
+/// the request then hangs instead of answering. At each entry boundary the
+/// guard sheds the object cache past MEM_SOFT; still above MEM_HARD it fails
+/// with an in-band Limit the client can act on (smaller slices).
+const MEM_SOFT: usize = 80 << 20;
+const MEM_HARD: usize = 96 << 20;
 const MAX_DEPTH: usize = 64; // git's default delta depth is 50
 const MAX_CHAIN_BYTES: u64 = 64 << 20; // chain holds raw compressed delta bodies
 /// Rows per push_links INSERT; it keeps one statement at <= 90 bound params,
@@ -212,27 +223,49 @@ enum Key {
 }
 type Obj = (Kind, Rc<Vec<u8>>);
 
-#[derive(Default)]
 pub struct Cache {
     bytes: usize,
+    budget: usize,
     map: HashMap<Key, Obj>,
     order: VecDeque<Key>,
 }
+impl Default for Cache {
+    fn default() -> Self {
+        Self::with_budget(CACHE)
+    }
+}
 impl Cache {
+    pub fn with_budget(budget: usize) -> Self {
+        Self { bytes: 0, budget, map: HashMap::new(), order: VecDeque::new() }
+    }
     fn get(&self, k: &Key) -> Option<Obj> {
         self.map.get(k).cloned()
     }
-    fn put(&mut self, k: Key, kind: Kind, d: Rc<Vec<u8>>) -> Obj {
-        self.bytes = self.bytes.saturating_add(d.len());
+    /// Cache one decoded object. The Vec is shrink_to_fit'd first so its
+    /// capacity stops doubling past the payload, and `bytes` accounts
+    /// `capacity()` — the allocator's real footprint, not just `len()`.
+    fn put(&mut self, k: Key, kind: Kind, mut d: Vec<u8>) -> Obj {
+        d.shrink_to_fit();
+        let d = Rc::new(d);
+        self.bytes = self.bytes.saturating_add(d.capacity());
         self.order.push_back(k);
-        self.map.insert(k, (kind, d.clone()));
-        while self.bytes > CACHE {
+        if let Some((_, old)) = self.map.insert(k, (kind, d.clone())) {
+            self.bytes = self.bytes.saturating_sub(old.capacity());
+        }
+        while self.bytes > self.budget {
             match self.order.pop_front().and_then(|k| self.map.remove(&k)) {
-                Some((_, v)) => self.bytes = self.bytes.saturating_sub(v.len()),
+                Some((_, v)) => self.bytes = self.bytes.saturating_sub(v.capacity()),
                 None => break,
             }
         }
         (kind, d)
+    }
+    /// Drop every cached object — resolved entries re-resolve lazily from the
+    /// pending pack, so this is always safe, only slower.
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
     }
 }
 
@@ -692,7 +725,7 @@ pub async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> 
         .pop()
         .ok_or_else(|| Error::Storage("base read".into()))?;
     let (k, d) = codec::decode_entry(&entry)?;
-    Ok(cx.cache.put(Key::Id(id), k, Rc::new(d)))
+    Ok(cx.cache.put(Key::Id(id), k, d))
 }
 
 /// Resolve a ref-delta base id: resolved in-pack entry -> chain walk; repo base -> read;
@@ -781,16 +814,34 @@ pub async fn resolve_at(
                     return Err(unpack("delta base exceeds 16 MiB and cannot be resolved"));
                 }
                 let (k, d) = decode_mini(&mut cx.z, None, &raw, cx.obj_kind)?;
-                break cx.cache.put(Key::Off(off), k, Rc::new(d));
+                break cx.cache.put(Key::Off(off), k, d);
             }
         }
     };
     while let Some((o, raw)) = chain.pop() {
         let (_, d) = decode_mini(&mut cx.z, Some((kind, &data)), &raw, cx.obj_kind)?;
-        data = cx.cache.put(Key::Off(o), kind, Rc::new(d)).1;
+        data = cx.cache.put(Key::Off(o), kind, d).1;
     }
     cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
     Ok(Base::Ready((kind, data)))
+}
+
+/// Pass-B memory guard, run at each entry boundary of the edge resolve loop.
+/// `live` reads the counting allocator's live bytes; clearing the cache is the
+/// soft relief (resolved objects re-resolve lazily), and only a reading still
+/// above MEM_HARD after the clear earns the client an in-band Limit — a push
+/// this size cannot finish inside one request and smaller slices will.
+fn mem_guard(cache: &mut Cache, live: impl Fn() -> usize) -> Result<(), Error> {
+    if live() <= MEM_SOFT {
+        return Ok(());
+    }
+    cache.clear();
+    if live() > MEM_HARD {
+        return Err(Error::Limit(
+            "push needs more memory than one request allows; push it in smaller slices".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// `sink` posts `/_do/push/index` in 10,000-row batches and collects links (2.5).
@@ -816,7 +867,7 @@ pub async fn resolve_and_normalize(
     });
     let mut cx = Cx {
         win: Window { bucket, src: Source::Key(pending_key), pack_len, start: 0, buf: Vec::new() },
-        cache: Cache::default(),
+        cache: Cache::with_budget(EDGE_CACHE),
         z: Inflate::default(),
         by_id: IdMap::Map(HashMap::new()),
         externals,
@@ -845,7 +896,7 @@ pub async fn resolve_and_normalize(
     if let Ok(entries) = bucket.read_entries(&pre, budget).await {
         for (id, entry) in entries {
             let (k, d) = codec::decode_entry(&entry)?;
-            cx.cache.put(Key::Id(id), k, Rc::new(d));
+            cx.cache.put(Key::Id(id), k, d);
         }
     }
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
@@ -858,6 +909,7 @@ pub async fn resolve_and_normalize(
     let mut order: Vec<usize> = (0..entries.len()).collect();
     let mut i = 0;
     while i < order.len() {
+        mem_guard(&mut cx.cache, crate::mem::live_bytes)?;
         let at = order[i];
         i += 1;
         match one_entry(&mut cx, &toc, at, need_ids, out, &mut sink, &mut rows, budget, 0).await? {
@@ -978,7 +1030,7 @@ pub async fn one_entry(
     if need_ids {
         cx.by_id.insert(id, i);
     }
-    cx.cache.put(Key::Off(rec.offset), kind, Rc::new(data));
+    cx.cache.put(Key::Off(rec.offset), kind, data);
     if rows.len() >= 10_000 {
         sink.post(rows, budget).await?;
         rows.clear();
@@ -1120,5 +1172,38 @@ mod tests {
         let (q, args) = links_insert("push", &chunk);
         assert!(args.len() <= 90);
         assert_eq!(q.matches("(?,?)").count(), LINKS_CHUNK);
+    }
+
+    #[test]
+    fn cache_accounts_capacity_and_evicts_lru() {
+        let mut c = Cache::with_budget(100);
+        c.put(Key::Off(1), Kind::Blob, vec![7u8; 60]);
+        c.put(Key::Off(2), Kind::Blob, vec![9u8; 60]);
+        // second put overflowed the budget: the oldest entry was evicted
+        assert!(c.get(&Key::Off(1)).is_none());
+        assert!(c.get(&Key::Off(2)).is_some());
+        // bytes tracks the Vec's capacity(), not its len()
+        let cap = c.map.get(&Key::Off(2)).unwrap().1.capacity();
+        assert_eq!(c.bytes, cap);
+        c.clear();
+        assert_eq!(c.bytes, 0);
+        assert!(c.get(&Key::Off(2)).is_none());
+    }
+
+    #[test]
+    fn mem_guard_soft_clears_hard_limits() {
+        // under the soft ceiling: untouched
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        mem_guard(&mut c, || MEM_SOFT).unwrap();
+        assert!(c.get(&Key::Off(1)).is_some());
+        // past soft but under hard after the clear: cache shed, push continues
+        mem_guard(&mut c, || MEM_SOFT + 1).unwrap();
+        assert!(c.get(&Key::Off(1)).is_none());
+        // still above hard after the clear: typed Limit, actionable message
+        let mut c = Cache::default();
+        let err = mem_guard(&mut c, || MEM_HARD + 1).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(err.message().contains("smaller slices"), "{err}");
     }
 }

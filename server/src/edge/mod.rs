@@ -124,6 +124,14 @@ impl BodyReader {
 
 /// The one public entry point (lib.rs #[event(fetch)]).
 pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
+    // wasm-bindgen-futures never settles the request promise after a panic —
+    // the runtime then cancels the invocation as "hung". Log the panic message
+    // (never request data) so the console shows the real cause. wasm-only:
+    // native test builds keep the default hook.
+    #[cfg(target_arch = "wasm32")]
+    std::panic::set_hook(Box::new(|info| {
+        worker::console_error!("git-edge panic: {info}");
+    }));
     let started = platform::now_ms();
     // Request-wide subrequest tally: every ReqBudget the request creates reports
     // into it, so respond() stamps x-ge-subrequests even on error paths where the
