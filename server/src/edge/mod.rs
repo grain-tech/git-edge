@@ -1807,6 +1807,43 @@ mod tests {
         assert_eq!(body, payload);
     }
 
+    /// The line of the try_grow call that ends `snippet`, found in this
+    /// file's production code — ingest.rs's guarded_site twin, so a test
+    /// names a guarded site by its code, not by a line number.
+    fn guarded_site(snippet: &str) -> (&'static str, u32) {
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests module")];
+        let hits: Vec<usize> = prod.match_indices(snippet).map(|(i, _)| i).collect();
+        assert_eq!(hits.len(), 1, "snippet must name one site: {snippet:?}");
+        let end = hits[0] + snippet.len();
+        (file!(), u32::try_from(prod[..end].matches('\n').count() + 1).unwrap())
+    }
+
+    /// A sub-FILL_STEP EOF tail taking a cap-sized body over the cap is refused.
+    #[test]
+    fn upload_body_tail_crossing_the_cap_is_refused() {
+        let mut chunks: Vec<Vec<u8>> = (0..16).map(|_| vec![0u8; FILL_STEP]).collect();
+        chunks.push(vec![0u8; 100]);
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+    }
+
+    /// The in-loop reserve refused at its own site is the in-band retry Limit.
+    #[test]
+    fn upload_body_refused_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let site = guarded_site("        crate::try_grow::vec(&mut body, reader.buffered().len())?;");
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(0));
+        let mut reader = BodyReader::from_chunks(vec![vec![0u8; FILL_STEP]], None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+    }
+
     /// The header accumulator refuses BEFORE the push that would take it
     /// over the cap: pr.buf stays at or under CMD_CAP.
     #[test]
