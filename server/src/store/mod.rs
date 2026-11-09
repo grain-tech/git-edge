@@ -482,17 +482,6 @@ pub struct Bucket {
     pub inner: worker::Bucket,
     pub repo: RepoId,
 }
-/// The fallible core every JS→Rust body copy shares: `len` bytes are
-/// reserved exactly once through try_grow — a refusal is the in-band
-/// memory Limit, never the infallible `vec![0; len]` worker's `bytes()`
-/// does internally — zeroed, then `fill` writes them. Native-testable
-/// through the fail hook.
-pub(crate) fn js_body(len: usize, fill: impl FnOnce(&mut [u8]) -> Result<(), Error>) -> Result<Vec<u8>, Error> {
-    let mut v = crate::try_grow::zeroed(len)?;
-    fill(v.as_mut_slice())?;
-    Ok(v)
-}
-
 /// One body chunk the exact-fill core copies from: a JS Uint8Array in
 /// production, a byte slice in native tests.
 pub(crate) trait BodyChunk {
@@ -2245,30 +2234,6 @@ mod tests {
         assert!(ready(fill_exact(0, s)).unwrap().is_empty());
         let (s, _) = probe(vec![vec![1u8]]);
         assert!(matches!(ready(fill_exact(0, s)), Err(Error::Storage(_))));
-    }
-
-    /// js_body reserves `len` through try_grow BEFORE fill runs: the
-    /// fail hook's refusal is the in-band Limit and fill never executes;
-    /// a fitting reservation returns the filled bytes.
-    #[test]
-    fn js_body_reserves_fallibly_then_fills() {
-        let _guard = crate::try_grow::HookGuard;
-        crate::try_grow::fail_above(Some(8));
-        let mut filled = false;
-        let err = js_body(16, |_| {
-            filled = true;
-            Ok(())
-        })
-        .unwrap_err();
-        crate::try_grow::fail_above(None);
-        assert!(crate::try_grow::is_retry(&err), "{err}");
-        assert!(!filled, "fill must not run on a refused reservation");
-        let v = js_body(4, |b| {
-            b.copy_from_slice(&[1, 2, 3, 4]);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(v, vec![1, 2, 3, 4]);
     }
 
     /// resume_tail_apply reserves the cleared buffer's room BEFORE

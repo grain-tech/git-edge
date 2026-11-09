@@ -25,24 +25,53 @@ use crate::{ReqBudget, Spend};
 const CMD_CAP: usize = 1 << 20; // section 6.3: command section cap
 const FILL_STEP: usize = 64 << 10; // 6.3: fill in 64 KiB steps
 
+/// The one size check every capped request body shares — the declared
+/// Content-Length and each streamed chunk's running total. Over-cap is
+/// the caller's Protocol wording; the check itself allocates nothing.
+fn check_body_len(len: usize, cap: usize, too_big: &'static str) -> Result<(), Error> {
+    if len > cap {
+        return Err(Error::Protocol(too_big.into()));
+    }
+    Ok(())
+}
+
+/// One streamed chunk into `body` under `cap`: the length check runs
+/// before the chunk's fallible reservation, so an over-cap body never
+/// reaches try_grow.
+fn body_push(body: &mut Vec<u8>, chunk: &[u8], cap: usize, too_big: &'static str) -> Result<(), Error> {
+    check_body_len(body.len().saturating_add(chunk.len()), cap, too_big)?;
+    crate::try_grow::vec(body, chunk.len())?;
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// `Request::bytes()` without worker's infallible `vec![0; len]` inside
-/// `Uint8Array::to_vec()`: array_buffer() -> one Uint8Array -> a single
-/// fallible reservation + copy_to. A refused reservation is the in-band
+/// `Uint8Array::to_vec()`, and bounded by `cap`: the declared
+/// Content-Length is checked before a byte is read, and the streamed
+/// length is checked before each chunk's reservation — an over-cap body
+/// never buys a reservation. A refused reservation is the in-band
 /// memory Limit.
-async fn request_body_bytes(req: &Request) -> Result<Vec<u8>, Error> {
-    let p = req
-        .inner()
-        .array_buffer()
-        .map_err(|e| Error::Protocol(format!("body: {e:?}")))?;
-    let v = wasm_bindgen_futures::JsFuture::from(p)
-        .await
-        .map_err(|e| Error::Protocol(format!("body: {e:?}")))?;
-    let a = js_sys::Uint8Array::new(&v);
-    let len = a.length() as usize;
-    crate::store::js_body(len, |buf| {
-        a.copy_to(buf);
-        Ok(())
-    })
+async fn request_body_bytes(req: &mut Request, cap: usize, too_big: &'static str) -> Result<Vec<u8>, Error> {
+    if let Some(n) = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        check_body_len(usize::try_from(n).unwrap_or(usize::MAX), cap, too_big)?;
+    }
+    let mut body = Vec::new();
+    if req.inner().body().is_none() {
+        return Ok(body); // no body — the same empty Vec array_buffer() produced
+    }
+    let mut stream = req.stream().map_err(|e| Error::Protocol(format!("body: {e:?}")))?;
+    use futures_util::StreamExt as _;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| Error::Storage(format!("body stream: {e}")))?;
+        body_push(&mut body, &chunk, cap, too_big)?;
+    }
+    Ok(body)
 }
 
 /// The request body as a chunked byte stream (section 6). gzip is decoded through a
@@ -540,31 +569,21 @@ async fn pack_get(req: &Request, env: &Env, _route: &RepoRoute, name: &str, spen
 /// POST /:owner/:repo/info/lfs/objects/batch — Git LFS batch API (#21, basic
 /// transfer). The operation picks the auth level: download needs read, upload
 /// needs write. The DO does existence checks + mints the signed `/_lfs/` URLs.
-async fn lfs_batch(req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
-    // a batch spec is small JSON (≤100 objects typical) — cap before buffering
-    let too_big = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|n| n > 1_048_576)
-        .unwrap_or(false);
-    if too_big {
-        return Err(Error::Protocol("lfs batch body too large".into()));
-    }
-    let body = request_body_bytes(&req).await?;
-    if body.len() > 1_048_576 {
-        return Err(Error::Protocol("lfs batch body too large".into()));
-    }
+async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    // authenticate at the minimum level before the body is read — the
+    // required level depends on `operation`, known only after parsing.
+    // An upload re-checks at Write below.
+    auth::authenticate(&req, env, Level::Read, route, spend).await?;
+    let body = request_body_bytes(&mut req, 1_048_576, "lfs batch body too large").await?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("lfs batch: {e}")))?;
-    let level = match v.get("operation").and_then(|o| o.as_str()) {
-        Some("download") => Level::Read,
-        Some("upload") => Level::Write,
+    match v.get("operation").and_then(|o| o.as_str()) {
+        Some("download") => {}
+        Some("upload") => {
+            auth::authenticate(&req, env, Level::Write, route, spend).await?;
+        }
         _ => return Err(Error::Protocol("lfs operation must be download or upload".into())),
-    };
-    auth::authenticate(&req, env, level, route, spend).await?;
+    }
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let base = req.url().ok().map(|u| u.origin().ascii_serialization());
     let mut resp = stub_raw(&stub, route, "/_do/lfs/batch", body, &mut budget, base.as_deref()).await?;
@@ -651,25 +670,10 @@ async fn lfs_object(req: Request, env: &Env, _route: &RepoRoute, oid: &str, op: 
 /// POST /:owner/:repo/_admin/tokens {name, level} — mint a per-repo credential.
 /// Global-write-token only (authenticate_admin): a repo-level token must not mint
 /// more credentials. The token value is returned once and only its hash is stored.
-async fn token_create(req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+async fn token_create(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
     // {name, level} needs a few hundred bytes; cap before buffering the body whole
-    let too_big = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|n| n > 65_536)
-        .unwrap_or(false);
-    if too_big {
-        return Err(Error::Protocol("token create body too large".into()));
-    }
-    let body = request_body_bytes(&req).await?;
-    if body.len() > 65_536 {
-        // chunked upload had no content-length to check up front
-        return Err(Error::Protocol("token create body too large".into()));
-    }
+    let body = request_body_bytes(&mut req, 65_536, "token create body too large").await?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("token create body: {e}")))?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
@@ -715,21 +719,7 @@ async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str, spe
 
 /// Bounded JSON body for the small _admin payloads (public/pin/unpin).
 async fn json_body(req: &mut Request) -> Result<serde_json::Value, Error> {
-    if let Some(n) = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if n > 4_096 {
-            return Err(Error::Protocol("admin body too large".into()));
-        }
-    }
-    let body = request_body_bytes(req).await?;
-    if body.len() > 4_096 {
-        return Err(Error::Protocol("admin body too large".into()));
-    }
+    let body = request_body_bytes(req, 4_096, "admin body too large").await?;
     serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("admin body: {e}")))
 }
 
@@ -935,21 +925,7 @@ async fn import_stage(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
 /// Bounded body for _admin/import — commands for a many-ref import run to a few
 /// hundred KB, so this gets its own cap rather than json_body's 4 KiB.
 async fn import_body(req: &mut Request) -> Result<serde_json::Value, Error> {
-    if let Some(n) = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if n > (4 << 20) {
-            return Err(Error::Protocol("import body too large".into()));
-        }
-    }
-    let body = request_body_bytes(req).await?;
-    if body.len() > (4 << 20) {
-        return Err(Error::Protocol("import body too large".into()));
-    }
+    let body = request_body_bytes(req, 4 << 20, "import body too large").await?;
     serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("import body: {e}")))
 }
 
@@ -1087,7 +1063,7 @@ async fn import_status(req: &Request, env: &Env, route: &RepoRoute, push: &str, 
 /// auth even runs; on, the routes take the same global-write-token gate as the
 /// other _admin routes and forward verbatim to the DO's /_do/test/* handlers.
 /// fsck is a GET carrying ?mode= — the DO route reads it from a JSON body.
-async fn test_forward(req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
+async fn test_forward(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
     if !crate::testhooks::env_flag(env, "GE_TEST_HOOKS") {
         return Err(Error::NotFound);
     }
@@ -1100,7 +1076,7 @@ async fn test_forward(req: Request, env: &Env, route: &RepoRoute, path: &str, sp
             .unwrap_or_else(|| "refs".into());
         serde_json::to_vec(&serde_json::json!({ "mode": mode })).map_err(|e| Error::Internal(e.to_string()))?
     } else {
-        request_body_bytes(&req).await?
+        request_body_bytes(&mut req, 1 << 20, "test body too large").await?
     };
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let mut resp = stub_raw(&stub, route, path, body, &mut budget, None).await?;
@@ -1430,4 +1406,34 @@ async fn owner_release(env: &Env, route: &RepoRoute) {
         return;
     }
     let _ = stub.fetch_with_request(r).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cap is checked before any reservation: an over-cap chunk is the
+    /// caller's Protocol error and never reaches the try_grow ask log. The
+    /// boundary len == cap is admitted.
+    #[test]
+    fn body_cap_refuses_before_any_reservation() {
+        let _guard = crate::try_grow::HookGuard;
+        let mut body = Vec::new();
+        crate::try_grow::log_asks();
+        let err = body_push(&mut body, &[0u8; 65], 64, "test body too large").unwrap_err();
+        assert!(matches!(&err, Error::Protocol(m) if m == "test body too large"), "{err}");
+        assert!(body.is_empty());
+        assert!(crate::try_grow::take_asks().is_empty(), "the refused chunk must not reach try_grow");
+        // len == cap is admitted
+        body_push(&mut body, &[0u8; 64], 64, "test body too large").unwrap();
+        assert_eq!(body.len(), 64);
+        // one byte over the running total refuses — again with no ask
+        crate::try_grow::log_asks();
+        let err = body_push(&mut body, &[0u8; 1], 64, "test body too large").unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "{err}");
+        assert!(crate::try_grow::take_asks().is_empty());
+        // the declared-length check shares the rule
+        check_body_len(65, 64, "declared too large").unwrap_err();
+        check_body_len(64, 64, "declared too large").unwrap();
+    }
 }
