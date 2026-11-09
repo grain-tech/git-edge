@@ -134,23 +134,32 @@ pub async fn run(
         return Ok((None, HashMap::new()));
     }
     let (entries, _) = super::ingest::stream_to_pending(body, bucket, push, kind, budget).await?;
-    let mut bases: Vec<ObjectId> = entries
-        .iter()
-        .filter_map(|r| match r.kind_or_delta {
-            Header::RefDelta { base_id } => Some(base_id),
-            _ => None,
-        })
-        .collect();
+    // thin-pack bases: count first (no allocation), then preflight and
+    // reserve the id list once
+    let base_of = |r: &super::ingest::EntryRec| match r.kind_or_delta {
+        Header::RefDelta { base_id } => Some(base_id),
+        _ => None,
+    };
+    let n_bases = entries.iter().filter(|r| base_of(r).is_some()).count();
+    super::ingest::mem_preflight(
+        budget.lease.as_ref(),
+        crate::store::growth_incoming(n_bases.saturating_mul(std::mem::size_of::<ObjectId>())),
+        "grow:bases",
+    )?;
+    let mut bases: Vec<ObjectId> = crate::try_grow::with_capacity(n_bases)?;
+    bases.extend(entries.iter().filter_map(base_of));
     bases.sort_unstable();
     bases.dedup();
     let mut external: HashMap<ObjectId, ObjLoc> = HashMap::new();
     for chunk in bases.chunks(1_000) {
-        external.extend(
-            lookup(stub, repo, chunk, None, budget)
-                .await?
-                .into_iter()
-                .filter_map(|(id, l)| Some((id, l?))),
-        );
+        // one lookup's response (<= 1,000 locs) is deserialized from the
+        // DO's JSON; the map's growth for its hits is preflighted and
+        // reserved before the rows move in
+        let found = lookup(stub, repo, chunk, None, budget).await?;
+        let lease = budget.lease.clone();
+        add_externals(&mut external, found, |n| {
+            super::ingest::mem_preflight(lease.as_ref(), n, "grow:externals")
+        })?;
     }
     let pack = PackId::random()?;
     let mut sink = IndexSink { stub, repo, pack: pack.clone(), push: push.clone(), links: Vec::new(), tags: HashMap::new() };
@@ -221,6 +230,21 @@ pub async fn run(
         }
     }
     Ok((Some(pack), std::mem::take(&mut sink.tags))) // section 3 (3) is the caller's commit
+}
+
+/// Move one lookup's hits into the externals map: `preflight` admits the
+/// map's growth for them, then the growth is reserved fallibly before any
+/// row moves in. A refusal leaves the map as it was.
+fn add_externals(
+    external: &mut HashMap<ObjectId, ObjLoc>,
+    found: Vec<(ObjectId, Option<ObjLoc>)>,
+    preflight: impl FnOnce(usize) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let hits = found.iter().filter(|(_, l)| l.is_some()).count();
+    preflight(super::ingest::map_growth_peak::<(ObjectId, ObjLoc)>(external.len(), external.capacity(), hits))?;
+    crate::try_grow::map(external, hits)?;
+    external.extend(found.into_iter().filter_map(|(id, l)| Some((id, l?))));
+    Ok(())
 }
 
 pub struct IndexSink<'a> {
@@ -915,6 +939,39 @@ async fn admit_pass_b(env: &Env, budget: &ReqBudget, objects: usize, pack_bytes:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex r8 #3: the externals map's growth for a lookup's hits is
+    /// preflighted (misses cost nothing) and reserved fallibly; a refusal
+    /// leaves the map as it was.
+    #[test]
+    fn add_externals_preflights_and_reserves_hits() {
+        let loc = |n: u32| ObjLoc { pack: PackId("p".into()), idx: n, offset: 0, len: 1, kind: gix_object::Kind::Blob, size: 1 };
+        let id = |n: u32| {
+            let mut b = [0u8; 20];
+            b[..4].copy_from_slice(&n.to_be_bytes());
+            ObjectId::from_bytes_or_panic(&b)
+        };
+        let found: Vec<_> = (0..1_000u32).map(|n| (id(n), (n % 2 == 0).then(|| loc(n)))).collect();
+        let mut ext = HashMap::new();
+        let mut seen = None;
+        add_externals(&mut ext, found.clone(), |b| {
+            seen = Some(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ext.len(), 500, "misses never enter the map");
+        assert_eq!(seen, Some(super::super::ingest::map_growth_peak::<(ObjectId, ObjLoc)>(0, 0, 500)));
+        assert!(seen.unwrap() > 0);
+        // a refused preflight and a refused reservation change nothing
+        let more: Vec<_> = (1_000..3_000u32).map(|n| (id(n), Some(loc(n)))).collect();
+        let err = add_externals(&mut ext, more.clone(), |_| Err(Error::Limit("busy".into())));
+        assert!(matches!(err, Err(Error::Limit(_))));
+        crate::try_grow::fail_above(Some(1 << 10));
+        let err = add_externals(&mut ext, more, |_| Ok(()));
+        crate::try_grow::fail_above(None);
+        assert!(matches!(&err, Err(e) if crate::try_grow::is_retry(e)));
+        assert_eq!(ext.len(), 500);
+    }
     use gix_object::Kind;
 
     fn row(i: u32) -> ObjRow {

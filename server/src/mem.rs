@@ -102,6 +102,10 @@ pub(crate) fn set_live_override(f: Option<std::rc::Rc<dyn Fn() -> usize>>) {
     LIVE_OVERRIDE.with(|c| *c.borrow_mut() = f);
 }
 #[cfg(test)]
+pub(crate) fn has_live_override() -> bool {
+    LIVE_OVERRIDE.with(|c| c.borrow().is_some())
+}
+#[cfg(test)]
 pub(crate) fn set_linear_override(f: Option<std::rc::Rc<dyn Fn() -> usize>>) {
     LINEAR_OVERRIDE.with(|c| *c.borrow_mut() = f);
 }

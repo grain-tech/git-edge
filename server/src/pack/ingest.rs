@@ -385,7 +385,7 @@ impl Cache {
     /// live reading). 0 when both have room. The payload Vec is already
     /// allocated by the caller (and its decode was preflighted).
     fn put_growth_bound(&self) -> usize {
-        map_growth_peak::<(Key, Obj)>(self.map.len(), self.map.capacity())
+        map_growth_peak::<(Key, Obj)>(self.map.len(), self.map.capacity(), 1)
             .saturating_add(vec_growth_peak::<Key>(self.order.len(), self.order.capacity(), 1))
     }
     /// Cache one decoded object. The Vec is shrink_to_fit'd first so its
@@ -825,7 +825,7 @@ impl AnySink<'_, '_> {
     /// Peak bytes the next tag insert can need — see map_growth_peak.
     pub fn tags_growth_bound(&mut self) -> usize {
         let t = self.tags_mut();
-        map_growth_peak::<(ObjectId, ObjectId)>(t.len(), t.capacity())
+        map_growth_peak::<(ObjectId, ObjectId)>(t.len(), t.capacity(), 1)
     }
     /// Incoming bytes `push_links`' extend can need for `adding` more
     /// links — the memory guard's preflight for the sink-side growth. 0
@@ -1549,16 +1549,18 @@ fn table_bytes<T>(items: usize) -> usize {
     buckets.saturating_mul(std::mem::size_of::<T>().saturating_add(1)).saturating_add(16)
 }
 
-/// Incoming bytes one more insert can need in a HashMap of `len` entries
-/// and `cap` capacity: 0 while it has room, else a new table sized for at
-/// least cap + 1 entries (hashbrown at least doubles) plus one
-/// allocation's overhead. The old table is already in the live reading.
-fn map_growth_peak<T>(len: usize, cap: usize) -> usize {
-    if len < cap {
+/// Incoming bytes `adding` more inserts can need in a HashMap of `len`
+/// entries and `cap` capacity: 0 while they fit, else a new table sized
+/// for at least max(len + adding, cap + 1) entries (hashbrown's resize
+/// target; `table_bytes` rounds it to the power-of-two bucket count) plus
+/// one allocation's overhead. The old table is already in the live
+/// reading.
+pub(crate) fn map_growth_peak<T>(len: usize, cap: usize, adding: usize) -> usize {
+    let need = len.saturating_add(adding);
+    if need <= cap {
         return 0;
     }
-    let grown = cap.saturating_add(1).max(len.saturating_add(1)).saturating_mul(2);
-    crate::store::growth_incoming(table_bytes::<T>(grown))
+    crate::store::growth_incoming(table_bytes::<T>(need.max(cap.saturating_add(1))))
 }
 
 /// Incoming bytes a `Vec<T>` of `len`/`cap` adds while `extend` grows it
@@ -1805,24 +1807,56 @@ fn id_map_bound(n: usize) -> usize {
     slots.saturating_mul(std::mem::size_of::<(ObjectId, usize)>().saturating_add(1))
 }
 
+/// Most thin-pack bases one prefetch batch carries. Each row costs
+/// metadata whatever its payload: the (id, ObjLoc) pair with its cloned
+/// pack id, and read_entries' sort and result slots. Hundreds of
+/// thousands of few-byte bases would otherwise stay under EDGE_CACHE
+/// while their metadata alone filled tens of MiB.
+const PREFETCH_MAX_LOCS: usize = 4_096;
+
+/// Heap bytes one prefetched base's metadata holds: its (id, ObjLoc)
+/// row, the row's cloned pack-id String, and read_entries' per-loc slots
+/// (a sorted reference and an (id, Vec) result pair).
+fn prefetch_meta_bytes(loc: &ObjLoc) -> usize {
+    std::mem::size_of::<(ObjectId, ObjLoc)>()
+        .saturating_add(loc.pack.0.len())
+        .saturating_add(std::mem::size_of::<&ObjLoc>())
+        .saturating_add(std::mem::size_of::<(ObjectId, Vec<u8>)>())
+}
+
 /// The thin-pack bases worth prefetching: each must fit the 16 MiB object
 /// cap — `external()` reports the actionable error for bigger ones, and
-/// `decode_entry` would throw its bare limit first — and the batch's
-/// decompressed bytes (`loc.size`, what `Cache` budgets by `capacity()`)
-/// stay under EDGE_CACHE, so early decodes can't evict entries still queued.
-fn prefetch_locs(bases: &HashMap<ObjectId, ObjLoc>) -> Vec<(ObjectId, ObjLoc)> {
-    let mut out = Vec::new();
-    let mut sum = 0u64;
-    for (id, loc) in bases {
-        if loc.size <= MAX_OBJ {
-            sum = sum.saturating_add(loc.size);
-            if sum > EDGE_CACHE as u64 {
-                break;
-            }
-            out.push((*id, loc.clone()));
+/// `decode_entry` would throw its bare limit first. The batch stops at
+/// PREFETCH_MAX_LOCS rows, and its decompressed bytes (`loc.size`, what
+/// `Cache` budgets by `capacity()`) plus every row's metadata stay under
+/// EDGE_CACHE, so early decodes can't evict entries still queued. The
+/// batch is planned first without allocating; `preflight` then admits the
+/// metadata bytes, and the rows are built in one fallible reservation.
+fn prefetch_locs(
+    bases: &HashMap<ObjectId, ObjLoc>,
+    preflight: impl FnOnce(usize) -> Result<(), Error>,
+) -> Result<Vec<(ObjectId, ObjLoc)>, Error> {
+    let fits = |loc: &&ObjLoc| loc.size <= MAX_OBJ;
+    let (mut n, mut sum, mut meta) = (0usize, 0u64, 0usize);
+    for loc in bases.values().filter(fits) {
+        let m = prefetch_meta_bytes(loc);
+        let next = sum.saturating_add(loc.size).saturating_add(m as u64);
+        if n >= PREFETCH_MAX_LOCS || next > EDGE_CACHE as u64 {
+            break;
         }
+        (n, sum, meta) = (n + 1, next, meta.saturating_add(m));
     }
-    out
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    preflight(meta)?;
+    let mut out = crate::try_grow::with_capacity(n)?;
+    // the same iteration order as the plan: the map is unchanged
+    for (id, loc) in bases.iter().filter(|(_, l)| fits(l)).take(n) {
+        let pack = crate::store::PackId(crate::try_grow::string(&loc.pack.0)?);
+        out.push((*id, ObjLoc { pack, ..*loc }));
+    }
+    Ok(out)
 }
 
 /// `sink` posts `/_do/push/index` in 10,000-row batches and collects links (2.5).
@@ -1856,9 +1890,15 @@ pub async fn resolve_and_normalize<O: PackOut>(
         chain_live: 0,
         mem: Some(MemGuard { cleared_at: None, lease: budget.lease.clone() }),
     };
-    let pre = match &cx.externals {
-        Externals::Map(bases) => prefetch_locs(bases),
-        Externals::Idx(_) => Vec::new(),
+    // plan the batch, preflight its metadata, then build it fallibly —
+    // the batch is opportunistic, so a refusal only skips it
+    let bases = match cx.externals {
+        Externals::Map(bases) => Some(bases),
+        Externals::Idx(_) => None,
+    };
+    let pre = match bases {
+        Some(bases) => prefetch_locs(bases, |meta| cx.mem_grow(meta, None, "grow:prefetch-meta")).unwrap_or_default(),
+        None => Vec::new(),
     };
     // prefetch is opportunistic on both axes: the batch's fetch allocation
     // (entry copies + largest merged span) is preflighted through the same
@@ -2859,14 +2899,19 @@ mod tests {
         assert!(!chain_room(u64::MAX, 0, u64::MAX, EDGE_CHAIN_BYTES));
     }
 
-    /// The prefetch batch is capped at EDGE_CACHE of DECOMPRESSED bytes —
-    /// `loc.size`, what the cache's capacity() accounting sees — so early
-    /// decodes can't evict entries still queued; streamed bases over
-    /// MAX_OBJ are skipped for external() to name. The compressed `len`
-    /// is irrelevant to the cap: a tiny wire can decode to MAX_OBJ each.
+    /// The prefetch batch is capped at EDGE_CACHE of DECOMPRESSED bytes
+    /// plus row metadata — `loc.size` is what the cache's capacity()
+    /// accounting sees — so early decodes can't evict entries still
+    /// queued; streamed bases over MAX_OBJ are skipped for external() to
+    /// name. The compressed `len` is irrelevant to the cap: a tiny wire
+    /// can decode to MAX_OBJ each.
     #[test]
     fn prefetch_locs_caps_at_edge_cache_and_skips_oversized() {
-        let oid = |n: u8| ObjectId::from_hex(format!("{n:02x}").repeat(20).as_bytes()).unwrap();
+        let oid = |n: u32| {
+            let mut b = [0u8; 20];
+            b[..4].copy_from_slice(&n.to_be_bytes());
+            ObjectId::from_bytes_or_panic(&b)
+        };
         let loc = |len: u32, size: u64| ObjLoc {
             pack: crate::store::PackId("p".into()),
             idx: 0,
@@ -2875,24 +2920,69 @@ mod tests {
             kind: Kind::Blob,
             size,
         };
+        let ok = |_: usize| Ok(());
         // three 10 MiB decompressed bases behind 1 KiB wires: whichever
         // order the map yields, the third crosses EDGE_CACHE (10+10+10 >
         // 24) -> exactly two are kept — a len-based sum would keep all
         let mut bases = HashMap::new();
-        for n in 0..3u8 {
+        for n in 0..3 {
             bases.insert(oid(n), loc(1 << 10, 10 << 20));
         }
         // a streamed base over MAX_OBJ never counts toward the sum
         bases.insert(oid(3), loc(1 << 20, MAX_OBJ + 1));
-        let got = prefetch_locs(&bases);
+        let got = prefetch_locs(&bases, ok).unwrap();
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|(_, l)| l.size <= MAX_OBJ));
         assert!(got.iter().map(|(_, l)| l.size).sum::<u64>() <= EDGE_CACHE as u64);
-        // the exact-cap boundary is kept: the check is `>` not `>=`
+        // the exact-cap boundary counts metadata too and is kept: the
+        // check is `>` not `>=`
+        let meta = prefetch_meta_bytes(&loc(0, 0)) as u64;
+        let half = EDGE_CACHE as u64 / 2 - meta;
         let mut bases = HashMap::new();
-        bases.insert(oid(4), loc(1 << 10, 12 << 20));
-        bases.insert(oid(5), loc(1 << 10, 12 << 20));
-        assert_eq!(prefetch_locs(&bases).len(), 2);
+        bases.insert(oid(4), loc(1 << 10, half));
+        bases.insert(oid(5), loc(1 << 10, half));
+        assert_eq!(prefetch_locs(&bases, ok).unwrap().len(), 2);
+        bases.insert(oid(5), loc(1 << 10, half + 1));
+        assert_eq!(prefetch_locs(&bases, ok).unwrap().len(), 1, "one byte of payload over the cap with metadata");
+    }
+
+    /// Codex r8 #3: many few-byte bases stop at PREFETCH_MAX_LOCS rows,
+    /// the preflight sees the rows' metadata bytes BEFORE the batch is
+    /// built, and a refusal (or a failed reservation) builds nothing.
+    #[test]
+    fn prefetch_locs_bounds_rows_and_preflights_metadata() {
+        let mut bases = HashMap::new();
+        for n in 0..10_000u32 {
+            let mut b = [0u8; 20];
+            b[..4].copy_from_slice(&n.to_be_bytes());
+            let loc = ObjLoc { pack: crate::store::PackId("0123456789abcdef".into()), idx: n, offset: 0, len: 9, kind: Kind::Blob, size: 1 };
+            bases.insert(ObjectId::from_bytes_or_panic(&b), loc);
+        }
+        let mut seen = None;
+        let got = prefetch_locs(&bases, |m| {
+            seen = Some(m);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got.len(), PREFETCH_MAX_LOCS);
+        let per = prefetch_meta_bytes(&got[0].1);
+        assert!(per > std::mem::size_of::<(ObjectId, ObjLoc)>(), "the pack id and read_entries' slots count");
+        assert_eq!(seen, Some(PREFETCH_MAX_LOCS * per));
+        // a refused preflight builds nothing
+        let err = prefetch_locs(&bases, |_| Err(Error::Limit("busy".into())));
+        assert!(matches!(err, Err(Error::Limit(_))));
+        // a refused reservation is the in-band retry Limit
+        crate::try_grow::fail_above(Some(1 << 10));
+        let err = prefetch_locs(&bases, |_| Ok(()));
+        crate::try_grow::fail_above(None);
+        assert!(matches!(&err, Err(e) if crate::try_grow::is_retry(e)));
+        // the production preflight is the guard: it records its site
+        let _calm = calm_heap();
+        let mem = MemReads::new(crate::store::RepoId("o/r".into()));
+        let mut cx = test_cx(&mem, "k", 0, Externals::Map(&bases));
+        clear_preflights();
+        let pre = prefetch_locs(&bases, |m| cx.mem_grow(m, None, "grow:prefetch-meta")).unwrap();
+        assert_eq!(preflight_sites(), vec![("grow:prefetch-meta", pre.len() * per)]);
     }
     // ---- mutation-sensitive call-site tests (PR #44 review) ----
     // Every large pass-B allocation preflights through mem_guard_peak, which
@@ -2900,6 +2990,26 @@ mod tests {
     // resolve loop on in-memory packs and assert each production site's tag
     // was recorded — deleting a mem_fetch/mem_decode/mem_entries/mem_grow/
     // mem_relief call site removes its record and fails the test.
+
+    /// Pins the live reading for a test that does not script one: the real
+    /// tally is process-wide, so a heavy test on another thread (a 46 MiB
+    /// entry table, a 16 MiB streamed blob) must not push this test's
+    /// guard over MEM_HARD. Drop restores the unscripted reading.
+    struct CalmHeap(bool);
+    fn calm_heap() -> CalmHeap {
+        if crate::mem::has_live_override() {
+            return CalmHeap(false);
+        }
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 16 << 20)));
+        CalmHeap(true)
+    }
+    impl Drop for CalmHeap {
+        fn drop(&mut self) {
+            if self.0 {
+                crate::mem::set_live_override(None);
+            }
+        }
+    }
 
     /// A waker that does nothing — MemReads resolves without real awaits.
     fn noop_waker() -> std::task::Waker {
@@ -3038,6 +3148,7 @@ mod tests {
         // it takes &mut AnySink. Build it in the async block instead.
         let _ = any;
         Box::pin(async move {
+            let _calm = calm_heap();
             let reads = Reader::Mem(mem);
             let mut any = AnySink::Mem(sink);
             let mut budget = test_budget();
@@ -3203,6 +3314,7 @@ mod tests {
         let mut budget = test_budget();
         // resolve the DELTA entry itself: resolve_at walks its chain back
         // to the base and applies it — it must succeed
+        let _calm = calm_heap();
         let mut cx = test_cx(&mem, key, pack_len_of(&recs), Externals::Map(&empty));
         let got = block_on(resolve_at(&mut cx, &toc, delta_off, &mut budget)).unwrap();
         match got {
@@ -3249,6 +3361,7 @@ mod tests {
         });
         clear_preflights();
         let mut budget = test_budget();
+        let _calm = calm_heap();
         let mut cx = test_cx(&mem, &ext_key, 1 << 20, Externals::Map(&ext));
         let (k, data) = block_on(external(&mut cx, base_id, &mut budget)).unwrap();
         assert_eq!(k, Kind::Blob);
@@ -3683,12 +3796,12 @@ mod tests {
                 i += 1;
             }
             let (len, cap) = (m.len(), m.capacity());
-            let bound = map_growth_peak::<(ObjectId, ObjectId)>(len, cap);
+            let bound = map_growth_peak::<(ObjectId, ObjectId)>(len, cap, 1);
             m.insert(id(i), id(i));
             assert!(m.capacity() > cap, "the insert resized");
             let elem = std::mem::size_of::<(ObjectId, ObjectId)>() + 1;
             assert!(bound >= m.capacity() * elem, "n={n}: bound {bound} < new {} slots", m.capacity());
-            assert_eq!(map_growth_peak::<(ObjectId, ObjectId)>(m.len(), m.capacity()), 0, "room left: no preflight");
+            assert_eq!(map_growth_peak::<(ObjectId, ObjectId)>(m.len(), m.capacity(), 1), 0, "room left: no preflight");
         }
         let mut c = Cache::with_budget(usize::MAX);
         assert!(c.put_growth_bound() > 0, "the first put allocates both tables");
@@ -3751,6 +3864,7 @@ mod tests {
         assert_eq!(recs.capacity(), cap, "a refused growth reserves nothing");
         // the production preflight is the guard: it records its site
         clear_preflights();
+        let _calm = calm_heap();
         let mut recs: Vec<EntryRec> = Vec::new();
         reserve_entries(&mut recs, 5, |peak| mem_preflight(None, peak, "grow:pass-a-entries")).unwrap();
         assert!(sites_of(&preflight_sites()).contains(&"grow:pass-a-entries"));

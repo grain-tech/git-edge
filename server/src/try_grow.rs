@@ -102,6 +102,17 @@ pub(crate) fn zeroed(n: usize) -> Result<Vec<u8>, Error> {
     Ok(v)
 }
 
+/// A copy of `src` in one exact, fallible block.
+pub(crate) fn string(src: &str) -> Result<String, Error> {
+    let mut s = String::new();
+    if !src.is_empty() {
+        gate(src.len())?;
+        s.try_reserve_exact(src.len()).map_err(|_| failed())?;
+    }
+    s.push_str(src);
+    Ok(s)
+}
+
 /// Reserve room for `additional` more entries in a HashMap, fallibly.
 /// The gate prices the new table's slots at one `(K, V)` each.
 pub(crate) fn map<K: Eq + Hash, V, S: BuildHasher>(
@@ -163,6 +174,7 @@ mod tests {
         let mut v: Vec<u8> = Vec::with_capacity(1_000);
         let fits = vec(&mut v, 1_000);
         let zero_over = zeroed(65);
+        let string_over = string(&"x".repeat(65));
         let mut m: HashMap<u64, u64> = HashMap::new();
         let map_over = map(&mut m, 100);
         let mut q: VecDeque<u64> = VecDeque::new();
@@ -172,6 +184,7 @@ mod tests {
         assert_eq!(at.unwrap().len(), 64);
         fits.unwrap();
         assert!(is_retry(&zero_over.unwrap_err()));
+        assert!(is_retry(&string_over.unwrap_err()));
         assert!(is_retry(&map_over.unwrap_err()));
         assert!(is_retry(&deque_over.unwrap_err()));
         assert_eq!(zeroed(65).unwrap(), vec![0u8; 65], "the hook is off again");
