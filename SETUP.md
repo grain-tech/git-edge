@@ -68,6 +68,7 @@ All have defaults; set in `wrangler.jsonc` `[vars]` or `wrangler dev --var`:
 | `GE_COMPACT_MIN_AGE_MS` | 60,000 | Minimum pack age before a pack can join a compact cohort |
 | `GE_COMPACT_MAX_ROWS` | 100,000 | Object-row budget per compact cohort (packs over `max_rows`/2 objects are ineligible) |
 | `GE_MAX_LIVE_PACKS` | 1,000 | Live+ingesting packs per repo; min 2 when enabled, ≤0 disables — over-cap pushes/imports get 503 + `Retry-After: 60`. Compaction (`GE_COMPACT_*`) is what normally keeps live packs under this cap |
+| `GE_EDGE_INGEST_SLOTS` / `GE_EDGE_INGEST_WAIT_MS` | 2 / 60,000 | Concurrent pass-B push ingests per isolate, and how long a push waits for a slot or a drained heap before answering busy in-band; slots ≤0 disables the gate |
 
 `GE_METRICS` (Analytics Engine binding in `wrangler.jsonc`) is optional —
 one datapoint per request; delete the binding line if you don't want it.

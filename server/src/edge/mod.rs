@@ -1203,7 +1203,7 @@ async fn receive_inner(
 
     // a post-begin failure must close the open push row now — leaving it for the
     // janitor's 1h expiry lets 64 failures DoS all pushes
-    let run = pack::run::run(body, &bucket, &stub, route, &push, hdr.caps.object_format, &mut budget).await;
+    let run = pack::run::run(body, &bucket, &stub, route, &push, hdr.caps.object_format, env, &mut budget).await;
     if run.is_err() {
         let _: serde_json::Value = stub_json(
             &stub,

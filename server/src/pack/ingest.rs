@@ -17,7 +17,7 @@ use crate::error::Error;
 use crate::store::{codec, keys, Bucket, ObjLoc, ObjRow, PackWriter, PushId, RawWriter};
 use crate::ReqBudget;
 
-use super::run::IndexSink;
+use super::run::{ingest_in_flight, IndexSink, INGEST_BUSY_MSG};
 
 
 #[derive(Clone, Copy)]
@@ -827,19 +827,28 @@ pub async fn resolve_at(
 }
 
 /// Pass-B memory guard, run at each entry boundary of the edge resolve loop.
-/// `live` reads the counting allocator's live bytes; clearing the cache is the
-/// soft relief (resolved objects re-resolve lazily), and only a reading still
-/// above MEM_HARD after the clear earns the client an in-band Limit — a push
-/// this size cannot finish inside one request and smaller slices will.
-fn mem_guard(cache: &mut Cache, live: impl Fn() -> usize) -> Result<(), Error> {
+/// `live` reads the counting allocator's live bytes and `in_flight` the
+/// isolate's pass-B admission count (this push's own slot included). Clearing
+/// the cache is the soft relief (resolved objects re-resolve lazily), and only
+/// a reading still above MEM_HARD after the clear earns the client an in-band
+/// Limit. The message is honest about cause: a peer ingest in flight means
+/// the isolate was busy — retry — while an alone push really is too big for
+/// one request and smaller slices will do.
+fn mem_guard(
+    cache: &mut Cache,
+    live: impl Fn() -> usize,
+    in_flight: impl Fn() -> usize,
+) -> Result<(), Error> {
     if live() <= MEM_SOFT {
         return Ok(());
     }
     cache.clear();
     if live() > MEM_HARD {
-        return Err(Error::Limit(
-            "push needs more memory than one request allows; push it in smaller slices".into(),
-        ));
+        return Err(Error::Limit(if in_flight() > 1 {
+            INGEST_BUSY_MSG.into()
+        } else {
+            "push needs more memory than one request allows; push it in smaller slices".into()
+        }));
     }
     Ok(())
 }
@@ -909,7 +918,7 @@ pub async fn resolve_and_normalize(
     let mut order: Vec<usize> = (0..entries.len()).collect();
     let mut i = 0;
     while i < order.len() {
-        mem_guard(&mut cx.cache, crate::mem::live_bytes)?;
+        mem_guard(&mut cx.cache, crate::mem::live_bytes, ingest_in_flight)?;
         let at = order[i];
         i += 1;
         match one_entry(&mut cx, &toc, at, need_ids, out, &mut sink, &mut rows, budget, 0).await? {
@@ -1195,15 +1204,27 @@ mod tests {
         // under the soft ceiling: untouched
         let mut c = Cache::default();
         c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
-        mem_guard(&mut c, || MEM_SOFT).unwrap();
+        mem_guard(&mut c, || MEM_SOFT, || 1).unwrap();
         assert!(c.get(&Key::Off(1)).is_some());
         // past soft but under hard after the clear: cache shed, push continues
-        mem_guard(&mut c, || MEM_SOFT + 1).unwrap();
+        mem_guard(&mut c, || MEM_SOFT + 1, || 1).unwrap();
         assert!(c.get(&Key::Off(1)).is_none());
         // still above hard after the clear: typed Limit, actionable message
         let mut c = Cache::default();
-        let err = mem_guard(&mut c, || MEM_HARD + 1).unwrap_err();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1).unwrap_err();
         assert!(matches!(err, Error::Limit(_)));
         assert!(err.message().contains("smaller slices"), "{err}");
+    }
+
+    /// The MEM_HARD message names the real cause: alone -> smaller slices;
+    /// a peer ingest in flight -> the isolate was busy, retry instead.
+    #[test]
+    fn mem_guard_message_names_busy_when_peers_run() {
+        let mut c = Cache::default();
+        // in_flight counts this push's own slot: 1 = alone, 2 = a peer too
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1).unwrap_err();
+        assert!(err.message().contains("smaller slices"), "{err}");
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 2).unwrap_err();
+        assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
     }
 }
