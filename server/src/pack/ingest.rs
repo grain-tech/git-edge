@@ -659,6 +659,22 @@ impl AnySink<'_, '_> {
             AnySink::Mem(_) => Ok(()),
         }
     }
+    /// Preflight bytes for `post(rows)`: the largest single index post's
+    /// JSON body plus its request copy (see run::index_post_bound). The DO
+    /// job writes SQL directly and allocates no body: 0.
+    pub fn post_bound(&self, rows: &[ObjRow]) -> Result<usize, Error> {
+        match self {
+            AnySink::Edge(s) => s.post_bound(&crate::store::PackMeta::EMPTY, rows),
+            AnySink::Job(_) => Ok(0),
+            #[cfg(test)]
+            AnySink::Mem(_) => super::run::index_post_bound(
+                "00000000000000000000000000000000",
+                "00000000000000000000000000000000",
+                &crate::store::PackMeta::EMPTY,
+                rows,
+            ),
+        }
+    }
     /// Rows buffered before a `post` flush — the edge posts each batch as
     /// index rows over the stub, so it flushes at INDEX_BATCH to keep both
     /// the rows Vec and every serialized body small; the DO job inserts
@@ -1511,6 +1527,28 @@ fn mem_guard_peak(
     Ok(())
 }
 
+/// A one-off preflight outside the resolve loop — the final index post
+/// after `resolve_and_normalize` returned and its Cx (and cache) are gone.
+/// Same guard, same thresholds and wording, the owning request's lease
+/// renewed; there is no cache left to shed.
+pub(crate) fn mem_preflight(
+    lease: Option<&Rc<super::run::Lease>>,
+    incoming: usize,
+    site: &'static str,
+) -> Result<(), Error> {
+    let mut state = MemGuard { cleared_at: None, lease: lease.cloned() };
+    mem_guard_peak(
+        &mut Cache::with_budget(0),
+        crate::mem::live_bytes,
+        crate::mem::linear_bytes,
+        receive_packs,
+        &mut state,
+        incoming,
+        None,
+        site,
+    )
+}
+
 /// wasm-only guard logging: a near-wall isolate (forced clear fired, or a
 /// linear reject) shows up in `wrangler tail` instead of looking like a
 /// silent hang. No-op natively.
@@ -1820,6 +1858,9 @@ pub async fn one_entry<O: PackOut>(
     }
     cx.cache.put(Key::Off(rec.offset), kind, data);
     if rows.len() >= sink.row_batch() {
+        // each index post's JSON body (plus its request copy) is a pass-B
+        // allocation too — commit rows carry parents, so price it first
+        cx.mem_grow(sink.post_bound(rows)?, None, "grow:index-entry")?;
         sink.post(rows, budget).await?;
         rows.clear();
     }
@@ -1919,6 +1960,7 @@ async fn stream_blob<O: PackOut>(
         cx.by_id.insert(id, i);
     }
     if rows.len() >= sink.row_batch() {
+        cx.mem_grow(sink.post_bound(rows)?, None, "grow:index-blob")?;
         sink.post(rows, budget).await?;
         rows.clear();
     }
@@ -2900,6 +2942,22 @@ mod tests {
             other => panic!("expected Limit, got {:?}", other.map(|r| r.len())),
         }
     }
+    /// The standalone preflight (the final index post, after the resolve
+    /// loop's Cx is gone) runs the same guard: it records its site, admits
+    /// a body that fits and fails in-band on one that would cross MEM_HARD.
+    #[test]
+    fn mem_preflight_guards_the_final_index_post() {
+        clear_preflights();
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 50 << 20)));
+        let ok = mem_preflight(None, 8 << 20, "grow:index-final");
+        let err = mem_preflight(None, 47 << 20, "grow:index-final");
+        crate::mem::set_live_override(None);
+        ok.unwrap();
+        assert!(matches!(err, Err(Error::Limit(_))), "{err:?}");
+        let sites = preflight_sites();
+        assert_eq!(sites.iter().filter(|(s, _)| *s == "grow:index-final").count(), 2);
+    }
+
     /// MEM_HARD boundary: `after > MEM_HARD` must be strict — at exactly
     /// MEM_HARD the push continues (a `>=` mutant fails it), one byte over
     /// fails in-band (an `&&`-for-`||` mutant on the shed condition would

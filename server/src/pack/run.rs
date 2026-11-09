@@ -12,7 +12,7 @@ use worker::{Delay, Env, Stub};
 use crate::edge::BodyReader;
 use crate::error::Error;
 use crate::store::{keys, Bucket, ObjLoc, ObjRow, PackId, PackMeta, PackWriter, PushId};
-use crate::wire::http::{stub_json, RepoRoute};
+use crate::wire::http::{stub_json, stub_json_body, RepoRoute};
 use crate::ReqBudget;
 
 pub(crate) const MAX_LINKS: usize = 1_000_000; // A5
@@ -22,13 +22,60 @@ pub(crate) const MAX_LINKS: usize = 1_000_000; // A5
 /// batch — pass-B memory stays bounded mid-push. The DO accepts up to
 /// 10,000 rows per post; `index_chunks` still splits defensively.
 pub(crate) const INDEX_BATCH: usize = 2_500;
+/// Serialized bytes per /_do/push/index body. Rows alone do not bound a
+/// body: a commit row carries every parent id, so 2,500 merge-heavy rows
+/// can serialize to tens of MiB. A batch flushes early once its JSON would
+/// pass this mark. 4 MiB keeps one body plus its request copy at ~8 MiB,
+/// the size of one window read. A single row bigger than this still posts,
+/// alone, and its own preflight judges it.
+pub(crate) const INDEX_POST_BYTES: usize = 4 << 20;
 
 /// The /_do/push/index body, borrowed — serializes rows straight from the
-/// slice instead of building a serde_json::Value tree per row.
+/// slice instead of building a serde_json::Value tree per row. `json_len`
+/// is the exact serialized length, so the body is built at that capacity
+/// with no growth.
 #[derive(serde::Serialize)]
 struct IndexPost<'a> {
     pack: IndexPack<'a>,
     rows: &'a [ObjRow],
+    #[serde(skip)]
+    json_len: usize,
+}
+
+/// An io::Write that only counts — measures a value's JSON length without
+/// allocating the text.
+struct JsonLen(usize);
+impl std::io::Write for JsonLen {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(b.len());
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn json_len(v: &impl serde::Serialize) -> Result<usize, Error> {
+    let mut w = JsonLen(0);
+    serde_json::to_writer(&mut w, v).map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(w.0)
+}
+
+/// Peak bytes one index post allocates: the exact-capacity JSON body plus
+/// the request-body copy `internal_request` makes, plus one allocation's
+/// overhead. Posts run one at a time and each body frees before the next.
+fn post_alloc(json_len: usize) -> usize {
+    json_len.saturating_mul(2).saturating_add(crate::store::ALLOC_OVERHEAD)
+}
+
+/// The memory-guard preflight for posting `rows` with `meta`: the largest
+/// single post's allocation. Pure, so the in-memory test sink prices its
+/// posts the same way.
+pub(crate) fn index_post_bound(pack: &str, push: &str, meta: &PackMeta, rows: &[ObjRow]) -> Result<usize, Error> {
+    Ok(index_chunks(pack, push, 0, meta, rows)?
+        .iter()
+        .map(|p| post_alloc(p.json_len))
+        .max()
+        .unwrap_or(0))
 }
 #[derive(Clone, Copy, serde::Serialize)]
 struct IndexPack<'a> {
@@ -147,6 +194,10 @@ pub async fn run(
     drop(entries);
     drop(external);
     let meta = out.finish(budget).await?; // section 3 (1): pack durable in R2
+    // the tail rows' serialization is pass-B memory too: preflight the
+    // largest post before any body is built
+    let bound = sink.post_bound(&meta, &tail)?;
+    super::ingest::mem_preflight(budget.lease.as_ref(), bound, "grow:index-final")?;
     sink.post_meta(&meta, &tail, budget).await?; // section 3 (2): tail rows + real meta
     drop(permit); // the gated span ends here; the link check below is light
     let mut links = std::mem::take(&mut sink.links);
@@ -174,6 +225,10 @@ pub struct IndexSink<'a> {
     pub tags: HashMap<ObjectId, ObjectId>,
 }
 impl IndexSink<'_> {
+    /// Preflight bytes for `post_meta(meta, rows)` — see `index_post_bound`.
+    pub fn post_bound(&self, meta: &PackMeta, rows: &[ObjRow]) -> Result<usize, Error> {
+        index_post_bound(&self.pack.0, &self.push.0, meta, rows)
+    }
     /// One /_do/push/index call (<= 10,000 rows, 1.3).
     pub async fn post(&mut self, rows: &[ObjRow], budget: &mut ReqBudget) -> Result<(), Error> {
         self.post_meta(&PackMeta::EMPTY, rows, budget).await
@@ -185,19 +240,17 @@ impl IndexSink<'_> {
         budget: &mut ReqBudget,
     ) -> Result<(), Error> {
         for post in index_chunks(&self.pack.0, &self.push.0, self.links.len(), meta, rows)? {
-            self.post_rows(&post.pack, post.rows, budget).await?;
+            self.post_rows(&post, budget).await?;
         }
         Ok(())
     }
-    async fn post_rows(
-        &self,
-        pack: &IndexPack<'_>,
-        rows: &[ObjRow],
-        budget: &mut ReqBudget,
-    ) -> Result<(), Error> {
-        let body = IndexPost { pack: *pack, rows };
+    /// Serialize one post at its exact length — no String growth — and
+    /// send it. The caller preflighted `post_alloc(post.json_len)`.
+    async fn post_rows(&self, post: &IndexPost<'_>, budget: &mut ReqBudget) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(post.json_len);
+        serde_json::to_writer(&mut body, post).map_err(|e| Error::Internal(e.to_string()))?;
         let _: serde_json::Value =
-            stub_json(self.stub, self.repo, "/_do/push/index", &body, budget).await?;
+            stub_json_body(self.stub, self.repo, "/_do/push/index", body, budget).await?;
         Ok(())
     }
 }
@@ -206,7 +259,10 @@ impl IndexSink<'_> {
 /// stub) so tests count the chunks and check the meta on each. An empty
 /// `rows` still yields exactly one post: it plants the 'ingesting' packs
 /// row the whole two-phase ordering depends on. Every chunk carries the
-/// same real meta — the DO upserts it idempotently.
+/// same real meta — the DO upserts it idempotently. A post closes at
+/// INDEX_BATCH rows OR when the next row would push its JSON past
+/// INDEX_POST_BYTES, whichever comes first; each post records its exact
+/// serialized length.
 fn index_chunks<'a>(
     pack: &'a str,
     push: &'a str,
@@ -227,10 +283,25 @@ fn index_chunks<'a>(
         commit_lo,
         commit_hi: meta.commit_hi,
     };
-    if rows.is_empty() {
-        return Ok(vec![IndexPost { pack, rows: &[] }]);
+    // `{"pack":{...},"rows":[]}` — each row adds its own JSON plus a comma
+    // after the first
+    let envelope = json_len(&IndexPost { pack, rows: &[], json_len: 0 })?;
+    let mut posts = Vec::new();
+    let (mut start, mut bytes) = (0usize, envelope);
+    for (i, row) in rows.iter().enumerate() {
+        let row_len = json_len(row)?;
+        let n = i - start;
+        let with_row = bytes.saturating_add(row_len).saturating_add(usize::from(n > 0));
+        if n > 0 && (n >= INDEX_BATCH || with_row > INDEX_POST_BYTES) {
+            posts.push(IndexPost { pack, rows: &rows[start..i], json_len: bytes });
+            start = i;
+            bytes = envelope.saturating_add(row_len);
+        } else {
+            bytes = with_row;
+        }
     }
-    Ok(rows.chunks(INDEX_BATCH).map(|c| IndexPost { pack, rows: c }).collect())
+    posts.push(IndexPost { pack, rows: &rows[start..], json_len: bytes });
+    Ok(posts)
 }
 
 #[derive(serde::Deserialize)]
@@ -855,7 +926,7 @@ mod tests {
     fn index_post_matches_do_json_shape() {
         let pack = IndexPack { id: "p1", push_id: "pu", count: 3, bytes: 999, commit_lo: 5, commit_hi: 9 };
         let rows = [row(0), row(1)];
-        let got = serde_json::to_value(IndexPost { pack, rows: &rows }).unwrap();
+        let got = serde_json::to_value(IndexPost { pack, rows: &rows, json_len: 0 }).unwrap();
         let want = serde_json::json!({
             "pack": { "id": "p1", "push_id": "pu", "count": 3, "bytes": 999,
                       "commit_lo": 5, "commit_hi": 9 },
@@ -904,6 +975,55 @@ mod tests {
         }
         // over MAX_LINKS refuses before any post is built
         assert!(index_chunks("pid", "push", MAX_LINKS + 1, &meta, &[]).is_err());
+    }
+
+    fn commit_row(i: u32, parents: usize) -> ObjRow {
+        let mut r = row(i);
+        r.kind = Kind::Commit;
+        r.parents = Some(vec![ObjectId::from_hex(b"89abcdef0123456789abcdef0123456789abcdef").unwrap(); parents]);
+        r
+    }
+
+    /// Codex #4: posts split by serialized BYTES too. 2,500 commit rows
+    /// with 100 parents each serialize to ~11 MiB — far over one 4 MiB
+    /// body — so the batch splits early; each post's recorded length is
+    /// the exact JSON length the edge allocates, and the preflight bound
+    /// is the largest post's body plus its request copy.
+    #[test]
+    fn index_chunks_split_by_serialized_bytes() {
+        let meta = PackMeta::EMPTY;
+        let rows: Vec<ObjRow> = (0..2_500).map(|i| commit_row(i, 100)).collect();
+        let posts = index_chunks("pid", "push", 0, &meta, &rows).unwrap();
+        let total: usize = posts.iter().map(|p| p.json_len).sum();
+        assert!(total > 3 * INDEX_POST_BYTES, "fixture must exceed several bodies: {total}");
+        assert!(posts.len() >= 3, "{} posts", posts.len());
+        assert_eq!(posts.iter().map(|p| p.rows.len()).sum::<usize>(), rows.len());
+        let mut max = 0;
+        for p in &posts {
+            let text = serde_json::to_vec(p).unwrap();
+            assert_eq!(p.json_len, text.len(), "recorded length is exact");
+            assert!(p.json_len <= INDEX_POST_BYTES, "post of {} bytes", p.json_len);
+            max = max.max(p.json_len);
+        }
+        // a post closes only when the NEXT row would not fit
+        for w in posts.windows(2) {
+            let next = json_len(&w[1].rows[0]).unwrap();
+            assert!(w[0].json_len + 1 + next > INDEX_POST_BYTES);
+        }
+        assert_eq!(index_post_bound("pid", "push", &meta, &rows).unwrap(), 2 * max + crate::store::ALLOC_OVERHEAD);
+        // one row over the byte mark still posts — alone
+        let giant = [row(0), commit_row(1, 120_000), row(2)];
+        let posts = index_chunks("pid", "push", 0, &meta, &giant).unwrap();
+        assert_eq!(posts.iter().map(|p| p.rows.len()).collect::<Vec<_>>(), vec![1, 1, 1]);
+        assert!(posts[1].json_len > INDEX_POST_BYTES);
+        // small rows still batch by count; exact lengths there too
+        let small: Vec<ObjRow> = (0..2_501).map(row).collect();
+        let posts = index_chunks("pid", "push", 0, &meta, &small).unwrap();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].json_len, serde_json::to_vec(&posts[0]).unwrap().len());
+        assert_eq!(posts[1].json_len, serde_json::to_vec(&posts[1]).unwrap().len());
+        let empty = index_chunks("pid", "push", 0, &meta, &[]).unwrap();
+        assert_eq!(empty[0].json_len, serde_json::to_vec(&empty[0]).unwrap().len());
     }
 
     /// Slots cap concurrency, release frees them, and the count can't go
