@@ -525,6 +525,18 @@ async fn read_upload_body(reader: &mut BodyReader, cap: usize) -> Result<Vec<u8>
     Ok(body)
 }
 
+/// The upload-pack command body under CMD_CAP: a declared Content-Length
+/// is rejected before any byte is buffered, and read_upload_body caps a
+/// chunked body while it streams in.
+async fn upload_command_body(reader: &mut BodyReader, declared: Option<u64>) -> Result<Vec<u8>, Error> {
+    if let Some(n) = declared {
+        if n > CMD_CAP as u64 {
+            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+        }
+    }
+    read_upload_body(reader, CMD_CAP).await
+}
+
 /// POST /:owner/:repo/git-upload-pack — v2 only; route on the command name, forward raw.
 async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate(&req, env, Level::Read, route, spend).await?;
@@ -536,21 +548,14 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
         return git_resp(w.out, "application/x-git-upload-pack-result")
             .map(|r| r.with_status(400));
     }
-    // bound the read: a declared Content-Length is rejected before any byte is buffered,
-    // and read_upload_body caps a chunked body at CMD_CAP while it streams in
-    if let Some(n) = req
+    let declared = req
         .headers()
         .get("content-length")
         .ok()
         .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if n > CMD_CAP as u64 {
-            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
-        }
-    }
+        .and_then(|v| v.parse::<u64>().ok());
     let mut reader = BodyReader::new(&mut req)?;
-    let body = read_upload_body(&mut reader, CMD_CAP).await?;
+    let body = upload_command_body(&mut reader, declared).await?;
     let path = match wire::parse_v2_command(&body)? {
         wire::V2Command::LsRefs(_) => "/_do/ls-refs",
         wire::V2Command::Fetch(_) => "/_do/fetch",
@@ -1805,6 +1810,37 @@ mod tests {
         let mut reader = BodyReader::from_chunks(vec![payload.clone()], None);
         let body = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap();
         assert_eq!(body, payload);
+    }
+
+    /// A chunked upload-pack command body is capped while it streams through
+    /// upload_command_body: 64 x 64 KiB refuses with the Limit after ~1 MiB
+    /// has been pulled — reader.total proves the refusal did not wait for EOF.
+    #[test]
+    fn upload_command_body_caps_a_chunked_body_while_streaming() {
+        let chunks: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; FILL_STEP]).collect();
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let err = block_on(upload_command_body(&mut reader, None)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        assert!(
+            reader.total <= CMD_CAP as u64 + FILL_STEP as u64,
+            "reader.total = {} — the cap must fire while streaming, not after EOF",
+            reader.total
+        );
+    }
+
+    /// A declared Content-Length over the cap refuses before a byte is pulled.
+    #[test]
+    fn upload_command_body_refuses_an_over_cap_declared_length() {
+        let mut reader = BodyReader::from_chunks(vec![vec![0u8; FILL_STEP]], None);
+        let err = block_on(upload_command_body(&mut reader, Some(CMD_CAP as u64 + 1))).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        assert_eq!(reader.total, 0, "the declared-length refusal must precede any read");
     }
 
     /// The line of the try_grow call that ends `snippet`, found in this
