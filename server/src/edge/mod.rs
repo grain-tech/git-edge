@@ -1088,10 +1088,12 @@ async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute, spend: &Spen
 
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
 async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spend) -> Result<Response, Error> {
-    // the pass-B memory guard's "is the isolate busy" count — pass A isn't
-    // admission-gated but still holds heap, so the whole handler counts
-    let _receive_pack = pack::run::ReceivePackGuard::new();
     let principal = auth::authenticate(&req, &env, Level::Write, &route, spend).await?;
+    // the pass-B memory guard's "is the isolate busy" count — pass A isn't
+    // admission-gated but still holds heap, so the whole handler counts.
+    // Created only AFTER auth: an unauthenticated request must not count as
+    // an in-progress receive-pack peer (it would skew busy-vs-slices).
+    let _receive_pack = pack::run::ReceivePackGuard::new();
     // A27: sha1 of the presented token is the rate-limit bucket key — the raw
     // credential never crosses the stub boundary (8.1)
     let rate_key = auth::presented_hash(&req)?;

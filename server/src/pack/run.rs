@@ -1,7 +1,7 @@
 //! Phase one of the two-phase push (CONTRACTS.md 2.4-2.5, 3 ordering), in the edge Worker.
 //! Ported from research/proofs/two-phase-push.md.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 
 use gix_hash::ObjectId;
@@ -112,7 +112,11 @@ pub async fn run(
     // behind. Pass A above already streamed the body to R2, so waiting
     // here never holds the client's upload. The permit stays held through
     // out.finish + the final post_meta: the gated span ends there.
-    let permit = admit_pass_b(env, budget).await?;
+    let pack_bytes = entries
+        .last()
+        .map(|r| r.offset.saturating_add(u64::from(r.header_len)).saturating_add(u64::from(r.compressed_len)))
+        .unwrap_or(0);
+    let permit = admit_pass_b(env, budget, entries.len(), pack_bytes).await?;
     sink.post_meta(&PackMeta::EMPTY, &[], budget).await?; // packs row 'ingesting' before any part is uploaded
     let key = keys::pack(&bucket.repo, &pack);
     let mut out = match PackWriter::create(bucket, &key, u32::try_from(entries.len()).unwrap_or(u32::MAX), kind, budget).await {
@@ -120,13 +124,14 @@ pub async fn run(
         Err(e) => return Err(e),
     };
     let pending = keys::pending(&bucket.repo, push);
+    let mut any_sink = super::ingest::AnySink::Edge(&mut sink);
     let tail = match super::ingest::resolve_and_normalize(
-        bucket,
+        super::ingest::Reader::Bucket(bucket),
         &pending,
         &entries,
         super::ingest::Externals::Map(&external),
         &mut out,
-        &mut sink,
+        &mut any_sink,
         kind,
         budget,
     )
@@ -356,18 +361,22 @@ impl Admission {
     /// budget bounds the gated span) and head tickets that stopped polling
     /// TICKET_STALE_MS ago. One log line per reclaimed item; `now` is the
     /// platform clock the caller already reads on every poll.
-    fn sweep(&mut self, now: i64) {
+    /// Returns how many stale permits this sweep reclaimed — the caller
+    /// counts a just-evicted holder as a peer for the heap_busy check: its
+    /// buffers still sit in the live heap, so admitting onto them would
+    /// stack a second pass B on the first's leftovers.
+    fn sweep(&mut self, now: i64) -> usize {
         let stale: Vec<(u64, i64)> = self
             .permits
             .iter()
             .filter(|(_, at)| now.saturating_sub(**at) > PERMIT_LEASE_MS)
             .map(|(id, at)| (*id, *at))
             .collect();
-        for (id, at) in stale {
-            self.permits.remove(&id);
+        for (id, at) in &stale {
+            self.permits.remove(id);
             admit_log(format_args!(
                 "git-edge ingest admit: reclaimed leaked permit {id} (held {}ms)",
-                now.saturating_sub(at)
+                now.saturating_sub(*at)
             ));
         }
         while let Some((&t, &at)) = self.waiting.first_key_value() {
@@ -380,6 +389,7 @@ impl Admission {
                 now.saturating_sub(at)
             ));
         }
+        stale.len()
     }
     /// Admit the ticketed waiter iff it is the queue head AND a slot is free
     /// AND the heap is calm. Returns the new permit's id — the caller hands
@@ -404,12 +414,17 @@ impl Admission {
                 self.waiting.insert(ticket, now);
             }
         }
-        self.sweep(now);
+        let evicted = self.sweep(now);
         if self.slots != 0 && self.waiting.first_key_value().map(|(t, _)| *t) != Some(ticket) {
             return None;
         }
         let in_flight = self.permits.len();
-        let admit = self.slots == 0 || (in_flight < self.slots && !(heap_busy && in_flight > 0));
+        // a permit the sweep just reclaimed still counts as a peer: its
+        // holder's buffers are still live heap, so heap_busy must keep
+        // blocking admission until they drain — not just while a permit
+        // row exists
+        let peer = in_flight > 0 || evicted > 0;
+        let admit = self.slots == 0 || (in_flight < self.slots && !(heap_busy && peer));
         if !admit {
             return None;
         }
@@ -424,6 +439,21 @@ impl Admission {
     /// slot a newer permit now holds.
     fn release(&mut self, permit: u64) {
         self.permits.remove(&permit);
+    }
+    /// Renew a live holder's lease on progress — every guard call and
+    /// budget charge on the edge pass-B path lands here, so a working
+    /// pass B can never age past PERMIT_LEASE_MS. Returns false when the
+    /// permit is absent: the sweep already reclaimed it, which means the
+    /// gate gave the slot to another waiter — this holder lost its right
+    /// and must stop with an in-band Limit so its buffers free.
+    fn renew(&mut self, permit: u64, now: i64) -> bool {
+        match self.permits.get_mut(&permit) {
+            Some(at) => {
+                *at = now;
+                true
+            }
+            None => false,
+        }
     }
     /// Re-point the gate at this request's slot count; env is fixed per
     /// deployment, and `permits` must survive the rewrite.
@@ -454,6 +484,14 @@ thread_local! {
     /// invocation can leave the guard behind, and an evergreen count would
     /// make a lone too-big push report "busy" forever.
     static RECEIVE_PACKS: RefCell<ReceivePacks> = const { RefCell::new(ReceivePacks::new()) };
+    /// The held pass-B permit's id while the gated span runs — set at
+    /// admit, cleared at drop. Guard calls and budget charges renew its
+    /// lease through `renew_lease` so a working pass B can never age past
+    /// PERMIT_LEASE_MS; an evicted holder learns at its next renew.
+    static RENEW_PERMIT: Cell<Option<u64>> = const { Cell::new(None) };
+    /// This request's RECEIVE_PACKS entry id — renewed on the same progress
+    /// points so a live request's peer count can't expire mid-push.
+    static RENEW_PACK: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// The isolate's in-flight receive-pack entries: id -> start ms. The map's
@@ -498,6 +536,12 @@ impl ReceivePacks {
             ));
         }
     }
+    /// Refresh a live request's lease stamp — re-inserts if the sweep
+    /// already reclaimed the entry: a request that is still charging is
+    /// definitionally alive, so its peer count restores rather than wedging.
+    fn renew(&mut self, id: u64, now: i64) {
+        self.entries.insert(id, now);
+    }
     /// Live entries after the lease sweep — `now` is injected so tests run
     /// natively (js_sys::Date is wasm-only).
     fn len(&mut self, now: i64) -> usize {
@@ -513,16 +557,25 @@ impl ReceivePacks {
 pub(crate) struct ReceivePackGuard(u64);
 impl ReceivePackGuard {
     pub(crate) fn new() -> Self {
-        Self(RECEIVE_PACKS.with(|c| c.borrow_mut().enter(crate::platform::now_ms())))
+        let g = Self(RECEIVE_PACKS.with(|c| c.borrow_mut().enter(crate::platform::now_ms())));
+        RENEW_PACK.with(|c| c.set(Some(g.0)));
+        g
     }
     #[cfg(test)]
     fn at(now: i64) -> Self {
-        Self(RECEIVE_PACKS.with(|c| c.borrow_mut().enter(now)))
+        let g = Self(RECEIVE_PACKS.with(|c| c.borrow_mut().enter(now)));
+        RENEW_PACK.with(|c| c.set(Some(g.0)));
+        g
     }
 }
 impl Drop for ReceivePackGuard {
     fn drop(&mut self) {
         let _ = RECEIVE_PACKS.try_with(|c| c.borrow_mut().leave(self.0));
+        let _ = RENEW_PACK.try_with(|c| {
+            if c.get() == Some(self.0) {
+                c.set(None);
+            }
+        });
     }
 }
 
@@ -544,15 +597,47 @@ pub(crate) fn ingest_in_flight() -> usize {
     ADMISSION.with(|a| a.borrow().in_flight())
 }
 
+/// Renew every lease this request holds — the pass-B permit's and the
+/// RECEIVE_PACKS entry's. Called from `mem_guard_peak` (every guard call on
+/// the edge pass-B path) and from `ReqBudget::charge` (every subrequest) so
+/// a working pass B's leases track its progress instead of aging to the
+/// 270 s sweep. An evicted permit means the gate gave the slot away while
+/// this holder still runs: the next renew returns Err and the holder stops
+/// in-band, freeing its buffers. try_with: teardown drops must not panic.
+pub(crate) fn renew_lease() -> Result<(), Error> {
+    let now = crate::platform::now_ms();
+    if let Some(id) = RENEW_PERMIT.with(|c| c.get()) {
+        let ok = ADMISSION.try_with(|a| a.borrow_mut().renew(id, now)).unwrap_or(false);
+        if !ok {
+            return Err(Error::Limit(INGEST_BUSY_MSG.into()));
+        }
+    }
+    if let Some(id) = RENEW_PACK.with(|c| c.get()) {
+        let _ = RECEIVE_PACKS.try_with(|c| c.borrow_mut().renew(id, now));
+    }
+    Ok(())
+}
+
 /// RAII slot release — every return/error path out of the gated span frees
 /// it. The permit id makes the release precise: if the lease sweep already
 /// reclaimed a leaked permit, this drop is a no-op instead of freeing a
 /// slot a newer permit now holds. try_with: a permit dropped during
 /// thread-local teardown must not panic.
 struct IngestPermit(u64);
+impl IngestPermit {
+    fn held(id: u64) -> Self {
+        RENEW_PERMIT.with(|c| c.set(Some(id)));
+        Self(id)
+    }
+}
 impl Drop for IngestPermit {
     fn drop(&mut self) {
         let _ = ADMISSION.try_with(|a| a.borrow_mut().release(self.0));
+        let _ = RENEW_PERMIT.try_with(|c| {
+            if c.get() == Some(self.0) {
+                c.set(None);
+            }
+        });
     }
 }
 
@@ -574,10 +659,30 @@ fn ingest_gate(slots: Option<i64>, wait: Option<i64>) -> (usize, i64) {
     (usize::try_from(slots).unwrap_or(0), wait.max(0))
 }
 
-/// GE_EDGE_INGEST_PASS_B_RESERVE_MS: absent or unparseable falls back to the
-/// default; <= 0 drops the reserve (the budget caps the wait by itself).
+/// GE_EDGE_INGEST_PASS_B_RESERVE_MS: the CAP on the size-aware reserve —
+/// absent or unparseable falls back to the default; <= 0 drops the reserve
+/// (the budget caps the wait by itself).
 fn ingest_reserve(raw: Option<i64>) -> i64 {
     raw.unwrap_or(INGEST_PASS_B_RESERVE_MS_DEFAULT).max(0)
+}
+/// Floor on the size-aware reserve: even a one-object push needs some
+/// pass-B time (window fetch + decode + write), so a queued wait never
+/// assumes zero.
+const INGEST_RESERVE_FLOOR_MS: i64 = 15_000;
+/// Calibrated pass-B wall rate: the measured ~26k-object push took ~150 s,
+/// so ~5.8 ms/object. Bytes add a second term for wide entries — 1 GiB of
+/// compressed input is ~150 s of inflate+copy work at the same rate.
+const INGEST_RESERVE_PER_OBJECT_MS: i64 = 6;
+const INGEST_RESERVE_PER_BYTE_MS: i64 = 150_000; // ms per GiB
+/// Size-aware pass-B reserve: what pass A learned (object count, pack
+/// bytes) sizes the wall pass B will need. A ~26k-object push reserves the
+/// full ~150 s cap and fails fast when the budget can't cover it; a ~5k
+/// push reserves ~45 s and may wait correspondingly longer. The env cap
+/// still wins — deployments tune the ceiling, not the estimate.
+fn pass_b_reserve(objects: usize, pack_bytes: u64, cap_ms: i64) -> i64 {
+    let by_objects = INGEST_RESERVE_PER_OBJECT_MS.saturating_mul(objects as i64);
+    let by_bytes = INGEST_RESERVE_PER_BYTE_MS.saturating_mul(pack_bytes as i64) / (1 << 30);
+    by_objects.max(by_bytes).max(INGEST_RESERVE_FLOOR_MS).min(cap_ms)
 }
 
 /// The admission wait bound in ms — `None` when the request budget cannot
@@ -641,8 +746,18 @@ where
     let ticket = ADMISSION.with(|a| a.borrow_mut().enqueue(now()));
     let _ticket = AdmitTicket(ticket);
     let started = now();
+    // the deadline bounds every attempt after the first — Codex's injected
+    // clock acquired at 240,001 ms on a 100 ms bound because the check ran
+    // only AFTER try_acquire. First try is unconditional (an uncontended
+    // push admits even on a zero bound); every retry checks the bound first.
     let mut waited = false;
     loop {
+        if waited && now() - started >= wait_ms {
+            let waited_ms = now() - started;
+            let n = ingest_in_flight();
+            admit_log(format_args!("git-edge ingest admit: timed out after {waited_ms}ms (in_flight={n})"));
+            return Err(Error::Limit(INGEST_BUSY_MSG.into()));
+        }
         let busy = heap_busy();
         if let Some(permit) = ADMISSION.with(|a| a.borrow_mut().try_acquire(ticket, busy, now())) {
             if waited {
@@ -650,15 +765,9 @@ where
                 let n = ingest_in_flight();
                 admit_log(format_args!("git-edge ingest admit: waited {waited_ms}ms (in_flight={n})"));
             }
-            return Ok(IngestPermit(permit));
+            return Ok(IngestPermit::held(permit));
         }
         waited = true;
-        let waited_ms = now() - started;
-        if waited_ms >= wait_ms {
-            let n = ingest_in_flight();
-            admit_log(format_args!("git-edge ingest admit: timed out after {waited_ms}ms (in_flight={n})"));
-            return Err(Error::Limit(INGEST_BUSY_MSG.into()));
-        }
         sleep(INGEST_POLL_MS).await;
     }
 }
@@ -668,10 +777,10 @@ where
 /// started before pass A, so an uncapped wait could admit a push with no
 /// time left and fail it mid-pass on Error::Budget instead of answering
 /// busy. `budget` is read-only: waiting itself spends no subrequests.
-async fn admit_pass_b(env: &Env, budget: &ReqBudget) -> Result<IngestPermit, Error> {
+async fn admit_pass_b(env: &Env, budget: &ReqBudget, objects: usize, pack_bytes: u64) -> Result<IngestPermit, Error> {
     let raw = |n: &str| env.var(n).ok().and_then(|v| v.to_string().parse::<i64>().ok());
     let (slots, wait_ms) = ingest_gate(raw("GE_EDGE_INGEST_SLOTS"), raw("GE_EDGE_INGEST_WAIT_MS"));
-    let reserve_ms = ingest_reserve(raw("GE_EDGE_INGEST_PASS_B_RESERVE_MS"));
+    let reserve_ms = pass_b_reserve(objects, pack_bytes, ingest_reserve(raw("GE_EDGE_INGEST_PASS_B_RESERVE_MS")));
     ADMISSION.with(|a| a.borrow_mut().set_slots(slots));
     // The reserve bounds only the CONTENTED wait: admit_wait always makes
     // one try_acquire before it reads the deadline, so a zero bound — the
@@ -1267,4 +1376,113 @@ mod tests {
         drop(live);
         assert_eq!(receive_packs_at(2_000 + PERMIT_LEASE_MS), 0);
     }
+    /// Codex's mutant: a waiter must NOT acquire after its wait bound —
+    /// the deadline is checked BEFORE every attempt after the first, so
+    /// an injected clock at 240,001 ms on a 100 ms bound can never admit.
+    #[test]
+    fn admit_wait_never_acquires_past_deadline() {
+        ADMISSION.with(|a| a.borrow_mut().set_slots(1));
+        let clock = FakeClock::new(1_000);
+        let (n, s) = clock_fns(&clock);
+        // hold the only slot so the waiter queues
+        let hold = block_on(admit_wait(60_000, || false, n, s)).unwrap();
+        // waiter bound 100 ms: polls at +0,+100 -> at +100 deadline hits
+        // BEFORE the third try_acquire — never acquires
+        let clock2 = FakeClock::new(0);
+        let (n2, s2) = clock_fns(&clock2);
+        let err = block_on(admit_wait(100, || false, n2, s2)).err().unwrap();
+        assert!(matches!(err, Error::Limit(_)), "{err:?}");
+        drop(hold);
+    }
+
+    /// A permit the sweep reclaimed as leaked must NOT let a second holder
+    /// in while heap is busy: evicting the stale permit counts it as a
+    /// peer, so heap_busy keeps blocking until its buffers drain.
+    #[test]
+    fn stale_permit_eviction_still_counts_as_peer() {
+        ADMISSION.with(|a| a.borrow_mut().set_slots(1));
+        let clock = FakeClock::new(0);
+        let (n, s) = clock_fns(&clock);
+        // acquire a permit directly at t=0 (leak it — no Drop)
+        let leaked = ADMISSION.with(|a| {
+            let t = a.borrow_mut().enqueue(0);
+            a.borrow_mut().try_acquire(t, false, 0).unwrap()
+        });
+        std::mem::forget(IngestPermit::held(leaked)); // simulate the leak: forget, don't drop
+        // now = PERMIT_LEASE_MS + 1: sweep evicts it; heap_busy=true must
+        // still block because the evicted holder's heap is live
+        let clock2 = FakeClock::new(PERMIT_LEASE_MS + 1);
+        let (n2, s2) = clock_fns(&clock2);
+        let ticket = ADMISSION.with(|a| a.borrow_mut().enqueue(PERMIT_LEASE_MS + 1));
+        // heap busy + a just-evicted peer -> no acquire even though permits is now empty
+        let got = ADMISSION.with(|a| a.borrow_mut().try_acquire(ticket, true, PERMIT_LEASE_MS + 1));
+        assert!(got.is_none(), "evicted holder's heap must still block admission");
+        // ticket1 still heads the queue — leave it, then a calm heap admits
+        ADMISSION.with(|a| a.borrow_mut().leave(ticket));
+        let ticket2 = ADMISSION.with(|a| a.borrow_mut().enqueue(PERMIT_LEASE_MS + 2));
+        let got2 = ADMISSION.with(|a| a.borrow_mut().try_acquire(ticket2, false, PERMIT_LEASE_MS + 2));
+        assert!(got2.is_some());
+    }
+
+    /// Lease renewal: a live holder's permit stamp refreshes on renew so a
+    /// working pass B never ages to the sweep; an evicted holder's renew
+    /// returns false -> the caller stops in-band.
+    #[test]
+    fn permit_renewal_keeps_lease_and_detects_eviction() {
+        ADMISSION.with(|a| a.borrow_mut().set_slots(1));
+        // hold a permit at t=0
+        let permit = ADMISSION.with(|a| {
+            let t = a.borrow_mut().enqueue(0);
+            a.borrow_mut().try_acquire(t, false, 0).unwrap()
+        });
+        // renew at t=200_000 (past where a stale stamp would be if not renewed)
+        let ok = ADMISSION.with(|a| a.borrow_mut().renew(permit, 200_000));
+        assert!(ok, "live permit renews");
+        // sweep at t=200_000+PERMIT_LEASE_MS-1: permit (renewed at 200k) is
+        // only ~270s-1ms old -> NOT stale -> still held
+        let still = ADMISSION.with(|a| a.borrow().permits.contains_key(&permit));
+        assert!(still);
+        // a permit id that was never issued / already swept: renew -> false
+        let bogus = ADMISSION.with(|a| a.borrow_mut().renew(999_999, 300_000));
+        assert!(!bogus, "evicted/absent permit detects eviction");
+    }
+
+    /// RECEIVE_PACKS entries renew the same way: a live request's peer
+    /// count restores after a sweep instead of wedging at 0.
+    #[test]
+    fn receive_pack_renew_restores_swept_entry() {
+        let id = RECEIVE_PACKS.with(|c| c.borrow_mut().enter(0));
+        // sweep it away: it's older than the lease
+        let _ = receive_packs_at(PERMIT_LEASE_MS + 1);
+        // a live request renews -> entry back
+        RECEIVE_PACKS.with(|c| c.borrow_mut().renew(id, PERMIT_LEASE_MS + 2));
+        assert_eq!(receive_packs_at(PERMIT_LEASE_MS + 2), 1);
+        RECEIVE_PACKS.with(|c| c.borrow_mut().leave(id));
+    }
+
+    /// Size-aware reserve: ~26k objects reserves the ~150 s cap; ~5k
+    /// reserves ~30-45 s; the floor and cap clamp both ends.
+    #[test]
+    fn pass_b_reserve_scales_with_pack_size() {
+        // 26k objects -> by_objects = 26_000 * 6 = 156_000 -> capped at 150_000
+        assert_eq!(pass_b_reserve(26_000, 0, 150_000), 150_000);
+        // 5k objects -> 30_000 ms (above the 15 s floor, under the cap)
+        assert_eq!(pass_b_reserve(5_000, 0, 150_000), 30_000);
+        // floor: a 1-object push still reserves 15 s
+        assert_eq!(pass_b_reserve(1, 0, 150_000), 15_000);
+        // bytes term: ~1 GiB compressed -> 150_000 * 1 = capped
+        assert_eq!(pass_b_reserve(10, 1 << 30, 150_000), 150_000);
+        // cap override wins: env cap of 60 s clamps the 26k estimate
+        assert_eq!(pass_b_reserve(26_000, 0, 60_000), 60_000);
+        // cap of 0 drops the reserve entirely (env <= 0 rule via ingest_reserve)
+        assert_eq!(pass_b_reserve(26_000, 0, 0), 0);
+    }
+
+    /// The lease margin is pinned: PERMIT_LEASE_MS = ReqBudget::MAX_MS + 30 s.
+    #[test]
+    fn permit_lease_margin_is_pinned() {
+        assert_eq!(PERMIT_LEASE_MS, ReqBudget::MAX_MS as i64 + 30_000);
+        assert_eq!(PERMIT_LEASE_MS, 270_000);
+    }
+
 }

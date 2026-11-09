@@ -837,7 +837,7 @@ async fn resume_drain<'a>(
     };
     let idx = Index(sql);
     let mut cx = Cx {
-        win: Window { bucket: &bucket, src, pack_len, start: 0, buf: Vec::new() },
+        win: Window { reads: crate::pack::ingest::Reader::Bucket(&bucket), src, pack_len, start: 0, buf: Vec::new() },
         cache: Cache::default(),
         z: Inflate::default(),
         by_id: IdMap::Sql { idx: &idx, pack: &pack.0, mem: HashMap::new() },
