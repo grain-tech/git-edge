@@ -749,6 +749,17 @@ impl Toc<'_> {
     }
 }
 
+/// The links append both bounded sinks share: reserve fallibly, extend,
+/// then the MAX_LINKS bound.
+fn push_links_guarded(dst: &mut Vec<ObjectId>, links: Vec<ObjectId>) -> Result<(), Error> {
+    crate::try_grow::vec(dst, links.len())?;
+    dst.extend(links);
+    if dst.len() > super::run::MAX_LINKS {
+        return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
+    }
+    Ok(())
+}
+
 /// The resolve loop's row/link/tag sink: the edge posts rows over the stub; an
 /// in-DO job writes them straight to SQLite (and spills links to push_links so
 /// the set survives slice boundaries).
@@ -812,24 +823,10 @@ impl AnySink<'_, '_> {
     /// 2.5 links bookkeeping — bounded by MAX_LINKS either way.
     pub fn push_links(&mut self, links: Vec<ObjectId>) -> Result<(), Error> {
         match self {
-            AnySink::Edge(s) => {
-                crate::try_grow::vec(&mut s.links, links.len())?;
-                s.links.extend(links);
-                if s.links.len() > super::run::MAX_LINKS {
-                    return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
-                }
-                Ok(())
-            }
+            AnySink::Edge(s) => push_links_guarded(&mut s.links, links),
             AnySink::Job(s) => s.push_links(links),
             #[cfg(test)]
-            AnySink::Mem(s) => {
-                crate::try_grow::vec(&mut s.links, links.len())?;
-                s.links.extend(links);
-                if s.links.len() > super::run::MAX_LINKS {
-                    return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
-                }
-                Ok(())
-            }
+            AnySink::Mem(s) => push_links_guarded(&mut s.links, links),
         }
     }
     pub fn tags_mut(&mut self) -> &mut HashMap<ObjectId, ObjectId> {
@@ -4399,4 +4396,98 @@ mod tests {
         assert!(id_map_bound(0) > 0);
     }
 
+    /// The links append both bounded sinks share is fallible: a refused
+    /// reservation is the in-band Limit and appends nothing.
+    #[test]
+    fn push_links_growth_is_guarded() {
+        let _guard = crate::try_grow::HookGuard;
+        let site = guarded_site("crate::try_grow::vec(dst, links.len())?;");
+        let mut dst: Vec<ObjectId> = Vec::new();
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(0));
+        let err = push_links_guarded(
+            &mut dst,
+            vec![
+                ObjectId::from_bytes_or_panic(&[1u8; 20]),
+                ObjectId::from_bytes_or_panic(&[2u8; 20]),
+            ],
+        )
+        .unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        crate::try_grow::fail_above(None);
+        crate::try_grow::fail_only_at(None);
+        assert!(dst.is_empty(), "a refused reservation appends nothing");
+        push_links_guarded(&mut dst, vec![ObjectId::from_bytes_or_panic(&[1u8; 20])]).unwrap();
+        assert_eq!(dst.len(), 1);
+    }
+
+    /// stream_blob's 1 MiB sink buffer is a fallible reservation: a refusal
+    /// at that one site is the in-band Limit.
+    #[test]
+    fn stream_blob_sinkbuf_reservation_is_guarded() {
+        let _guard = crate::try_grow::HookGuard;
+        let big = vec![0u8; MAX_OBJ as usize + 1];
+        let (pack, recs) = mk_pack(&[(Kind::Blob, &big)]);
+        let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
+        let key = "pending/p6.pack";
+        let repo = crate::store::RepoId("o/r".into());
+        let mut mem = MemReads::new(repo);
+        mem.put(key, pack);
+        let mut out = MemPackOut { buf: Vec::new() };
+        let mut sink = MemSink { batch: Some(1), ..MemSink::default() };
+        crate::try_grow::log_asks();
+        let rows = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
+        let asks = crate::try_grow::take_asks();
+        rows.unwrap();
+        let site = guarded_site("crate::try_grow::zeroed(1 << 20)?");
+        let Some(max) = asks.iter().filter(|a| (a.file, a.line) == site).map(|a| a.bytes).max() else {
+            panic!("sinkbuf reservation never asked");
+        };
+        assert!(max > 0);
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(max - 1));
+        let res = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
+        crate::try_grow::fail_above(None);
+        crate::try_grow::fail_only_at(None);
+        let Err(e) = res else { panic!("a refused sinkbuf reservation must fail the drive") };
+        assert!(crate::try_grow::is_retry(&e), "{e}");
+    }
+
+    /// A commit's parent list is reserved fallibly during decode: a refusal
+    /// at that one site is the in-band Limit.
+    #[test]
+    fn commit_parents_reservation_is_guarded() {
+        let _guard = crate::try_grow::HookGuard;
+        let commit: &[u8] = b"tree 1111111111111111111111111111111111111111
+parent 2222222222222222222222222222222222222222
+author A <a@b.c> 1700000000 +0000
+committer A <a@b.c> 1700000000 +0000
+
+x
+";
+        let (pack, recs) = mk_pack(&[(Kind::Commit, commit)]);
+        let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
+        let key = "pending/c.pack";
+        let repo = crate::store::RepoId("o/r".into());
+        let mut mem = MemReads::new(repo);
+        mem.put(key, pack);
+        let mut out = MemPackOut { buf: Vec::new() };
+        let mut sink = MemSink::default();
+        crate::try_grow::log_asks();
+        let rows = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
+        let asks = crate::try_grow::take_asks();
+        rows.unwrap();
+        let site = guarded_site("crate::try_grow::with_capacity(links.len().saturating_sub(1))?;");
+        let Some(max) = asks.iter().filter(|a| (a.file, a.line) == site).map(|a| a.bytes).max() else {
+            panic!("parents reservation never asked");
+        };
+        assert!(max > 0);
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(max - 1));
+        let res = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
+        crate::try_grow::fail_above(None);
+        crate::try_grow::fail_only_at(None);
+        let Err(e) = res else { panic!("a refused parents reservation must fail the drive") };
+        assert!(crate::try_grow::is_retry(&e), "{e}");
+    }
 }

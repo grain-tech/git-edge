@@ -561,6 +561,34 @@ async fn object_body_vec(body: worker::ObjectBody<'_>, want: usize) -> Result<Ve
     fill_exact(want, chunks).await
 }
 
+/// The trailer's fallible room + append — the growth `finish_inner` makes
+/// for the last part's trailer, kept in one step so it cannot revert to
+/// an infallible extend.
+fn trailer_append(part: &mut Vec<u8>, part_size: usize, trailer: &[u8]) -> Result<(), Error> {
+    room(part, part_size, trailer.len())?;
+    part.extend_from_slice(trailer);
+    Ok(())
+}
+
+/// One located entry's bytes out of a span read — the fallible copy
+/// `Bucket::read_entries` makes per entry.
+fn located_entry(
+    bytes: &[u8],
+    e: &&(ObjectId, ObjLoc),
+    start: u64,
+    key: &str,
+) -> Result<(ObjectId, Vec<u8>), Error> {
+    let lo = usize::try_from(e.1.offset.saturating_sub(start))
+        .map_err(|_| Error::Internal("offset".into()))?;
+    let hi = lo
+        .checked_add(usize::try_from(e.1.len).map_err(|_| Error::Internal("len".into()))?)
+        .ok_or_else(|| Error::Internal("len overflow".into()))?;
+    let entry = bytes
+        .get(lo..hi)
+        .ok_or_else(|| Error::Storage(format!("entry outside span in {key}")))?;
+    Ok((e.0, crate::try_grow::copy(entry)?))
+}
+
 impl Bucket {
     pub fn new(inner: worker::Bucket, repo: RepoId) -> Self {
         Self { inner, repo }
@@ -623,15 +651,7 @@ impl Bucket {
             let key = keys::pack(&self.repo, &first.1.pack);
             let bytes = self.read_range(&key, start, end.saturating_sub(start), budget).await?;
             for e in sorted.iter().take(j).skip(i) {
-                let lo = usize::try_from(e.1.offset.saturating_sub(start))
-                    .map_err(|_| Error::Internal("offset".into()))?;
-                let hi = lo
-                    .checked_add(usize::try_from(e.1.len).map_err(|_| Error::Internal("len".into()))?)
-                    .ok_or_else(|| Error::Internal("len overflow".into()))?;
-                let entry = bytes
-                    .get(lo..hi)
-                    .ok_or_else(|| Error::Storage(format!("entry outside span in {key}")))?;
-                out.push((e.0, crate::try_grow::copy(entry)?));
+                out.push(located_entry(&bytes, e, start, &key)?);
             }
             i = j;
         }
@@ -1027,8 +1047,7 @@ impl PackWriter {
         };
         // fallible: a failed trailer growth or split returns the in-band
         // Limit, and the caller's finish path decides abort vs keep
-        room(&mut self.part, self.part_size, trailer.len())?;
-        self.part.extend_from_slice(&trailer);
+        trailer_append(&mut self.part, self.part_size, &trailer)?;
         self.flush_if_full(budget).await?;
         if !self.part.is_empty() {
             let last = std::mem::take(&mut self.part);
@@ -2306,5 +2325,43 @@ mod tests {
             (st.offset, st.count, st.commit_lo, st.commit_hi),
             (offset - 100 + tail.len() as u64, 4, 5, 30)
         );
+    }
+    /// The per-entry copy `read_entries` makes is fallible: a refused
+    /// reservation is the in-band Limit.
+    #[test]
+    fn located_entry_copies_fallibly() {
+        let _guard = crate::try_grow::HookGuard;
+        let e = (
+            ObjectId::from_bytes_or_panic(&[9u8; 20]),
+            ObjLoc {
+                pack: PackId("p".into()),
+                idx: 0,
+                offset: 4,
+                len: 3,
+                kind: gix_object::Kind::Blob,
+                size: 3,
+            },
+        );
+        let bytes = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
+        crate::try_grow::fail_above(Some(2));
+        let err = located_entry(&bytes, &&e, 0, "k").unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        crate::try_grow::fail_above(None);
+        assert_eq!(located_entry(&bytes, &&e, 0, "k").unwrap().1, vec![4, 5, 6]);
+    }
+
+    /// The trailer's room check is fallible: without it the append would
+    /// grow the part buffer infallibly past the part bound.
+    #[test]
+    fn trailer_append_reserves_fallibly() {
+        let _guard = crate::try_grow::HookGuard;
+        let trailer = vec![0u8; 100];
+        let mut part = vec![0u8; 64];
+        crate::try_grow::fail_above(Some(50));
+        let err = trailer_append(&mut part, 8 << 20, &trailer).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        crate::try_grow::fail_above(None);
+        trailer_append(&mut part, 8 << 20, &trailer).unwrap();
+        assert_eq!(part.len(), 164);
     }
 }
