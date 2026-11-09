@@ -96,10 +96,12 @@ pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRou
     authenticate_with(credentials(req), env, need, route, spend).await
 }
 
-/// The post-credential half of authenticate. Split out so a caller that
-/// must not hold a borrow on `req` across the await — lfs_batch reads the
-/// body after auth — can extract credentials synchronously, then sequence
-/// the check before the read.
+/// The post-credential half of authenticate: resolve the presented
+/// credential to its Grant, then admit it against the route's Level.
+/// Split out so a caller that must not hold a borrow on `req` across the
+/// await can extract credentials synchronously, then sequence the check.
+/// lfs_batch resolves through `resolve` directly — it learns the required
+/// level only after `operation` parses.
 pub(crate) async fn authenticate_with(
     creds: Result<(String, String), Error>,
     env: &Env,
@@ -107,27 +109,63 @@ pub(crate) async fn authenticate_with(
     route: &RepoRoute,
     spend: &Spend,
 ) -> Result<String, Error> {
+    // no credential can never satisfy Write — refuse before resolve's
+    // anonymous probe would spend a DO call on it
+    if matches!(need, Level::Write) && matches!(&creds, Err(Error::Auth)) {
+        return Err(Error::Auth);
+    }
+    admit(resolve(creds, env, route, spend).await?, need)
+}
+
+/// What one credential resolution settled: the principal to record plus
+/// the level the credential actually grants. `admit` maps the grant onto
+/// a route's required Level, so a caller that learns its need late —
+/// lfs_batch parses `operation` only after the body — resolves once and
+/// admits later with no second DO call.
+pub(crate) struct Grant {
+    pub principal: String,
+    pub level: Granted,
+}
+
+/// The level a resolved credential grants. `Anonymous` is no credential
+/// offered on a public repo — the /_do/public probe inside `anonymous`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Granted {
+    Anonymous,
+    Read,
+    Write,
+}
+
+/// One need-agnostic credential resolution: the global write/read secrets
+/// answer locally, a repo token costs one /_do/auth lookup, and no
+/// credential costs one /_do/public probe deciding the anonymous grant.
+/// Level-dependent refusal is `admit`'s job. Storage errors propagate —
+/// never silently treat a DO failure as unauthenticated.
+pub(crate) async fn resolve(
+    creds: Result<(String, String), Error>,
+    env: &Env,
+    route: &RepoRoute,
+    spend: &Spend,
+) -> Result<Grant, Error> {
     let (token, principal) = match creds {
         Ok(c) => c,
-        // no usable credential on a read route: a public repo answers anonymously.
-        // (A presented-but-invalid credential still gets the challenge — anonymous
-        // fallback is only for requests that never offered one.)
-        Err(Error::Auth) if matches!(need, Level::Read) => return anonymous(env, route, spend).await,
+        // no usable credential: the anonymous fallback decides — a public
+        // repo resolves to the anonymous grant, a private one stays Auth
+        Err(Error::Auth) => {
+            let principal = anonymous(env, route, spend).await?;
+            return Ok(Grant { principal, level: Granted::Anonymous });
+        }
         Err(e) => return Err(e),
     };
     // optional for read-only deployments: an unset write secret just never matches,
     // it must not 500 a read route
     let write = secret_opt(env, "GE_WRITE_TOKEN");
     if write.map(|w| ct_eq(token.as_bytes(), w.as_bytes())) == Some(true) {
-        return Ok(principal);
+        return Ok(Grant { principal, level: Granted::Write });
     }
     let read = secret_opt(env, "GE_READ_TOKEN");
     if read.map(|r| ct_eq(token.as_bytes(), r.as_bytes())) == Some(true) {
-        return match need {
-            Level::Read => Ok(principal),
-            // a valid read token is forbidden, not unauthenticated: no second challenge
-            Level::Write => Err(Error::Forbidden),
-        };
+        return Ok(Grant { principal, level: Granted::Read });
     }
     // per-repo tokens are `ge_` + 64 lowercase hex — anything else can be rejected
     // here without waking the DO (a non-global credential must not cost a DO boot
@@ -153,16 +191,35 @@ pub(crate) async fn authenticate_with(
     )
     .await;
     match row {
-        Ok(r) if r.level == "write" => Ok(r.name),
-        Ok(r) if r.level == "read" && matches!(need, Level::Read) => Ok(r.name),
-        Ok(_) => Err(Error::Forbidden), // repo read token on a write route
+        Ok(r) if r.level == "write" => Ok(Grant { principal: r.name, level: Granted::Write }),
+        Ok(r) if r.level == "read" => Ok(Grant { principal: r.name, level: Granted::Read }),
+        // a level the edge does not know grants nothing — Forbidden on
+        // either need, the refusal authenticate_with always gave it
+        Ok(_) => Err(Error::Forbidden),
         Err(Error::Auth) | Err(Error::NotFound) => Err(Error::Auth),
         Err(e) => Err(e),
     }
 }
 
-/// No credential presented on a read route: one `/_do/public` probe decides
-/// whether the repo serves anonymous reads. Non-Auth DO errors propagate — a
+/// The pure need-vs-grant decision: Read admits every resolved grant —
+/// resolve already vetted the credential and ran the anonymous probe —
+/// while Write admits only a write grant. A read grant is Forbidden (a
+/// valid credential at the wrong level, not a second challenge); the
+/// anonymous grant is Auth, the same 401 a missing credential always got
+/// on Write.
+pub(crate) fn admit(grant: Grant, need: Level) -> Result<String, Error> {
+    match need {
+        Level::Read => Ok(grant.principal),
+        Level::Write => match grant.level {
+            Granted::Write => Ok(grant.principal),
+            Granted::Read => Err(Error::Forbidden),
+            Granted::Anonymous => Err(Error::Auth),
+        },
+    }
+}
+
+/// No credential presented: one `/_do/public` probe decides whether the
+/// repo serves anonymous reads. Non-Auth DO errors propagate — a
 /// tombstoned repo answers 410, not a fresh 401 challenge.
 async fn anonymous(env: &Env, route: &RepoRoute, spend: &Spend) -> Result<String, Error> {
     #[derive(serde::Deserialize)]
@@ -237,4 +294,43 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(level: Granted) -> Grant {
+        Grant { principal: "p".into(), level }
+    }
+
+    /// admit is the whole need-vs-grant decision, so each granted level's
+    /// download/upload outcome is pinned here: a write grant (global write
+    /// token or a repo write token) admits both, a read grant (global read
+    /// or repo read token) admits download and refuses upload with
+    /// Forbidden — a valid credential at the wrong level, not a second
+    /// challenge. The anonymous grant — no credential offered on a public
+    /// repo — admits download and refuses upload with Auth, the same 401
+    /// authenticate(Write) gives a missing credential. Credential validity,
+    /// the anonymous probe and DO errors live in resolve, which needs the
+    /// worker runtime.
+    #[test]
+    fn admit_write_grant_admits_download_and_upload() {
+        assert_eq!(admit(grant(Granted::Write), Level::Read).unwrap(), "p");
+        assert_eq!(admit(grant(Granted::Write), Level::Write).unwrap(), "p");
+    }
+
+    #[test]
+    fn admit_read_grant_admits_download_and_forbids_upload() {
+        assert_eq!(admit(grant(Granted::Read), Level::Read).unwrap(), "p");
+        assert!(matches!(admit(grant(Granted::Read), Level::Write), Err(Error::Forbidden)));
+    }
+
+    #[test]
+    fn admit_anonymous_grant_admits_download_and_challenges_upload() {
+        let g = Grant { principal: "anonymous".into(), level: Granted::Anonymous };
+        assert_eq!(admit(g, Level::Read).unwrap(), "anonymous");
+        let g = Grant { principal: "anonymous".into(), level: Granted::Anonymous };
+        assert!(matches!(admit(g, Level::Write), Err(Error::Auth)));
+    }
 }
