@@ -2155,7 +2155,7 @@ pub async fn one_entry<O: PackOut>(
         // mid-entry resume: bytes [0, skip) of the wire entry are already durable
         // upload parts — re-encode deterministically and append only the tail,
         // so the row's (offset, len) still describes the whole entry.
-        let mut enc = Vec::new();
+        let mut enc = crate::try_grow::with_capacity(crate::store::encoded_bound(data.len()))?;
         codec::encode_entry(kind, &data, &mut enc)?;
         let tail = usize::try_from(skip.min(enc.len() as u64)).map_err(internal)?;
         let start = out.offset().saturating_sub(tail as u64);

@@ -25,6 +25,26 @@ use crate::{ReqBudget, Spend};
 const CMD_CAP: usize = 1 << 20; // section 6.3: command section cap
 const FILL_STEP: usize = 64 << 10; // 6.3: fill in 64 KiB steps
 
+/// `Request::bytes()` without worker's infallible `vec![0; len]` inside
+/// `Uint8Array::to_vec()`: array_buffer() -> one Uint8Array -> a single
+/// fallible reservation + copy_to. A refused reservation is the in-band
+/// memory Limit.
+async fn request_body_bytes(req: &Request) -> Result<Vec<u8>, Error> {
+    let p = req
+        .inner()
+        .array_buffer()
+        .map_err(|e| Error::Protocol(format!("body: {e:?}")))?;
+    let v = wasm_bindgen_futures::JsFuture::from(p)
+        .await
+        .map_err(|e| Error::Protocol(format!("body: {e:?}")))?;
+    let a = js_sys::Uint8Array::new(&v);
+    let len = a.length() as usize;
+    crate::store::js_body(len, |buf| {
+        a.copy_to(buf);
+        Ok(())
+    })
+}
+
 /// The request body as a chunked byte stream (section 6). gzip is decoded through a
 /// `DecompressionStream` when `Content-Encoding: gzip` is set; other encodings are rejected.
 pub struct BodyReader {
@@ -533,7 +553,7 @@ async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend
     if too_big {
         return Err(Error::Protocol("lfs batch body too large".into()));
     }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    let body = request_body_bytes(&req).await?;
     if body.len() > 1_048_576 {
         return Err(Error::Protocol("lfs batch body too large".into()));
     }
@@ -645,7 +665,7 @@ async fn token_create(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
     if too_big {
         return Err(Error::Protocol("token create body too large".into()));
     }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    let body = request_body_bytes(&req).await?;
     if body.len() > 65_536 {
         // chunked upload had no content-length to check up front
         return Err(Error::Protocol("token create body too large".into()));
@@ -706,7 +726,7 @@ async fn json_body(req: &mut Request) -> Result<serde_json::Value, Error> {
             return Err(Error::Protocol("admin body too large".into()));
         }
     }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    let body = request_body_bytes(req).await?;
     if body.len() > 4_096 {
         return Err(Error::Protocol("admin body too large".into()));
     }
@@ -926,7 +946,7 @@ async fn import_body(req: &mut Request) -> Result<serde_json::Value, Error> {
             return Err(Error::Protocol("import body too large".into()));
         }
     }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
+    let body = request_body_bytes(req).await?;
     if body.len() > (4 << 20) {
         return Err(Error::Protocol("import body too large".into()));
     }
@@ -1080,7 +1100,7 @@ async fn test_forward(mut req: Request, env: &Env, route: &RepoRoute, path: &str
             .unwrap_or_else(|| "refs".into());
         serde_json::to_vec(&serde_json::json!({ "mode": mode })).map_err(|e| Error::Internal(e.to_string()))?
     } else {
-        req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?
+        request_body_bytes(&req).await?
     };
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let mut resp = stub_raw(&stub, route, path, body, &mut budget, None).await?;

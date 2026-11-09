@@ -43,6 +43,43 @@ pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) -> Result<(), E
     Ok(())
 }
 
+/// `resume_tail`'s state transition, factored so the reservation order is
+/// testable natively: the room the CLEARED buffer would need is reserved
+/// BEFORE `part` is cleared, so a refused reservation changes nothing —
+/// the buffered tail bytes and every counter the caller keeps stay as
+/// they were. Returns the writer's new (offset, count, commit_lo,
+/// commit_hi) only on success.
+fn resume_tail_apply(
+    part: &mut Vec<u8>,
+    part_size: usize,
+    bytes: &[u8],
+    offset: u64,
+    count: u32,
+    commit_lo: u64,
+    commit_hi: u64,
+    extra: u32,
+    lo: u64,
+    hi: u64,
+) -> Result<(u64, u32, u64, u64), Error> {
+    let new_offset = offset
+        .saturating_sub(part.len() as u64)
+        .saturating_add(bytes.len() as u64);
+    // reserve exactly what room() would allocate for the cleared buffer —
+    // sized against len 0, not the bytes about to be dropped
+    let target = room_target(0, part.capacity(), part_size, bytes.len());
+    if target > part.capacity() {
+        crate::try_grow::vec_exact(part, target.saturating_sub(part.len()))?;
+    }
+    part.clear();
+    part.extend_from_slice(bytes);
+    Ok((
+        new_offset,
+        count.saturating_add(extra),
+        commit_lo.min(lo),
+        commit_hi.max(hi),
+    ))
+}
+
 /// Per-allocation overhead a growing buffer can add on top of its byte
 /// capacity: the allocator's chunk header and alignment rounding, and
 /// `memory.grow` handing out whole 64 KiB wasm pages. One page covers all
@@ -438,6 +475,58 @@ pub struct Bucket {
     pub inner: worker::Bucket,
     pub repo: RepoId,
 }
+/// The fallible core every JS→Rust body copy shares: `len` bytes are
+/// reserved exactly once through try_grow — a refusal is the in-band
+/// memory Limit, never the infallible `vec![0; len]` worker's `bytes()`
+/// does internally — zeroed, then `fill` writes them. Native-testable
+/// through the fail hook.
+pub(crate) fn js_body(len: usize, fill: impl FnOnce(&mut [u8]) -> Result<(), Error>) -> Result<Vec<u8>, Error> {
+    let mut v = crate::try_grow::zeroed(len)?;
+    fill(v.as_mut_slice())?;
+    Ok(v)
+}
+
+/// `ObjectBody` → Vec without worker's infallible `vec![0; len]`: the
+/// body's ReadableStream yields JS Uint8Array chunks (JS-side — no wasm
+/// copy yet); `want` bytes are reserved once, fallibly, then each chunk
+/// is `copy_to`'d into place.
+async fn object_body_vec(body: worker::ObjectBody<'_>, want: usize) -> Result<Vec<u8>, Error> {
+    use futures_util::StreamExt as _;
+    use wasm_bindgen::JsCast as _;
+    let stream = match body.response_body()? {
+        worker::ResponseBody::Body(b) => {
+            if b.len() != want {
+                return Err(Error::Storage(format!("r2 body {} bytes, wanted {want}", b.len())));
+            }
+            return Ok(b);
+        }
+        worker::ResponseBody::Empty => return Err(Error::Storage("r2 body empty".into())),
+        worker::ResponseBody::Stream(rs) => rs,
+    };
+    let mut chunks = Vec::new();
+    let mut total = 0usize;
+    let mut s = wasm_streams::ReadableStream::from_raw(stream.unchecked_into()).into_stream();
+    while let Some(item) = s.next().await {
+        let v = item.map_err(|e| Error::Storage(format!("r2 body stream: {e:?}")))?;
+        let a = js_sys::Uint8Array::new(&v);
+        total = total.saturating_add(a.length() as usize);
+        crate::try_grow::vec(&mut chunks, 1)?;
+        chunks.push(a);
+    }
+    if total != want {
+        return Err(Error::Storage(format!("r2 body {total} bytes, wanted {want}")));
+    }
+    js_body(want, |buf| {
+        let mut pos = 0usize;
+        for a in &chunks {
+            let n = a.length() as usize;
+            a.copy_to(&mut buf[pos..pos + n]);
+            pos += n;
+        }
+        Ok(())
+    })
+}
+
 impl Bucket {
     pub fn new(inner: worker::Bucket, repo: RepoId) -> Self {
         Self { inner, repo }
@@ -451,9 +540,10 @@ impl Bucket {
         budget: &mut ReqBudget,
     ) -> Result<Vec<u8>, Error> {
         budget.charge(1)?;
-        // the returned body comes from the R2 binding (`bytes()` copies a
-        // JS ArrayBuffer into wasm memory): it cannot reserve fallibly, so
-        // every pass-B caller preflights it through the memory guard
+        // the returned body comes from the R2 binding: the range length
+        // is bounded upstream (window fetch, entry wire cap, read_entries
+        // span), and object_body_vec reserves it fallibly before copying —
+        // callers still preflight through the memory guard
         let obj = self
             .inner
             .get(key)
@@ -461,15 +551,11 @@ impl Bucket {
             .execute()
             .await?
             .ok_or_else(|| Error::Storage(format!("missing {key}")))?;
-        let bytes = obj
+        let body = obj
             .body()
-            .ok_or_else(|| Error::Storage(format!("no body for {key}")))?
-            .bytes()
-            .await?;
-        if u64::try_from(bytes.len()).ok() != Some(len) {
-            return Err(Error::Storage(format!("short read on {key}")));
-        }
-        Ok(bytes)
+            .ok_or_else(|| Error::Storage(format!("no body for {key}")))?;
+        let want = usize::try_from(len).map_err(|_| Error::Storage(format!("range too large on {key}")))?;
+        object_body_vec(body, want).await
     }
     /// Coalesced reads (7.2): sort by (pack, offset), merge gaps < 256 KiB, split at 8 MiB.
     pub async fn read_entries(
@@ -789,17 +875,22 @@ impl PackWriter {
     /// the buffer. `extra`/`lo`/`hi` fold the tail's already-completed entries back
     /// into the writer's counters (their `ObjRow`s were posted at the yield).
     pub fn resume_tail(&mut self, bytes: &[u8], extra: u32, lo: u64, hi: u64) -> Result<(), Error> {
-        let offset = self
-            .offset
-            .saturating_sub(self.part.len() as u64)
-            .saturating_add(bytes.len() as u64);
-        self.part.clear();
-        room(&mut self.part, self.part_size, bytes.len())?;
-        self.part.extend_from_slice(bytes);
+        let (offset, count, commit_lo, commit_hi) = resume_tail_apply(
+            &mut self.part,
+            self.part_size,
+            bytes,
+            self.offset,
+            self.count,
+            self.commit_lo,
+            self.commit_hi,
+            extra,
+            lo,
+            hi,
+        )?;
         self.offset = offset;
-        self.count = self.count.saturating_add(extra);
-        self.commit_lo = self.commit_lo.min(lo);
-        self.commit_hi = self.commit_hi.max(hi);
+        self.count = count;
+        self.commit_lo = commit_lo;
+        self.commit_hi = commit_hi;
         Ok(())
     }
     /// Append raw pack bytes verbatim: any chunk of an entry's `varint header + zlib
@@ -1993,5 +2084,54 @@ mod tests {
             encoded_bound(data.len()),
             enc.len()
         );
+    }
+
+    /// js_body reserves `len` through try_grow BEFORE fill runs: the
+    /// fail hook's refusal is the in-band Limit and fill never executes;
+    /// a fitting reservation returns the filled bytes.
+    #[test]
+    fn js_body_reserves_fallibly_then_fills() {
+        crate::try_grow::fail_above(Some(8));
+        let mut filled = false;
+        let err = js_body(16, |_| {
+            filled = true;
+            Ok(())
+        })
+        .unwrap_err();
+        crate::try_grow::fail_above(None);
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert!(!filled, "fill must not run on a refused reservation");
+        let v = js_body(4, |b| {
+            b.copy_from_slice(&[1, 2, 3, 4]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(v, vec![1, 2, 3, 4]);
+    }
+
+    /// resume_tail_apply reserves the cleared buffer's room BEFORE
+    /// clearing: a refused reservation is the in-band Limit and the part
+    /// bytes stay exactly as they were — the writer's offset/count/commit
+    /// counters, which the caller only writes on Ok, are untouched by
+    /// construction. On success the returned tuple carries the folded
+    /// counters and the part holds only the new tail.
+    #[test]
+    fn resume_tail_reserves_before_clearing() {
+        // a buffer with a live tail to lose if the order were wrong
+        let mut part: Vec<u8> = Vec::with_capacity(4 * 1024);
+        part.extend_from_slice(&[9u8; 100]);
+        let (offset, count, lo, hi) = (500u64, 3u32, 10u64, 20u64);
+        let tail = vec![7u8; 5 * 1024]; // bigger than the 4 KiB capacity -> must reserve
+        // the cleared buffer needs one whole 8 KiB part — over capacity —
+        // refuse anything under it
+        crate::try_grow::fail_above(Some(2 * 1024));
+        let e = resume_tail_apply(&mut part, 8 * 1024, &tail, offset, count, lo, hi, 1, 5, 30).unwrap_err();
+        crate::try_grow::fail_above(None);
+        assert!(crate::try_grow::is_retry(&e), "{e}");
+        assert_eq!(part, vec![9u8; 100], "a refused reservation must not clear the part");
+        // success: part holds only the tail; counters fold correctly
+        let (o, c, l, h) = resume_tail_apply(&mut part, 8 * 1024, &tail, offset, count, lo, hi, 1, 5, 30).unwrap();
+        assert_eq!(part, tail);
+        assert_eq!((o, c, l, h), (offset - 100 + tail.len() as u64, 4, 5, 30));
     }
 }
