@@ -292,6 +292,15 @@ pub struct Cache {
     map: HashMap<Key, Obj>,
     order: VecDeque<Key>,
 }
+/// Bytes one cached entry costs beyond its payload, counted against the
+/// cache budget so many tiny objects are bounded too, not just big ones:
+/// the map slot (key + value + control byte) and the queue slot, each
+/// doubled for the tables' growth headroom, plus the Rc and Vec headers of
+/// the payload allocation. Every queued key pays it until it is popped.
+const CACHE_ENTRY_OVERHEAD: usize = 2
+    * (std::mem::size_of::<(Key, Obj)>() + 1 + std::mem::size_of::<Key>())
+    + 2 * std::mem::size_of::<usize>()
+    + std::mem::size_of::<Vec<u8>>();
 impl Default for Cache {
     fn default() -> Self {
         Self::with_budget(CACHE)
@@ -304,21 +313,35 @@ impl Cache {
     fn get(&self, k: &Key) -> Option<Obj> {
         self.map.get(k).cloned()
     }
+    /// Peak bytes the NEXT `put` can allocate for bookkeeping: a map table
+    /// resize and a queue resize, each holding its old and new block at
+    /// once. 0 when both have room. The payload Vec is already allocated
+    /// by the caller (and its decode was preflighted).
+    fn put_growth_bound(&self) -> usize {
+        map_growth_peak::<(Key, Obj)>(self.map.len(), self.map.capacity())
+            .saturating_add(vec_growth_peak::<Key>(self.order.len(), self.order.capacity(), 1))
+    }
     /// Cache one decoded object. The Vec is shrink_to_fit'd first so its
     /// capacity stops doubling past the payload, and `bytes` accounts
-    /// `capacity()` — the allocator's real footprint, not just `len()`.
+    /// `capacity()` — the allocator's real footprint, not just `len()` —
+    /// plus CACHE_ENTRY_OVERHEAD per queued key.
     fn put(&mut self, k: Key, kind: Kind, mut d: Vec<u8>) -> Obj {
         d.shrink_to_fit();
         let d = Rc::new(d);
-        self.bytes = self.bytes.saturating_add(d.capacity());
+        self.bytes = self.bytes.saturating_add(d.capacity()).saturating_add(CACHE_ENTRY_OVERHEAD);
         self.order.push_back(k);
         if let Some((_, old)) = self.map.insert(k, (kind, d.clone())) {
+            // the old entry's queue slot stays queued and keeps paying its
+            // overhead until it pops
             self.bytes = self.bytes.saturating_sub(old.capacity());
         }
         while self.bytes > self.budget {
-            match self.order.pop_front().and_then(|k| self.map.remove(&k)) {
-                Some((_, v)) => self.bytes = self.bytes.saturating_sub(v.capacity()),
-                None => break,
+            let Some(k) = self.order.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(CACHE_ENTRY_OVERHEAD);
+            // a stale duplicate slot finds nothing (or the key's newer
+            // entry, which then leaves early — always safe, only slower)
+            if let Some((_, v)) = self.map.remove(&k) {
+                self.bytes = self.bytes.saturating_sub(v.capacity());
             }
         }
         (kind, d)
@@ -716,6 +739,11 @@ impl AnySink<'_, '_> {
             AnySink::Mem(s) => &mut s.tags,
         }
     }
+    /// Peak bytes the next tag insert can need — see map_growth_peak.
+    pub fn tags_growth_bound(&mut self) -> usize {
+        let t = self.tags_mut();
+        map_growth_peak::<(ObjectId, ObjectId)>(t.len(), t.capacity())
+    }
     /// Peak bytes `push_links`' extend can need for `adding` more links —
     /// the memory guard's preflight for the sink-side growth. 0 when the
     /// links fit the current capacity. Otherwise Vec's amortized growth
@@ -975,6 +1003,17 @@ impl Cx<'_> {
         self.mem_grow(incoming, None, site)
     }
 
+    /// Cache one decoded object after preflighting the cache's own
+    /// bookkeeping growth — its map table and LRU queue double as entries
+    /// accumulate. `site` tags the test probe; every call site has its own.
+    fn cache_put(&mut self, k: Key, kind: Kind, d: Vec<u8>, site: &'static str) -> Result<Obj, Error> {
+        if self.mem.is_some() {
+            let bound = self.cache.put_growth_bound();
+            self.mem_grow(bound, None, site)?;
+        }
+        Ok(self.cache.put(k, kind, d))
+    }
+
     /// Preflight for `Bucket::read_entries(locs)` — the external-base fetch
     /// (`external`) and the resolve loop's prefetch batch. The bound counts
     /// every entry copy plus the largest merged-span range buffer; same
@@ -1188,7 +1227,7 @@ pub async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> 
     // in-walk, not just the ambient heap
     cx.mem_decode(decode_entry_bound(&entry), Some(ObjLabel::Sha(id)), "decode:external")?;
     let (k, d) = codec::decode_entry(&entry)?;
-    Ok(cx.cache.put(Key::Id(id), k, d))
+    cx.cache_put(Key::Id(id), k, d, "grow:cache-external")
 }
 
 /// Resolve a ref-delta base id: resolved in-pack entry -> chain walk; repo base -> read;
@@ -1295,7 +1334,7 @@ pub async fn resolve_at(
                 // body plus the output object — it preflights its own bound
                 cx.mem_relief()?;
                 let (k, d) = decode_mini(cx, None, &raw, ObjLabel::Offset(off))?;
-                break cx.cache.put(Key::Off(off), k, d);
+                break cx.cache_put(Key::Off(off), k, d, "grow:cache-chain-base")?;
             }
         }
     };
@@ -1304,7 +1343,7 @@ pub async fn resolve_at(
         // rest of the chain still retains — same in-walk relief
         cx.mem_relief()?;
         let (_, d) = decode_mini(cx, Some((kind, &data)), &raw, ObjLabel::Offset(o))?;
-        data = cx.cache.put(Key::Off(o), kind, d).1;
+        data = cx.cache_put(Key::Off(o), kind, d, "grow:cache-chain")?.1;
     }
     cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
     Ok(Base::Ready((kind, data)))
@@ -1357,6 +1396,36 @@ const DECODE_SCRATCH: usize = 512 << 10;
 /// state, Vec capacity rounding past `room`'s whole-part target, the
 /// UploadedPart bookkeeping, and request plumbing the byte terms don't name.
 const STREAM_SLACK: usize = 1 << 20;
+
+/// Bytes a hashbrown table sized for `items` entries of `T` holds: the
+/// bucket count is the next power of two over items x 8/7 (87.5% max
+/// load; 4 or 8 buckets for tiny tables), each bucket one `T` plus one
+/// control byte, plus one 16-byte control group.
+fn table_bytes<T>(items: usize) -> usize {
+    if items == 0 {
+        return 0;
+    }
+    let buckets = if items < 4 {
+        4
+    } else if items < 8 {
+        8
+    } else {
+        (items.saturating_mul(8) / 7).saturating_add(1).next_power_of_two()
+    };
+    buckets.saturating_mul(std::mem::size_of::<T>().saturating_add(1)).saturating_add(16)
+}
+
+/// Peak bytes one more insert can need in a HashMap of `len` entries and
+/// `cap` capacity: 0 while it has room, else the old table plus a new one
+/// sized for at least cap + 1 entries (hashbrown at least doubles), held
+/// at once while entries move, plus one allocation's overhead.
+fn map_growth_peak<T>(len: usize, cap: usize) -> usize {
+    if len < cap {
+        return 0;
+    }
+    let grown = cap.saturating_add(1).max(len.saturating_add(1)).saturating_mul(2);
+    crate::store::moving_peak(table_bytes::<T>(cap), table_bytes::<T>(grown))
+}
 
 /// Peak bytes a `Vec<T>` of `len`/`cap` can hold while `extend` grows it
 /// for `adding` more elements: 0 if they fit, else Vec's amortized target
@@ -1676,7 +1745,7 @@ pub async fn resolve_and_normalize<O: PackOut>(
             for (id, entry) in entries {
                 let Ok(()) = cx.mem_decode(decode_entry_bound(&entry), Some(ObjLabel::Sha(id)), "decode:prefetch") else { break };
                 let Ok((k, d)) = codec::decode_entry(&entry) else { break };
-                cx.cache.put(Key::Id(id), k, d);
+                let Ok(_) = cx.cache_put(Key::Id(id), k, d, "grow:cache-prefetch") else { break };
             }
         }
     }
@@ -1811,6 +1880,8 @@ pub async fn one_entry<O: PackOut>(
     let parents = (kind == Kind::Commit).then(|| links.iter().skip(1).copied().collect::<Vec<_>>());
     if kind == Kind::Tag {
         if let Some(&t) = links.first() {
+            // the tag map doubles as tags accumulate — preflight its resize
+            cx.mem_grow(sink.tags_growth_bound(), None, "grow:tags")?;
             sink.tags_mut().insert(id, t);
         }
     }
@@ -1856,7 +1927,7 @@ pub async fn one_entry<O: PackOut>(
     if need_ids {
         cx.by_id.insert(id, i);
     }
-    cx.cache.put(Key::Off(rec.offset), kind, data);
+    cx.cache_put(Key::Off(rec.offset), kind, data, "grow:cache-entry")?;
     if rows.len() >= sink.row_batch() {
         // each index post's JSON body (plus its request copy) is a pass-B
         // allocation too — commit rows carry parents, so price it first
@@ -2012,15 +2083,15 @@ mod tests {
 
     #[test]
     fn cache_accounts_capacity_and_evicts_lru() {
-        let mut c = Cache::with_budget(100);
+        let mut c = Cache::with_budget(100 + 2 * CACHE_ENTRY_OVERHEAD);
         c.put(Key::Off(1), Kind::Blob, vec![7u8; 60]);
         c.put(Key::Off(2), Kind::Blob, vec![9u8; 60]);
         // second put overflowed the budget: the oldest entry was evicted
         assert!(c.get(&Key::Off(1)).is_none());
         assert!(c.get(&Key::Off(2)).is_some());
-        // bytes tracks the Vec's capacity(), not its len()
+        // bytes tracks the Vec's capacity(), not its len(), plus overhead
         let cap = c.map.get(&Key::Off(2)).unwrap().1.capacity();
-        assert_eq!(c.bytes, cap);
+        assert_eq!(c.bytes, cap + CACHE_ENTRY_OVERHEAD);
         c.clear();
         assert_eq!(c.bytes, 0);
         assert!(c.get(&Key::Off(2)).is_none());
@@ -3005,7 +3076,7 @@ mod tests {
     /// under-count and keep entries the budget should evict.
     #[test]
     fn cache_accounts_capacity_not_len() {
-        let mut c = Cache::with_budget(100);
+        let mut c = Cache::with_budget(100 + CACHE_ENTRY_OVERHEAD);
         // Vec with len 10 but capacity 60 — shrink_to_fit in put() makes
         // capacity==len for the STORED vec, so test the accounting path via
         // a vec that keeps spare: put() shrink_to_fits, so instead verify
@@ -3016,8 +3087,8 @@ mod tests {
         c.put(Key::Off(1), Kind::Blob, v);
         let stored = c.map.get(&Key::Off(1)).unwrap().1.clone();
         // after shrink_to_fit capacity may equal len — the point is bytes
-        // equals the STORED vec's capacity(), whatever it is
-        assert_eq!(c.bytes, stored.capacity());
+        // equals the STORED vec's capacity(), whatever it is, plus overhead
+        assert_eq!(c.bytes, stored.capacity() + CACHE_ENTRY_OVERHEAD);
         assert!(c.bytes >= stored.len());
     }
 
@@ -3115,6 +3186,69 @@ mod tests {
             cap_now * elem + (len + big) * elem + crate::store::ALLOC_OVERHEAD
         );
         assert_eq!(vec_growth_peak::<u8>(0, 0, 1), 4 + crate::store::ALLOC_OVERHEAD, "Vec's minimum non-zero capacity");
+    }
+
+    /// Codex #5: tiny objects are bounded too. Each entry pays
+    /// CACHE_ENTRY_OVERHEAD, so a budget of N overheads holds at most N
+    /// empty objects however many are put, and the map and queue stop
+    /// growing with it. Re-puts of one key keep the queue bounded as well.
+    #[test]
+    fn cache_budget_bounds_tiny_entries_by_overhead() {
+        let mut c = Cache::with_budget(100 * CACHE_ENTRY_OVERHEAD);
+        for i in 0..10_000u64 {
+            c.put(Key::Off(i), Kind::Blob, Vec::new());
+        }
+        assert_eq!(c.map.len(), 100);
+        assert_eq!(c.order.len(), 100);
+        assert!(c.bytes <= c.budget);
+        for _ in 0..10_000 {
+            c.put(Key::Off(7), Kind::Blob, vec![1]);
+        }
+        assert!(c.order.len() <= 100, "re-puts grew the queue to {}", c.order.len());
+        assert!(c.bytes <= c.budget);
+        // the overhead covers both tables' slots with doubling headroom
+        assert!(CACHE_ENTRY_OVERHEAD >= 2 * (std::mem::size_of::<(Key, Obj)>() + 1 + std::mem::size_of::<Key>()));
+    }
+
+    /// Codex #5: map and queue growth preflights. The bound is 0 while
+    /// both have room and covers the old plus the new table when the next
+    /// insert resizes; checked against what HashMap/VecDeque really do.
+    #[test]
+    fn map_and_cache_growth_bounds_cover_real_resizes() {
+        for n in [0usize, 1, 3, 4, 7, 8, 13, 100, 1_000, 30_000] {
+            let mut m: HashMap<ObjectId, ObjectId> = HashMap::with_capacity(n);
+            let mut i = 0u32;
+            let id = |i: u32| {
+                let mut b = [0u8; 20];
+                b[..4].copy_from_slice(&i.to_be_bytes());
+                ObjectId::from_bytes_or_panic(&b)
+            };
+            while m.len() < m.capacity() {
+                m.insert(id(i), id(i));
+                i += 1;
+            }
+            let (len, cap) = (m.len(), m.capacity());
+            let bound = map_growth_peak::<(ObjectId, ObjectId)>(len, cap);
+            m.insert(id(i), id(i));
+            assert!(m.capacity() > cap, "the insert resized");
+            let elem = std::mem::size_of::<(ObjectId, ObjectId)>() + 1;
+            assert!(
+                bound >= (cap + m.capacity()) * elem,
+                "n={n}: bound {bound} < old {cap} + new {} slots",
+                m.capacity()
+            );
+            assert_eq!(map_growth_peak::<(ObjectId, ObjectId)>(m.len(), m.capacity()), 0, "room left: no preflight");
+        }
+        let mut c = Cache::with_budget(usize::MAX);
+        assert!(c.put_growth_bound() > 0, "the first put allocates both tables");
+        c.put(Key::Off(0), Kind::Blob, vec![1]);
+        if c.map.len() < c.map.capacity() && c.order.len() < c.order.capacity() {
+            assert_eq!(c.put_growth_bound(), 0);
+        }
+        // the tags preflight reads the sink's map the same way
+        let mut sink = MemSink::default();
+        let mut any = AnySink::Mem(&mut sink);
+        assert!(any.tags_growth_bound() > 0, "an empty map allocates on first insert");
     }
 
     #[test]
