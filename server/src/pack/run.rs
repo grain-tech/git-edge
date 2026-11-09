@@ -996,10 +996,6 @@ async fn admit_pass_b(env: &Env, budget: &ReqBudget, objects: usize, pack_bytes:
 mod tests {
     use super::*;
 
-    fn test_budget() -> ReqBudget {
-        ReqBudget { max_subrequests: 9_000, used: 0, started_ms: crate::wall_now(), max_ms: ReqBudget::MAX_MS, sink: None, lease: None }
-    }
-
     fn oid(n: u32) -> ObjectId {
         let mut b = [0u8; 20];
         b[..4].copy_from_slice(&n.to_be_bytes());

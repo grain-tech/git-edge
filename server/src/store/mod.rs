@@ -1211,7 +1211,7 @@ impl PackWriter {
 /// through `finish_writer` (the "grow:writer-finish" preflight). The permit
 /// is minted only inside crate::jobs, so this cannot be named from
 /// pack::run.
-pub async fn finish_pack(out: PackWriter, _permit: crate::jobs::GcPermit, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+pub(crate) async fn finish_pack(out: PackWriter, _permit: crate::jobs::GcPermit, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
     out.finish(budget).await
 }
 
