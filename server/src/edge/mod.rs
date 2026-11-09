@@ -1239,6 +1239,20 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
     }
 }
 
+/// The next buffered chunk into the header accumulator: the cap is checked
+/// against `pr.buf` plus the pending bytes BEFORE the push, so a refusal
+/// never leaves the accumulator over CMD_CAP.
+fn header_push(pr: &mut PktReader, body: &mut BodyReader) -> Result<(), Error> {
+    check_body_len(
+        pr.buf.len().saturating_add(body.buffered().len()),
+        CMD_CAP,
+        "receive header > 1 MiB",
+    )?;
+    pr.push(&body.buffered().to_vec());
+    body.consume(usize::MAX);
+    Ok(())
+}
+
 /// Parse the receive-pack command header: pkt-lines up to the first flush, then the
 /// pack follows. Re-parses the whole accumulated buffer each round (bounded by CMD_CAP)
 /// because parse_receive_header's accumulators don't survive an Incomplete result.
@@ -1254,11 +1268,7 @@ async fn receive_header(body: &mut BodyReader) -> Result<(wire::ReceiveHeader, V
                 if body.buffered().is_empty() {
                     return Err(Error::Protocol("truncated receive header".into()));
                 }
-                pr.push(&body.buffered().to_vec());
-                body.consume(usize::MAX);
-                if pr.buf.len() > CMD_CAP {
-                    return Err(Error::Protocol("receive header > 1 MiB".into()));
-                }
+                header_push(&mut pr, body)?;
             }
         }
     }
@@ -1765,5 +1775,25 @@ mod tests {
         let mut reader = BodyReader::from_chunks(vec![payload.clone()], None);
         let body = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap();
         assert_eq!(body, payload);
+    }
+
+    /// The header accumulator refuses BEFORE the push that would take it
+    /// over the cap: pr.buf stays at or under CMD_CAP.
+    #[test]
+    fn header_push_refuses_before_exceeding_the_cap() {
+        let mut pr = PktReader::default();
+        pr.buf = vec![0u8; CMD_CAP - 1_000];
+        let mut body = BodyReader::from_chunks(vec![vec![7u8; FILL_STEP]], None);
+        block_on(body.fill(FILL_STEP)).unwrap();
+        let err = header_push(&mut pr, &mut body).unwrap_err();
+        assert!(
+            matches!(&err, Error::Protocol(m) if m == "receive header > 1 MiB"),
+            "{err}"
+        );
+        assert!(
+            pr.buf.len() <= CMD_CAP,
+            "pr.buf.len() = {} — the refusal must precede the push",
+            pr.buf.len()
+        );
     }
 }
