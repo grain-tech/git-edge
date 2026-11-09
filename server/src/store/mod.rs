@@ -493,10 +493,59 @@ pub(crate) fn js_body(len: usize, fill: impl FnOnce(&mut [u8]) -> Result<(), Err
     Ok(v)
 }
 
-/// `ObjectBody` → Vec without worker's infallible `vec![0; len]`: the
-/// body's ReadableStream yields JS Uint8Array chunks (JS-side — no wasm
-/// copy yet); `want` bytes are reserved once, fallibly, then each chunk
-/// is `copy_to`'d into place.
+/// One body chunk the exact-fill core copies from: a JS Uint8Array in
+/// production, a byte slice in native tests.
+pub(crate) trait BodyChunk {
+    fn len(&self) -> usize;
+    /// Copy every byte of the chunk into `dst`. `dst.len()` is `len()`.
+    fn copy_into(&self, dst: &mut [u8]);
+}
+
+impl BodyChunk for js_sys::Uint8Array {
+    fn len(&self) -> usize {
+        self.length() as usize
+    }
+    fn copy_into(&self, dst: &mut [u8]) {
+        self.copy_to(dst);
+    }
+}
+
+/// Read exactly `want` bytes from `stream` into one Rust buffer. The
+/// buffer is reserved fallibly BEFORE the stream is polled, so a refusal
+/// is the in-band memory Limit and no chunk is ever held. Each chunk is
+/// copied into place and dropped. A chunk that would pass `want` is a
+/// Storage error at once, before it is copied and before the stream is
+/// polled again. A stream that ends short of `want` is a Storage error.
+pub(crate) async fn fill_exact<C, S>(want: usize, stream: S) -> Result<Vec<u8>, Error>
+where
+    C: BodyChunk,
+    S: futures_util::Stream<Item = Result<C, Error>>,
+{
+    use futures_util::StreamExt as _;
+    let mut buf = crate::try_grow::zeroed(want)?;
+    let mut pos = 0usize;
+    let mut stream = std::pin::pin!(stream);
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        let n = chunk.len();
+        let end = match pos.checked_add(n) {
+            Some(end) if end <= want => end,
+            _ => return Err(Error::Storage(format!("r2 body longer than {want}"))),
+        };
+        chunk.copy_into(&mut buf[pos..end]);
+        pos = end;
+    }
+    if pos < want {
+        return Err(Error::Storage(format!("r2 body {pos} bytes, wanted {want}")));
+    }
+    Ok(buf)
+}
+
+/// `ObjectBody` → Vec without worker's infallible `vec![0; len]`, and
+/// without a JS-side copy of the body: `fill_exact` reserves `want`
+/// bytes first, then each ReadableStream chunk is cast to a Uint8Array
+/// and copied straight into place. An ArrayBuffer chunk gets a view,
+/// which copies nothing.
 async fn object_body_vec(body: worker::ObjectBody<'_>, want: usize) -> Result<Vec<u8>, Error> {
     use futures_util::StreamExt as _;
     use wasm_bindgen::JsCast as _;
@@ -510,28 +559,17 @@ async fn object_body_vec(body: worker::ObjectBody<'_>, want: usize) -> Result<Ve
         worker::ResponseBody::Empty => return Err(Error::Storage("r2 body empty".into())),
         worker::ResponseBody::Stream(rs) => rs,
     };
-    let mut chunks = Vec::new();
-    let mut total = 0usize;
-    let mut s = wasm_streams::ReadableStream::from_raw(stream.unchecked_into()).into_stream();
-    while let Some(item) = s.next().await {
-        let v = item.map_err(|e| Error::Storage(format!("r2 body stream: {e:?}")))?;
-        let a = js_sys::Uint8Array::new(&v);
-        total = total.saturating_add(a.length() as usize);
-        crate::try_grow::vec(&mut chunks, 1)?;
-        chunks.push(a);
-    }
-    if total != want {
-        return Err(Error::Storage(format!("r2 body {total} bytes, wanted {want}")));
-    }
-    js_body(want, |buf| {
-        let mut pos = 0usize;
-        for a in &chunks {
-            let n = a.length() as usize;
-            a.copy_to(&mut buf[pos..pos + n]);
-            pos += n;
-        }
-        Ok(())
-    })
+    let chunks = wasm_streams::ReadableStream::from_raw(stream.unchecked_into())
+        .into_stream()
+        .map(|item| {
+            let v = item.map_err(|e| Error::Storage(format!("r2 body stream: {e:?}")))?;
+            Ok(match v.dyn_into::<js_sys::Uint8Array>() {
+                Ok(a) => a,
+                Err(v) if v.is_instance_of::<js_sys::ArrayBuffer>() => js_sys::Uint8Array::new(&v),
+                Err(v) => return Err(Error::Storage(format!("r2 body chunk is not bytes: {v:?}"))),
+            })
+        });
+    fill_exact(want, chunks).await
 }
 
 impl Bucket {
@@ -2086,6 +2124,127 @@ mod tests {
             encoded_bound(data.len()),
             enc.len()
         );
+    }
+
+    impl BodyChunk for Vec<u8> {
+        fn len(&self) -> usize {
+            self.as_slice().len()
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            dst.copy_from_slice(self);
+        }
+    }
+    impl BodyChunk for &[u8] {
+        fn len(&self) -> usize {
+            <[u8]>::len(self)
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            dst.copy_from_slice(self);
+        }
+    }
+
+    /// A chunk that counts its copies, so a test can see that none ran.
+    struct Counted(Vec<u8>, std::rc::Rc<std::cell::Cell<usize>>);
+    impl BodyChunk for Counted {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            self.1.set(self.1.get() + 1);
+            dst.copy_from_slice(&self.0);
+        }
+    }
+
+    /// A body stream that counts its polls and can panic when polled.
+    struct Probe<C> {
+        items: std::collections::VecDeque<C>,
+        polls: std::rc::Rc<std::cell::Cell<usize>>,
+        panic_on_poll: bool,
+    }
+    impl<C: Unpin> futures_util::Stream for Probe<C> {
+        type Item = Result<C, Error>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            assert!(!self.panic_on_poll, "the body stream must not be polled");
+            self.polls.set(self.polls.get() + 1);
+            std::task::Poll::Ready(self.items.pop_front().map(Ok))
+        }
+    }
+    fn probe<C>(items: Vec<C>) -> (Probe<C>, std::rc::Rc<std::cell::Cell<usize>>) {
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+        (Probe { items: items.into(), polls: polls.clone(), panic_on_poll: false }, polls)
+    }
+    fn ready<F: std::future::Future>(f: F) -> F::Output {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(f).poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("fill_exact over a ready stream must not pend"),
+        }
+    }
+
+    /// The R2 read reserves `want` BEFORE it touches the body: with the
+    /// fail hook just below `want`, the answer is the in-band memory
+    /// Limit, the stream is never polled, and no chunk is copied. Draining
+    /// chunks first, as the old reader did, panics in the probe.
+    #[test]
+    fn fill_exact_reserves_before_polling_the_body() {
+        let want = 4096;
+        let copies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (mut s, polls) = probe(vec![Counted(vec![7; want], copies.clone())]);
+        s.panic_on_poll = true;
+        crate::try_grow::fail_above(Some(want - 1));
+        let r = ready(fill_exact(want, s));
+        crate::try_grow::fail_above(None);
+        let err = r.unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert_eq!(polls.get(), 0, "the stream must not be polled");
+        assert_eq!(copies.get(), 0, "no chunk may be copied");
+    }
+
+    /// An over-length body fails at the first chunk that passes `want`:
+    /// that chunk is not copied and later chunks are not polled.
+    #[test]
+    fn fill_exact_rejects_an_over_length_body_at_once() {
+        let copies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let c = |b: &[u8]| Counted(b.to_vec(), copies.clone());
+        let (s, polls) = probe(vec![c(&[1, 2]), c(&[3, 4, 5]), c(&[6]), c(&[7])]);
+        let err = ready(fill_exact(4, s)).unwrap_err();
+        assert!(matches!(&err, Error::Storage(m) if m == "r2 body longer than 4"), "{err}");
+        assert_eq!(polls.get(), 2, "the stream must stop at the overflowing chunk");
+        assert_eq!(copies.get(), 1, "the overflowing chunk must not be copied");
+    }
+
+    /// A body that ends short of `want` is the Storage error.
+    #[test]
+    fn fill_exact_rejects_a_short_body() {
+        let (s, _) = probe(vec![vec![1u8, 2], vec![3]]);
+        let err = ready(fill_exact(5, s)).unwrap_err();
+        assert!(matches!(&err, Error::Storage(m) if m == "r2 body 3 bytes, wanted 5"), "{err}");
+    }
+
+    /// An exact multi-chunk body returns its bytes in order, an empty
+    /// chunk included.
+    #[test]
+    fn fill_exact_joins_an_exact_multi_chunk_body() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let parts: Vec<&[u8]> = vec![&data[..1], &data[1..4096], &data[4096..4096], &data[4096..]];
+        let (s, polls) = probe(parts);
+        assert_eq!(ready(fill_exact(data.len(), s)).unwrap(), data);
+        assert_eq!(polls.get(), 5, "four chunks, then the end");
+    }
+
+    /// want == 0: an empty stream, or one with only empty chunks, is an
+    /// empty body. Any byte is over-length.
+    #[test]
+    fn fill_exact_handles_a_zero_length_body() {
+        let (s, _) = probe(Vec::<Vec<u8>>::new());
+        assert!(ready(fill_exact(0, s)).unwrap().is_empty());
+        let (s, _) = probe(vec![Vec::<u8>::new()]);
+        assert!(ready(fill_exact(0, s)).unwrap().is_empty());
+        let (s, _) = probe(vec![vec![1u8]]);
+        assert!(matches!(ready(fill_exact(0, s)), Err(Error::Storage(_))));
     }
 
     /// js_body reserves `len` through try_grow BEFORE fill runs: the
