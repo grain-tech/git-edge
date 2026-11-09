@@ -146,17 +146,25 @@ const LINEAR_CAP: usize = 112 << 20;
 /// Free space inside linear memory that the allocator may be unable to use
 /// for one request. Freed blocks are scattered, so a contiguous `incoming`
 /// block can need fresh pages even when the total free bytes exceed it.
-/// 16 MiB is one MAX_OBJ — the largest single block pass B allocates — so
-/// a heap with that much spare beyond `live + incoming` can place the
-/// block inside existing pages even if one MAX_OBJ-sized hole is unusable.
+/// 16 MiB is one MAX_OBJ — the largest single block pass B allocates.
 const FRAG_MARGIN: usize = 16 << 20;
 
-/// Would allocating `incoming` bytes risk growing linear memory past
-/// LINEAR_CAP? Only when the allocation may need fresh pages — live +
-/// incoming + FRAG_MARGIN no longer fits inside the current linear size —
-/// and those pages would cross the cap. A high-water linear size with a
-/// low live heap reuses its free pages and does not trip. `incoming == 0`
+/// Should the guard shed early because allocating `incoming` bytes may
+/// grow linear memory past LINEAR_CAP? It answers yes only when the
+/// allocation may need fresh pages — live + incoming + FRAG_MARGIN no
+/// longer fits inside the current linear size — and those pages would
+/// cross the cap. A high-water linear size with a low live heap is
+/// assumed to reuse its free pages and does not trip. `incoming == 0`
 /// allocates nothing and never trips.
+///
+/// This is a HEURISTIC. It decides only when to shed the cache and
+/// answer in-band early. Aggregate free space does not prove a contiguous
+/// block exists: a heap whose free bytes sit in holes smaller than
+/// `incoming` can still need fresh pages, and FRAG_MARGIN tolerates one
+/// unusable MAX_OBJ-sized hole, not more. Safety does not rest on this
+/// check. Every large or preflighted growth reserves fallibly through
+/// `crate::try_grow`, so a block the allocator cannot place answers with
+/// the same in-band retry Limit instead of trapping.
 fn linear_trip(live: usize, linear: usize, incoming: usize) -> bool {
     incoming > 0
         && live.saturating_add(incoming).saturating_add(FRAG_MARGIN) > linear
