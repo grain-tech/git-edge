@@ -1207,43 +1207,56 @@ impl PackWriter {
 }
 
 /// The GC build's finish — the ordinary abort-on-failure contract, without
-/// the edge push's memory preflight.
-pub async fn finish_pack(out: PackWriter, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+/// the edge push's memory preflight. GC-only: the edge push finishes
+/// through `finish_writer` (the "grow:writer-finish" preflight). The permit
+/// is minted only inside crate::jobs, so this cannot be named from
+/// pack::run.
+pub async fn finish_pack(out: PackWriter, _permit: crate::jobs::GcPermit, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
     out.finish(budget).await
 }
 
-/// The writer steps `finish_writer` needs: PackWriter in production, an
-/// in-memory fake in native tests.
-pub(crate) trait FinishWriter {
-    fn finish_bound(&self) -> usize;
-    async fn abort(self);
-    async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error>;
-}
-impl FinishWriter for PackWriter {
-    fn finish_bound(&self) -> usize {
-        PackWriter::finish_bound(self)
-    }
-    async fn abort(self) {
-        PackWriter::abort(self).await
-    }
-    async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
-        PackWriter::finish(self, budget).await
-    }
-}
+/// The writer-finish seam, sealed inside this module: `finish_writer` is
+/// the only caller of `finish`, so the "grow:writer-finish" preflight
+/// cannot be skipped by naming the trait's method from outside store.
+mod finish_sealed {
+    use super::{Error, PackMeta, PackWriter};
+    use crate::ReqBudget;
 
-/// Finish the pack writer. finish_inner grows the part buffer for the
-/// trailer and splits one part off it: the "grow:writer-finish" preflight
-/// prices both while the upload can still abort cleanly. The growth
-/// itself is fallible too, and finish aborts on its failure. run() needs
-/// the PackMeta; PackWriter::finish is private, so this preflighted
-/// wrapper is the only finish run() can reach.
-pub(crate) async fn finish_writer<W: FinishWriter>(out: W, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
-    if let Err(e) = crate::pack::ingest::mem_preflight(budget.lease.as_ref(), out.finish_bound(), "grow:writer-finish") {
-        out.abort().await;
-        return Err(e);
+    /// The writer steps `finish_writer` needs: PackWriter in production,
+    /// an in-memory fake in native tests.
+    pub trait FinishWriter {
+        fn finish_bound(&self) -> usize;
+        async fn abort(self);
+        async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error>;
     }
-    out.finish(budget).await
+    impl FinishWriter for PackWriter {
+        fn finish_bound(&self) -> usize {
+            PackWriter::finish_bound(self)
+        }
+        async fn abort(self) {
+            PackWriter::abort(self).await
+        }
+        async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+            PackWriter::finish(self, budget).await
+        }
+    }
+
+    /// Finish the pack writer. finish_inner grows the part buffer for the
+    /// trailer and splits one part off it: the "grow:writer-finish" preflight
+    /// prices both while the upload can still abort cleanly. The growth
+    /// itself is fallible too, and finish aborts on its failure. run() needs
+    /// the PackMeta; PackWriter::finish is private, so this preflighted
+    /// wrapper is the only finish run() can reach.
+    #[allow(private_bounds)] // the seal is the point: callers never name FinishWriter
+    pub async fn finish_writer<W: FinishWriter>(out: W, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+        if let Err(e) = crate::pack::ingest::mem_preflight(budget.lease.as_ref(), out.finish_bound(), "grow:writer-finish") {
+            out.abort().await;
+            return Err(e);
+        }
+        out.finish(budget).await
+    }
 }
+pub(crate) use finish_sealed::finish_writer;
 
 fn i(n: u64) -> Result<V, Error> {
     Ok(V::from(i64::try_from(n).map_err(|_| Error::Internal("u64 to i64".into()))?))
@@ -2348,6 +2361,36 @@ mod tests {
         assert!(crate::try_grow::is_retry(&err), "{err}");
         crate::try_grow::fail_above(None);
         assert_eq!(located_entry(&bytes, &&e, 0, "k").unwrap().1, vec![4, 5, 6]);
+    }
+
+    /// A writer that records whether finish or abort ran.
+    struct FakeOut {
+        bound: usize,
+        done: std::rc::Rc<std::cell::Cell<&'static str>>,
+    }
+    impl super::finish_sealed::FinishWriter for FakeOut {
+        fn finish_bound(&self) -> usize {
+            self.bound
+        }
+        async fn abort(self) {
+            self.done.set("abort");
+        }
+        async fn finish(self, _budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+            self.done.set("finish");
+            Ok(PackMeta::EMPTY)
+        }
+    }
+
+    /// A refused finish preflight aborts the upload and never finishes.
+    #[test]
+    fn finish_writer_refusal_aborts_the_upload() {
+        let _guard = crate::try_grow::HookGuard;
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 200 << 20)));
+        let done = std::rc::Rc::new(std::cell::Cell::new(""));
+        let mut budget = ReqBudget::paid();
+        let res = ready(super::finish_writer(FakeOut { bound: 1 << 20, done: done.clone() }, &mut budget));
+        assert!(matches!(res, Err(Error::Limit(_))), "a refused finish preflight is the Limit");
+        assert_eq!(done.get(), "abort");
     }
 
     /// The trailer's room check is fallible: without it the append would

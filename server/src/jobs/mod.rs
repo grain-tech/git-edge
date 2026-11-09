@@ -8,6 +8,11 @@ pub mod import;
 pub mod janitor;
 pub mod purge;
 
+/// Proof the caller is a GC job — `store::finish_pack` requires it, and
+/// only this module's descendants can mint it, so the raw pack finish
+/// stays unreachable from pack::run.
+pub(crate) struct GcPermit(());
+
 use worker::{SqlStorage, SqlStorageValue as V};
 
 use crate::error::Error;

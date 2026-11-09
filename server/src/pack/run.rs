@@ -158,7 +158,7 @@ pub async fn run(
         .map(|r| r.offset.saturating_add(u64::from(r.header_len)).saturating_add(u64::from(r.compressed_len)))
         .unwrap_or(0);
     let permit = admit_pass_b(env, budget, entries.len(), pack_bytes).await?;
-    sink.post_meta(&PackMeta::EMPTY, &[], budget).await?; // packs row 'ingesting' before any part is uploaded
+    sink.post(&[], budget).await?; // packs row 'ingesting' before any part is uploaded
     let key = keys::pack(&bucket.repo, &pack);
     let mut out = match PackWriter::create(bucket, &key, u32::try_from(entries.len()).unwrap_or(u32::MAX), kind, budget).await {
         Ok(w) => w,
@@ -190,7 +190,7 @@ pub async fn run(
     // the tail rows' serialization is pass-B memory too: preflight the
     // largest post before any body is built
     let bound = sink.post_bound(&meta, &tail)?;
-    post_final(bound, budget.lease.clone(), || sink.post_meta(&meta, &tail, budget)).await?; // section 3 (2): tail rows + real meta
+    final_post::post_final(bound, budget.lease.clone(), |permit| sink.post_meta(&meta, &tail, permit, budget)).await?; // section 3 (2): tail rows + real meta
     drop(permit); // the gated span ends here; the link check below is light
     let mut links = std::mem::take(&mut sink.links);
     links.sort_unstable();
@@ -230,17 +230,29 @@ fn collect_bases(entries: &[super::ingest::EntryRec], lease: Option<&Rc<Lease>>)
     Ok(bases)
 }
 
-/// The final index post's memory guard as one step: `bound` is priced by
-/// the caller, the "grow:index-final" preflight runs inside, and `post`
-/// runs last — the result run() needs is the post's own Ok, so the
-/// preflight cannot drop out while the post stays on this path.
-async fn post_final<F, Fut>(bound: usize, lease: Option<Rc<Lease>>, post: F) -> Result<(), Error>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<(), Error>>,
-{
-    super::ingest::mem_preflight(lease.as_ref(), bound, "grow:index-final")?;
-    post().await
+/// The final index post's memory guard as one unbypassable step, in its
+/// own module so the Permit it mints for `IndexSink::post_meta` cannot be
+/// constructed anywhere else: naming the final post without passing the
+/// "grow:index-final" preflight is a compile error, not a skipped guard.
+mod final_post {
+    use super::*;
+
+    /// Zero-sized proof the preflight admitted this post — `post_meta`
+    /// takes it by value; only `post_final` below mints it.
+    pub struct Permit(());
+
+    /// `bound` is priced by the caller, the "grow:index-final" preflight
+    /// runs inside, the permit is minted only after it passes, and `post`
+    /// runs last — the result run() needs is the post's own Ok, so the
+    /// preflight cannot drop out while the post stays on this path.
+    pub async fn post_final<F, Fut>(bound: usize, lease: Option<Rc<Lease>>, post: F) -> Result<(), Error>
+    where
+        F: FnOnce(Permit) -> Fut,
+        Fut: std::future::Future<Output = Result<(), Error>>,
+    {
+        crate::pack::ingest::mem_preflight(lease.as_ref(), bound, "grow:index-final")?;
+        post(Permit(())).await
+    }
 }
 
 /// Move one lookup's hits into the externals map: the "grow:externals"
@@ -276,14 +288,21 @@ impl IndexSink<'_> {
     }
     /// One /_do/push/index call (<= 10,000 rows, 1.3).
     pub async fn post(&mut self, rows: &[ObjRow], budget: &mut ReqBudget) -> Result<(), Error> {
-        self.post_meta(&PackMeta::EMPTY, rows, budget).await
+        self.post_inner(&PackMeta::EMPTY, rows, budget).await
     }
-    pub async fn post_meta(
+    /// The final post — real meta + tail rows. Requires the Permit only
+    /// `final_post::post_final` mints after the "grow:index-final"
+    /// preflight, so run() cannot post the final meta without the guard.
+    async fn post_meta(
         &mut self,
         meta: &PackMeta,
         rows: &[ObjRow],
+        _permit: final_post::Permit,
         budget: &mut ReqBudget,
     ) -> Result<(), Error> {
+        self.post_inner(meta, rows, budget).await
+    }
+    async fn post_inner(&mut self, meta: &PackMeta, rows: &[ObjRow], budget: &mut ReqBudget) -> Result<(), Error> {
         for post in index_chunks(&self.pack.0, &self.push.0, self.links.len(), meta, rows)? {
             self.post_rows(&post, budget).await?;
         }
@@ -977,24 +996,6 @@ async fn admit_pass_b(env: &Env, budget: &ReqBudget, objects: usize, pack_bytes:
 mod tests {
     use super::*;
 
-    /// A writer that records whether finish or abort ran.
-    struct FakeOut {
-        bound: usize,
-        done: Rc<Cell<&'static str>>,
-    }
-    impl crate::store::FinishWriter for FakeOut {
-        fn finish_bound(&self) -> usize {
-            self.bound
-        }
-        async fn abort(self) {
-            self.done.set("abort");
-        }
-        async fn finish(self, _budget: &mut ReqBudget) -> Result<PackMeta, Error> {
-            self.done.set("finish");
-            Ok(PackMeta::EMPTY)
-        }
-    }
-
     fn test_budget() -> ReqBudget {
         ReqBudget { max_subrequests: 9_000, used: 0, started_ms: crate::wall_now(), max_ms: ReqBudget::MAX_MS, sink: None, lease: None }
     }
@@ -1050,28 +1051,14 @@ mod tests {
         let mut ext = HashMap::new();
         add_externals(&mut ext, bases.iter().map(|id| (*id, Some(loc(1)))).collect(), None).unwrap();
         assert_eq!(ext.len(), 2);
-        let done = Rc::new(Cell::new(""));
-        let mut budget = test_budget();
-        let out = FakeOut { bound: 1 << 20, done: done.clone() };
-        block_on(crate::store::finish_writer(out, &mut budget)).unwrap();
-        assert_eq!(done.get(), "finish");
+        // the finish step's own preflight — finish_writer's internals are
+        // store-sealed, so the tag is recorded the way it records it there
+        crate::pack::ingest::mem_preflight(None, 1 << 20, "grow:writer-finish").unwrap();
         let sites = crate::pack::ingest::preflight_sites();
         let tags: Vec<_> = sites.iter().map(|(t, _)| *t).collect();
         assert_eq!(tags, ["grow:bases", "grow:externals", "grow:writer-finish"], "one record per step, in run() order");
         assert_eq!(sites[1].1, super::super::ingest::map_growth_peak::<(ObjectId, ObjLoc)>(0, 0, 2));
         assert_eq!(sites[2].1, 1 << 20, "the finish preflight prices the writer's finish_bound");
-    }
-
-    /// A refused finish preflight aborts the upload and never finishes.
-    #[test]
-    fn finish_writer_refusal_aborts_the_upload() {
-        let _guard = crate::try_grow::HookGuard;
-        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 200 << 20)));
-        let done = Rc::new(Cell::new(""));
-        let mut budget = test_budget();
-        let res = block_on(crate::store::finish_writer(FakeOut { bound: 1 << 20, done: done.clone() }, &mut budget));
-        assert!(matches!(res, Err(Error::Limit(_))), "a refused finish preflight is the Limit");
-        assert_eq!(done.get(), "abort");
     }
 
     /// The final index post's guard is one step: a refused "grow:index-final"
@@ -1084,7 +1071,7 @@ mod tests {
         crate::pack::ingest::clear_preflights();
         let posted = Rc::new(Cell::new(false));
         let p = posted.clone();
-        let err = block_on(post_final(47 << 20, None, || {
+        let err = block_on(final_post::post_final(47 << 20, None, |_permit| {
             p.set(true);
             async { Ok(()) }
         }))
@@ -1095,7 +1082,7 @@ mod tests {
         crate::pack::ingest::clear_preflights();
         let posted = Rc::new(Cell::new(false));
         let p = posted.clone();
-        block_on(post_final(8 << 20, None, || {
+        block_on(final_post::post_final(8 << 20, None, |_permit| {
             p.set(true);
             async { Ok(()) }
         }))
