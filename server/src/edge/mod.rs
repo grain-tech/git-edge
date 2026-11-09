@@ -16,6 +16,7 @@ use crate::error::{respond, Error};
 use crate::pack;
 use crate::platform;
 use crate::store::{Bucket, PackId, PushId, RepoId};
+use crate::store::BodyChunk;
 use crate::wire::{
     self,
     http::{stub_json, stub_raw, RepoRoute},
@@ -33,16 +34,6 @@ fn check_body_len(len: usize, cap: usize, too_big: &'static str) -> Result<(), E
     if len > cap {
         return Err(Error::Protocol(too_big.into()));
     }
-    Ok(())
-}
-
-/// One streamed chunk into `body` under `cap`: the length check runs
-/// before the chunk's fallible reservation, so an over-cap body never
-/// reaches try_grow.
-fn body_push(body: &mut Vec<u8>, chunk: &[u8], cap: usize, too_big: &'static str) -> Result<(), Error> {
-    check_body_len(body.len().saturating_add(chunk.len()), cap, too_big)?;
-    crate::try_grow::vec(body, chunk.len())?;
-    body.extend_from_slice(chunk);
     Ok(())
 }
 
@@ -65,15 +56,45 @@ fn declared_len_ok(header: Option<&str>, cap: usize, too_big: &'static str) -> R
 async fn request_body_bytes(req: &mut Request, cap: usize, too_big: &'static str) -> Result<Vec<u8>, Error> {
     let declared = req.headers().get("content-length").ok().flatten();
     declared_len_ok(declared.as_deref(), cap, too_big)?;
-    let mut body = Vec::new();
-    if req.inner().body().is_none() {
-        return Ok(body); // no body — the same empty Vec array_buffer() produced
-    }
-    let mut stream = req.stream().map_err(|e| Error::Protocol(format!("body: {e:?}")))?;
+    let Some(raw) = req.inner().body() else {
+        return Ok(Vec::new()); // no body — the same empty Vec array_buffer() produced
+    };
     use futures_util::StreamExt as _;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| Error::Storage(format!("body stream: {e}")))?;
-        body_push(&mut body, &chunk, cap, too_big)?;
+    use wasm_bindgen::JsCast as _;
+    let chunks = wasm_streams::ReadableStream::from_raw(raw.unchecked_into())
+        .into_stream()
+        .map(|item| {
+            let v = item.map_err(|e| Error::Storage(format!("body stream: {e:?}")))?;
+            Ok(match v.dyn_into::<js_sys::Uint8Array>() {
+                Ok(a) => a,
+                Err(v) if v.is_instance_of::<js_sys::ArrayBuffer>() => js_sys::Uint8Array::new(&v),
+                Err(v) => return Err(Error::Storage(format!("body chunk is not bytes: {v:?}"))),
+            })
+        });
+    fill_capped(cap, too_big, chunks).await
+}
+
+/// The capped body read, generic over the chunk type so native tests drive
+/// it with counting fakes: each chunk's `len()` is checked against the
+/// running total BEFORE it is copied — an over-cap chunk is the caller's
+/// Protocol error, never copied and never followed by another poll. An
+/// admitted chunk's growth is reserved fallibly first (a refusal is the
+/// in-band retry Limit), then copied into the new tail.
+async fn fill_capped<C, S>(cap: usize, too_big: &'static str, stream: S) -> Result<Vec<u8>, Error>
+where
+    C: BodyChunk,
+    S: Stream<Item = Result<C, Error>>,
+{
+    use futures_util::StreamExt as _;
+    let mut body = Vec::new();
+    let mut stream = std::pin::pin!(stream);
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        check_body_len(body.len().saturating_add(chunk.len()), cap, too_big)?;
+        crate::try_grow::vec(&mut body, chunk.len())?;
+        let start = body.len();
+        body.resize(start + chunk.len(), 0);
+        chunk.copy_into(&mut body[start..]);
     }
     Ok(body)
 }
@@ -1433,31 +1454,6 @@ async fn owner_release(env: &Env, route: &RepoRoute) {
 mod tests {
     use super::*;
 
-    /// The cap is checked before any reservation: an over-cap chunk is the
-    /// caller's Protocol error and never reaches the try_grow ask log. The
-    /// boundary len == cap is admitted.
-    #[test]
-    fn body_cap_refuses_before_any_reservation() {
-        let _guard = crate::try_grow::HookGuard;
-        let mut body = Vec::new();
-        crate::try_grow::log_asks();
-        let err = body_push(&mut body, &[0u8; 65], 64, "test body too large").unwrap_err();
-        assert!(matches!(&err, Error::Protocol(m) if m == "test body too large"), "{err}");
-        assert!(body.is_empty());
-        assert!(crate::try_grow::take_asks().is_empty(), "the refused chunk must not reach try_grow");
-        // len == cap is admitted
-        body_push(&mut body, &[0u8; 64], 64, "test body too large").unwrap();
-        assert_eq!(body.len(), 64);
-        // one byte over the running total refuses — again with no ask
-        crate::try_grow::log_asks();
-        let err = body_push(&mut body, &[0u8; 1], 64, "test body too large").unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "{err}");
-        assert!(crate::try_grow::take_asks().is_empty());
-        // the declared-length check shares the rule
-        check_body_len(65, 64, "declared too large").unwrap_err();
-        check_body_len(64, 64, "declared too large").unwrap();
-    }
-
     /// The declared-length precheck: over-cap refuses with the caller's
     /// Protocol wording, len == cap is admitted, and an absent or
     /// unparsable header falls through to the streamed check. A length
@@ -1533,5 +1529,119 @@ mod tests {
         .unwrap();
         assert_eq!(out, vec![1, 2]);
         assert_eq!(order.borrow().as_slice(), ["auth", "body"]);
+    }
+
+    /// A chunk that counts its copies, so a test can see that none ran.
+    struct Counted(Vec<u8>, Rc<Cell<usize>>);
+    impl BodyChunk for Counted {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            self.1.set(self.1.get() + 1);
+            dst.copy_from_slice(&self.0);
+        }
+    }
+
+    /// A body stream that counts its polls.
+    struct Probe<C> {
+        items: std::collections::VecDeque<C>,
+        polls: Rc<Cell<usize>>,
+    }
+    impl<C: Unpin> Stream for Probe<C> {
+        type Item = Result<C, Error>;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.polls.set(self.polls.get() + 1);
+            std::task::Poll::Ready(self.items.pop_front().map(Ok))
+        }
+    }
+    fn probe<C>(items: Vec<C>) -> (Probe<C>, Rc<Cell<usize>>) {
+        let polls = Rc::new(Cell::new(0));
+        (Probe { items: items.into(), polls: polls.clone() }, polls)
+    }
+    fn counted(items: &[&[u8]], copies: &Rc<Cell<usize>>) -> Vec<Counted> {
+        items.iter().map(|b| Counted(b.to_vec(), copies.clone())).collect()
+    }
+
+    /// Many small chunks under the cap join into the exact body.
+    #[test]
+    fn fill_capped_joins_chunks_under_the_cap() {
+        let copies = Rc::new(Cell::new(0));
+        let want: Vec<u8> = (0..200u8).collect();
+        let parts: Vec<&[u8]> = vec![&want[..1], &want[1..100], &want[100..101], &want[101..]];
+        let (s, polls) = probe(counted(&parts, &copies));
+        let body = block_on(fill_capped(1 << 20, "test body too large", s)).unwrap();
+        assert_eq!(body, want);
+        assert_eq!(copies.get(), parts.len(), "every admitted chunk is copied once");
+        assert_eq!(polls.get(), parts.len() + 1, "chunks plus the end-of-stream poll");
+    }
+
+    /// A single oversized FIRST chunk is the Protocol error: it is never
+    /// copied, never reaches the try_grow ask log, and the stream is
+    /// polled exactly once.
+    #[test]
+    fn fill_capped_rejects_an_oversized_first_chunk_uncopied() {
+        let _guard = crate::try_grow::HookGuard;
+        let copies = Rc::new(Cell::new(0));
+        let (s, polls) = probe(counted(&[&[0u8; 65]], &copies));
+        crate::try_grow::log_asks();
+        let err = block_on(fill_capped(64, "test body too large", s)).unwrap_err();
+        assert!(matches!(&err, Error::Protocol(m) if m == "test body too large"), "{err}");
+        assert_eq!(copies.get(), 0, "the oversized chunk must not be copied");
+        assert_eq!(polls.get(), 1, "the stream must not be polled again");
+        assert!(crate::try_grow::take_asks().is_empty(), "the refused chunk must not reach try_grow");
+    }
+
+    /// A chunk that crosses the cap mid-stream is the Protocol error:
+    /// earlier chunks were copied, the crossing chunk was not, and the
+    /// stream was never polled past it.
+    #[test]
+    fn fill_capped_rejects_the_chunk_crossing_the_cap() {
+        let copies = Rc::new(Cell::new(0));
+        let (s, polls) = probe(counted(&[&[1, 2], &[3, 4, 5], &[6], &[7]], &copies));
+        let err = block_on(fill_capped(4, "test body too large", s)).unwrap_err();
+        assert!(matches!(&err, Error::Protocol(m) if m == "test body too large"), "{err}");
+        assert_eq!(copies.get(), 1, "only the first chunk may be copied");
+        assert_eq!(polls.get(), 2, "the stream stops at the crossing chunk");
+    }
+
+    /// A body whose chunks sum to exactly the cap is admitted.
+    #[test]
+    fn fill_capped_admits_a_body_exactly_at_the_cap() {
+        let copies = Rc::new(Cell::new(0));
+        let want: Vec<u8> = (0..64u8).collect();
+        let parts: Vec<&[u8]> = vec![&want[..10], &want[10..40], &want[40..]];
+        let (s, _) = probe(counted(&parts, &copies));
+        let body = block_on(fill_capped(64, "test body too large", s)).unwrap();
+        assert_eq!(body, want);
+        assert_eq!(copies.get(), parts.len());
+    }
+
+    /// An empty body — an empty stream, or one of only empty chunks — is Ok.
+    #[test]
+    fn fill_capped_accepts_an_empty_body() {
+        let (s, polls) = probe(Vec::<Counted>::new());
+        assert!(block_on(fill_capped(8, "test body too large", s)).unwrap().is_empty());
+        assert_eq!(polls.get(), 1);
+        let copies = Rc::new(Cell::new(0));
+        let (s, _) = probe(counted(&[&[], &[]], &copies));
+        assert!(block_on(fill_capped(8, "test body too large", s)).unwrap().is_empty());
+    }
+
+    /// A refused reservation is the in-band retry Limit and the chunk is
+    /// never copied.
+    #[test]
+    fn fill_capped_refused_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let copies = Rc::new(Cell::new(0));
+        let (s, polls) = probe(counted(&[&[7u8; 100]], &copies));
+        crate::try_grow::fail_above(Some(50));
+        let err = block_on(fill_capped(1 << 20, "test body too large", s)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert_eq!(copies.get(), 0, "a refused reservation must not copy the chunk");
+        assert_eq!(polls.get(), 1);
     }
 }
