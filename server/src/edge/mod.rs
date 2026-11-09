@@ -501,6 +501,30 @@ async fn state_probe(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend)
     git_resp(bytes, "application/json")
 }
 
+/// The upload-pack command body read whole under `cap`. The cap check runs
+/// BEFORE each append and counts the bytes `fill` already pulled into the
+/// buffer — checking the assembled body alone would let a chunked upload
+/// overshoot by a whole fill step. Each append's growth is reserved
+/// fallibly first: a refusal is the in-band retry Limit, over-cap the
+/// upload-pack Limit.
+async fn read_upload_body(reader: &mut BodyReader, cap: usize) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    while reader.fill(FILL_STEP).await? {
+        if body.len().saturating_add(reader.buffered().len()) > cap {
+            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+        }
+        crate::try_grow::vec(&mut body, reader.buffered().len())?;
+        body.extend_from_slice(reader.buffered());
+        reader.consume(usize::MAX);
+    }
+    if body.len().saturating_add(reader.buffered().len()) > cap {
+        return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+    }
+    crate::try_grow::vec(&mut body, reader.buffered().len())?;
+    body.extend_from_slice(reader.buffered()); // EOF tail shorter than FILL_STEP
+    Ok(body)
+}
+
 /// POST /:owner/:repo/git-upload-pack — v2 only; route on the command name, forward raw.
 async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate(&req, env, Level::Read, route, spend).await?;
@@ -513,7 +537,7 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
             .map(|r| r.with_status(400));
     }
     // bound the read: a declared Content-Length is rejected before any byte is buffered,
-    // and a chunked body is still capped at CMD_CAP while streaming in
+    // and read_upload_body caps a chunked body at CMD_CAP while it streams in
     if let Some(n) = req
         .headers()
         .get("content-length")
@@ -526,18 +550,7 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
         }
     }
     let mut reader = BodyReader::new(&mut req)?;
-    let mut body = Vec::new();
-    while reader.fill(FILL_STEP).await? {
-        if reader.buffered().len() > CMD_CAP {
-            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
-        }
-        body.extend_from_slice(reader.buffered());
-        reader.consume(usize::MAX);
-    }
-    body.extend_from_slice(reader.buffered()); // EOF tail shorter than FILL_STEP
-    if body.len() > CMD_CAP {
-        return Err(Error::Limit("upload-pack body > 1 MiB".into()));
-    }
+    let body = read_upload_body(&mut reader, CMD_CAP).await?;
     let path = match wire::parse_v2_command(&body)? {
         wire::V2Command::LsRefs(_) => "/_do/ls-refs",
         wire::V2Command::Fetch(_) => "/_do/fetch",
@@ -1712,5 +1725,45 @@ mod tests {
         let err = block_on(body.fill(1)).unwrap_err();
         assert!(crate::try_grow::is_retry(&err), "{err}");
         assert!(body.buffered().is_empty(), "a refused growth buffers nothing");
+    }
+
+    /// A chunked upload-pack body (no Content-Length) is capped WHILE it
+    /// streams: 64 x 64 KiB refuses with the Limit error after ~1 MiB has
+    /// been pulled — reader.total proves the refusal did not wait for EOF.
+    #[test]
+    fn upload_body_cap_fires_while_streaming() {
+        let chunks: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; FILL_STEP]).collect();
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        assert!(
+            reader.total <= CMD_CAP as u64 + 2 * FILL_STEP as u64,
+            "reader.total = {} — the cap must fire while streaming, not after EOF",
+            reader.total
+        );
+    }
+
+    /// Chunks summing to exactly the cap are admitted whole.
+    #[test]
+    fn upload_body_admits_exactly_cap() {
+        let chunks: Vec<Vec<u8>> = (0..16).map(|i| vec![i as u8; FILL_STEP]).collect();
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let body = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap();
+        assert_eq!(body.len(), CMD_CAP);
+        assert_eq!(body[0], 0);
+        assert_eq!(body[FILL_STEP], 1);
+        assert_eq!(body[CMD_CAP - 1], 15);
+    }
+
+    /// A small chunked body passes through untouched.
+    #[test]
+    fn upload_body_admits_a_small_body() {
+        let payload: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let mut reader = BodyReader::from_chunks(vec![payload.clone()], None);
+        let body = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap();
+        assert_eq!(body, payload);
     }
 }
