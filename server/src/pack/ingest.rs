@@ -1135,42 +1135,58 @@ fn delta_result_size(body: &[u8], z: &mut Inflate) -> Option<u64> {
     Some(result)
 }
 
-/// Upper bound on the live bytes ONE decode_mini adds at its peak — run
-/// BEFORE anything allocates so the guard can reject in-band. Counts the
-/// copies the decode actually makes:
-///   mini   — the synthetic pack Vec: 12-byte header, the re-deflated base
-///            (level 0 ≈ stored), the re-headed entry header, the raw entry
-///            body verbatim, and the digest-width trailer. It stays alive
-///            through decode_entry; ×2 covers Vec's amortized capacity.
-///   out    — decode_entry's work Vec: for a delta, two biggest-result
-///            buffers plus the decompressed instruction stream (the result
-///            size comes from the delta header probe); for a full entry,
-///            the object itself. Sized exactly, then floored at 2× the
-///            instruction region for Vec's amortized growth.
-///   scratch — zlib states and small vecs the size terms don't name.
-fn decode_mini_bound(
+/// The exact capacity decode_mini reserves for its synthetic pack: the
+/// 12-byte header, the base's entry header and level-0 re-deflate, the
+/// re-headed entry header, the raw entry body verbatim, and the
+/// digest-width trailer. Each entry header is at most 32 bytes (kind and
+/// size varints, plus the ofs distance). decode_mini writes only inside
+/// this capacity, so the buffer never grows and never moves.
+fn mini_capacity(base_len: Option<usize>, body_len: usize, obj_kind: H) -> usize {
+    let mut n = 12usize
+        .saturating_add(32)
+        .saturating_add(body_len)
+        .saturating_add(obj_kind.len_in_bytes());
+    if let Some(b) = base_len {
+        n = n.saturating_add(32).saturating_add(stored_deflate_bound(b));
+    }
+    n
+}
+
+/// The two large blocks ONE decode_mini allocates, each reserved exactly
+/// and fallibly before it is written, so neither grows:
+///   mini — the synthetic pack (`mini_capacity`). It stays alive through
+///          decode_entry.
+///   out  — decode_entry's work Vec. For a delta, gix-pack sizes it to two
+///          biggest-result buffers plus the decompressed instruction stream
+///          (the result size comes from the delta header probe). For a
+///          full entry it is the object itself.
+#[derive(Debug, PartialEq, Eq)]
+struct DecodeTerms {
+    mini: usize,
+    out: usize,
+}
+impl DecodeTerms {
+    /// The decode's preflight: both blocks plus the flat scratch.
+    fn bound(&self) -> usize {
+        self.mini.saturating_add(self.out).saturating_add(DECODE_SCRATCH)
+    }
+}
+
+/// Size ONE decode_mini's blocks BEFORE anything allocates, so the guard
+/// can reject in-band and the decode can reserve them exactly.
+fn decode_mini_terms(
     z: &mut Inflate,
     base_len: Option<usize>,
     e: &PackEntry,
     raw: &[u8],
     obj_kind: H,
-) -> usize {
+) -> DecodeTerms {
     let hlen = e.header_size();
-    let body_len = raw.len().saturating_sub(hlen);
-    let mut mini_len = 12usize
-        .saturating_add(32) // re-headed entry header: kind + size varints (+ ofs distance)
-        .saturating_add(body_len)
-        .saturating_add(obj_kind.len_in_bytes()); // zero digest trailer
-    if let Some(b) = base_len {
-        mini_len = mini_len
-            .saturating_add(32) // base entry header
-            .saturating_add(stored_deflate_bound(b));
-    }
-    let mini_alloc = mini_len.saturating_mul(2);
+    let mini = mini_capacity(base_len, raw.len().saturating_sub(hlen), obj_kind);
     let instr = usize::try_from(e.decompressed_size)
         .unwrap_or(usize::MAX)
         .min(MAX_OBJ as usize);
-    let out_alloc = if e.header.is_delta() {
+    let out = if e.header.is_delta() {
         // resolve_deltas sizes `out` = 2*biggest_result + instruction bytes;
         // biggest is max(base len, result claim) and claims over MAX_OBJ
         // are rejected by the alloc limit before the resize — clamp here.
@@ -1179,14 +1195,42 @@ fn decode_mini_bound(
             .unwrap_or(MAX_OBJ as usize)
             .min(MAX_OBJ as usize);
         let biggest = base_len.unwrap_or(0).max(result).min(MAX_OBJ as usize);
-        biggest
-            .saturating_mul(2)
-            .saturating_add(instr)
-            .max(instr.saturating_mul(2))
+        biggest.saturating_mul(2).saturating_add(instr)
     } else {
         instr
     };
-    mini_alloc.saturating_add(out_alloc).saturating_add(DECODE_SCRATCH)
+    DecodeTerms { mini, out }
+}
+
+/// Upper bound on the live bytes ONE decode_mini adds at its peak — the
+/// sum of `decode_mini_terms` and the flat scratch.
+#[cfg(test)]
+fn decode_mini_bound(
+    z: &mut Inflate,
+    base_len: Option<usize>,
+    e: &PackEntry,
+    raw: &[u8],
+    obj_kind: H,
+) -> usize {
+    decode_mini_terms(z, base_len, e, raw, obj_kind).bound()
+}
+
+/// An io::Write into a Vec that never grows it: a write past the reserved
+/// capacity fails instead of reallocating. decode_mini reserves the
+/// mini-pack's full size up front, so no moving reallocation can hold an
+/// old and a new copy of it at once.
+struct NoGrow<'a>(&'a mut Vec<u8>);
+impl std::io::Write for NoGrow<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.0.len().saturating_add(b.len()) > self.0.capacity() {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "mini-pack capacity exceeded"));
+        }
+        self.0.extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Bound for codec::decode_entry (external bases, the prefetch batch): it
@@ -1203,9 +1247,10 @@ fn decode_entry_bound(entry: &[u8]) -> usize {
 
 /// One decode_entry over `[PACK v2][base as a level-0 zlib full entry][delta re-headed as ofs-delta][digest-width zero trailer]`.
 /// `cx` supplies the inflate, the object format, and — on the edge path —
-/// the memory guard: the decode's peak working set is preflighted against
-/// MEM_HARD before `mini` or `out` allocate (a ~16 MiB base plus ~16 MiB of
-/// delta instructions would otherwise grow ~80 MiB inside this one call).
+/// the memory guard: the decode's working set is preflighted against
+/// MEM_HARD before `mini` or `out` allocate. Both blocks are then reserved
+/// once, exactly and fallibly, so neither grows: a block the allocator
+/// cannot place returns the in-band memory Limit instead of trapping.
 pub fn decode_mini(
     cx: &mut Cx<'_>,
     base: Option<(Kind, &[u8])>,
@@ -1214,9 +1259,10 @@ pub fn decode_mini(
 ) -> Result<(Kind, Vec<u8>), Error> {
     let obj_kind = cx.obj_kind;
     let e = PackEntry::from_bytes(raw, 0, obj_kind).map_err(|e| unpack(e.to_string()))?;
-    let bound = decode_mini_bound(&mut cx.z, base.map(|(_, d)| d.len()), &e, raw, obj_kind);
-    cx.mem_decode(bound, Some(label), "decode:mini")?;
-    let mut mini = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
+    let terms = decode_mini_terms(&mut cx.z, base.map(|(_, d)| d.len()), &e, raw, obj_kind);
+    cx.mem_decode(terms.bound(), Some(label), "decode:mini")?;
+    let mut mini = crate::try_grow::with_capacity(terms.mini)?;
+    NoGrow(&mut mini).write_all(b"PACK\0\0\0\x02\0\0\0\x02").map_err(internal)?;
     if let Some((k, d)) = base {
         let hk = match k {
             Kind::Commit => Header::Commit,
@@ -1224,10 +1270,9 @@ pub fn decode_mini(
             Kind::Blob => Header::Blob,
             Kind::Tag => Header::Tag,
         };
-        hk.write_to(d.len() as u64, &mut mini).map_err(internal)?;
-        let mut w = gix_zlib::stream::deflate::Write::new(mini, Compression::new(0).unwrap_or_default());
+        hk.write_to(d.len() as u64, &mut NoGrow(&mut mini)).map_err(internal)?;
+        let mut w = gix_zlib::stream::deflate::Write::new(NoGrow(&mut mini), Compression::new(0).unwrap_or_default());
         w.write_all(d).and_then(|_| std::io::Write::flush(&mut w)).map_err(internal)?;
-        mini = w.into_inner();
     }
     let at = mini.len() as u64;
     let body = raw.get(e.header_size()..).ok_or_else(|| unpack("short entry"))?;
@@ -1236,13 +1281,17 @@ pub fn decode_mini(
         (true, None) => return Err(unpack("delta without base")),
         (false, _) => e.header,
     };
-    hdr.write_to(e.decompressed_size, &mut mini).map_err(internal)?;
-    mini.extend_from_slice(body);
-    mini.resize(mini.len() + obj_kind.len_in_bytes(), 0);
+    hdr.write_to(e.decompressed_size, &mut NoGrow(&mut mini)).map_err(internal)?;
+    NoGrow(&mut mini).write_all(body).map_err(internal)?;
+    NoGrow(&mut mini).write_all(&[0u8; 32][..obj_kind.len_in_bytes()]).map_err(internal)?;
     let file = File::<&[u8]>::from_data(&mini, "mini".into(), obj_kind)
         .map_err(internal)?
         .with_alloc_limit_bytes(usize::try_from(MAX_OBJ).ok());
-    let mut out = Vec::new();
+    // gix-pack grows `out` with try_reserve up to exactly `terms.out`, so
+    // this reservation leaves it nothing to allocate. Its OutOfMemory
+    // after that is the alloc-limit check on the object's own claim — a
+    // property of the object, so it stays an unpack error.
+    let mut out = crate::try_grow::with_capacity(terms.out)?;
     let oc = file
         .decode_entry(
             file.entry(at).map_err(|e| unpack(e.to_string()))?,
@@ -2035,7 +2084,7 @@ async fn stream_blob<O: PackOut>(
         skip -= s as u64;
     }
     cx.mem_grow((1 << 20) + STREAM_SLACK, None, "grow:blob-sinkbuf")?;
-    let (mut z, mut h, mut sinkbuf) = (Decompress::new(), gix_hash::hasher(cx.obj_kind), vec![0u8; 1 << 20]);
+    let (mut z, mut h, mut sinkbuf) = (Decompress::new(), gix_hash::hasher(cx.obj_kind), crate::try_grow::zeroed(1 << 20)?);
     h.update(format!("blob {}\0", rec.size).as_bytes());
     let (mut pos, mut produced, mut st) = (body_start, 0u64, Status::Ok);
     while pos < end && st != Status::StreamEnd {
@@ -2544,8 +2593,8 @@ mod tests {
         assert_eq!(g.cleared_at, Some(60 << 20), "never rises without a shed");
     }
 
-    /// decode_mini_bound counts the mini-pack copy (raw body + re-deflated
-    /// base) AND decode_entry's work Vec (2*biggest result + instructions).
+    /// decode_mini_bound counts the mini-pack (raw body + re-deflated base)
+    /// AND decode_entry's work Vec (2*biggest result + instructions).
     #[test]
     fn decode_mini_bound_counts_mini_and_work_buffers() {
         let mut z = Inflate::default();
@@ -2554,17 +2603,16 @@ mod tests {
         codec::encode_entry(Kind::Blob, &[7u8; 4_096], &mut enc).unwrap();
         let e = PackEntry::from_bytes(&enc, 0, H::Sha1).unwrap();
         let bound = decode_mini_bound(&mut z, None, &e, &enc, H::Sha1);
-        // mini alone is ~2x the raw wire bytes; out adds the 4 KiB object
-        assert!(bound >= enc.len().saturating_mul(2), "{bound} < 2*raw");
+        // mini holds the raw wire bytes; out adds the 4 KiB object
+        assert!(bound >= enc.len() + 4_096, "{bound} < raw + object");
         assert!(bound >= 4_096 + DECODE_SCRATCH, "{bound}");
         // delta entry: biggest = max(base, result) drives the 2x work buffers
         let raw = delta_raw(2 << 20, 1 << 20, &[0u8; 1_000]);
         let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
         let bound = decode_mini_bound(&mut z, Some(2 << 20), &e, &raw, H::Sha1);
         // out term alone is 2*biggest(2 MiB) + instr(~1 KiB+hdr); mini adds
-        // ~2x (stored base + raw body)
-        assert!(bound >= (2 << 20) * 2, "{bound}");
-        assert!(bound >= raw.len() * 2, "{bound}");
+        // the stored base + raw body
+        assert!(bound >= (2 << 20) * 3, "{bound}");
         // a bigger claimed result size lifts the bound
         let raw_big = delta_raw(1 << 10, 8 << 20, &[0u8; 10]);
         let e_big = PackEntry::from_bytes(&raw_big, 0, H::Sha1).unwrap();
@@ -3410,24 +3458,109 @@ mod tests {
         assert_eq!(PER_OBJECT_DECODE, MEM_HARD - (40 << 20));
     }
 
-    /// decode_mini_bound's x2 factors are pinned: the mini-pack copy and the
-    /// delta work buffers each carry a 2x Vec-capacity factor — dropping
-    /// either under-counts the real peak by ~half.
+    /// Codex r8 #5: each decode term is pinned on its own, with fixtures
+    /// where dropping a factor changes the asserted value. The 512 KiB
+    /// scratch is outside both terms, so it cannot mask a mutation.
     #[test]
-    fn decode_bound_double_factors_are_pinned() {
+    fn decode_terms_are_pinned_independently() {
+        const MIB: usize = 1 << 20;
         let mut z = Inflate::default();
+        // full entry: mini holds the synthetic pack's parts, out the object
         let mut enc = Vec::new();
         codec::encode_entry(Kind::Blob, &[7u8; 4_096], &mut enc).unwrap();
         let e = PackEntry::from_bytes(&enc, 0, H::Sha1).unwrap();
-        let bound = decode_mini_bound(&mut z, None, &e, &enc, H::Sha1);
-        // mini term alone is 2x the raw wire bytes (12 hdr + 32 slack + body + 20 trailer)*2
-        let wire = enc.len();
-        assert!(bound >= wire * 2, "mini 2x factor missing: {bound} < 2*{wire}");
-        // delta: out term has 2*biggest result — pinned by the delta_raw case
+        let body = enc.len() - e.header_size();
+        let t = decode_mini_terms(&mut z, None, &e, &enc, H::Sha1);
+        assert_eq!(t, DecodeTerms { mini: 12 + 32 + body + 20, out: 4_096 });
+        assert_eq!(t.bound(), t.mini + t.out + DECODE_SCRATCH);
+        // delta over a bigger base: out is 2 x the 2 MiB base plus the
+        // instructions — a x1 mutant gives 2 MiB + instr, not 4 MiB + instr
         let raw = delta_raw(2 << 20, 1 << 20, &[0u8; 1_000]);
         let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
-        let bound = decode_mini_bound(&mut z, Some(2 << 20), &e, &raw, H::Sha1);
-        assert!(bound >= (2 << 20) * 2, "out 2x biggest-result factor missing: {bound}");
+        let instr = usize::try_from(e.decompressed_size).unwrap();
+        let body = raw.len() - e.header_size();
+        let t = decode_mini_terms(&mut z, Some(2 * MIB), &e, &raw, H::Sha1);
+        assert_eq!(t.out, 2 * (2 * MIB) + instr);
+        // mini counts the base's level-0 re-deflate once: no x2 factor
+        assert_eq!(t.mini, 12 + 32 + body + 20 + 32 + stored_deflate_bound(2 * MIB));
+        // a result claim bigger than the base drives `biggest`
+        let raw = delta_raw(1 << 10, 8 << 20, &[0u8; 10]);
+        let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
+        let instr = usize::try_from(e.decompressed_size).unwrap();
+        let t = decode_mini_terms(&mut z, Some(1 << 10), &e, &raw, H::Sha1);
+        assert_eq!(t.out, 2 * (8 * MIB) + instr);
+        // an unreadable claim bounds at MAX_OBJ
+        let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
+        let t = decode_mini_terms(&mut z, Some(1 << 10), &e, &raw[..e.header_size()], H::Sha1);
+        assert_eq!(t.out, 2 * MAX_OBJ as usize + instr);
+    }
+
+    /// A Cx with the guard off, so a decode test sees only the fallible
+    /// reservations, not the process-wide live reading.
+    fn bare_cx<'a>(mem: &'a MemReads, empty: &'a HashMap<ObjectId, ObjLoc>) -> Cx<'a> {
+        let mut cx = test_cx(mem, "k", 0, Externals::Map(empty));
+        cx.mem = None;
+        cx
+    }
+
+    /// Codex r8 #2: the mini-pack and the work Vec are reserved once at
+    /// their exact sizes. A real delta over an incompressible 3 MiB base
+    /// decodes inside both reservations: the NoGrow writer would fail an
+    /// overflowing mini-pack, and the returned `out` keeps exactly the
+    /// reserved capacity, so gix-pack never reallocated it.
+    #[test]
+    fn decode_mini_stays_inside_its_reservations() {
+        let mem = MemReads::new(crate::store::RepoId("o/r".into()));
+        let empty = HashMap::new();
+        let mut cx = bare_cx(&mem, &empty);
+        let mut x = 0x2545_f491_u32;
+        let base: Vec<u8> = (0..3 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let result = b"replaced";
+        let raw = mk_delta_raw(Header::OfsDelta { base_distance: 1 }, base.len() as u64, result.len() as u64, &insert_ops(result));
+        let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
+        let terms = decode_mini_terms(&mut cx.z, Some(base.len()), &e, &raw, H::Sha1);
+        let (k, out) = decode_mini(&mut cx, Some((Kind::Blob, &base)), &raw, ObjLabel::Offset(0)).unwrap();
+        assert_eq!(k, Kind::Blob);
+        assert_eq!(out, result);
+        assert_eq!(out.capacity(), terms.out, "gix-pack stayed inside the reserved work Vec");
+        // a full entry: the work Vec is the object, exactly
+        let mut enc = Vec::new();
+        codec::encode_entry(Kind::Blob, &base, &mut enc).unwrap();
+        let (_, out) = decode_mini(&mut cx, None, &enc, ObjLabel::Offset(0)).unwrap();
+        assert_eq!(out, base);
+        assert_eq!(out.capacity(), base.len());
+    }
+
+    /// A failed mini-pack or work-Vec reservation is the in-band memory
+    /// Limit, never a panic.
+    #[test]
+    fn decode_mini_failed_reservation_is_in_band() {
+        let mem = MemReads::new(crate::store::RepoId("o/r".into()));
+        let empty = HashMap::new();
+        let mut cx = bare_cx(&mem, &empty);
+        let base = vec![5u8; 1 << 20];
+        let raw = mk_delta_raw(Header::OfsDelta { base_distance: 1 }, base.len() as u64, 4, &insert_ops(b"four"));
+        let e = PackEntry::from_bytes(&raw, 0, H::Sha1).unwrap();
+        let terms = decode_mini_terms(&mut cx.z, Some(base.len()), &e, &raw, H::Sha1);
+        assert!(terms.mini < terms.out);
+        // the mini-pack itself is refused
+        crate::try_grow::fail_above(Some(terms.mini - 1));
+        let mini = decode_mini(&mut cx, Some((Kind::Blob, &base)), &raw, ObjLabel::Offset(0));
+        // the mini-pack fits, the work Vec is refused
+        crate::try_grow::fail_above(Some(terms.mini));
+        let work = decode_mini(&mut cx, Some((Kind::Blob, &base)), &raw, ObjLabel::Offset(0));
+        crate::try_grow::fail_above(None);
+        assert!(crate::try_grow::is_retry(&mini.unwrap_err()));
+        assert!(crate::try_grow::is_retry(&work.unwrap_err()));
+        let (_, out) = decode_mini(&mut cx, Some((Kind::Blob, &base)), &raw, ObjLabel::Offset(0)).unwrap();
+        assert_eq!(out, b"four");
     }
 
     /// links_bound is honest: a max-size tree can't produce more links than
