@@ -640,6 +640,15 @@ where
     Ok((s, t))
 }
 
+/// The LFS batch `operation` field as the auth level it needs.
+fn lfs_need(v: &serde_json::Value) -> Result<Level, Error> {
+    match v.get("operation").and_then(|o| o.as_str()) {
+        Some("download") => Ok(Level::Read),
+        Some("upload") => Ok(Level::Write),
+        _ => Err(Error::Protocol("lfs operation must be download or upload".into())),
+    }
+}
+
 /// POST /:owner/:repo/info/lfs/objects/batch — Git LFS batch API (#21, basic
 /// transfer). The operation picks the auth level: download needs read, upload
 /// needs write. The DO does existence checks + mints the signed `/_lfs/` URLs.
@@ -656,11 +665,7 @@ async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend
     .await?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("lfs batch: {e}")))?;
-    let need = match v.get("operation").and_then(|o| o.as_str()) {
-        Some("download") => Level::Read,
-        Some("upload") => Level::Write,
-        _ => return Err(Error::Protocol("lfs operation must be download or upload".into())),
-    };
+    let need = lfs_need(&v)?;
     auth::admit(grant, need)?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let base = req.url().ok().map(|u| u.origin().ascii_serialization());
@@ -1575,6 +1580,31 @@ mod tests {
         .unwrap();
         assert_eq!(out, vec![1, 2]);
         assert_eq!(order.borrow().as_slice(), ["auth", "body"]);
+    }
+
+    /// lfs_batch's operation -> level mapping: download reads, upload
+    /// writes, anything else is the Protocol error.
+    #[test]
+    fn lfs_need_maps_operation_to_level() {
+        assert!(matches!(
+            lfs_need(&serde_json::json!({"operation": "download"})),
+            Ok(Level::Read)
+        ));
+        assert!(matches!(
+            lfs_need(&serde_json::json!({"operation": "upload"})),
+            Ok(Level::Write)
+        ));
+        for v in [
+            serde_json::json!({"operation": "delete"}),
+            serde_json::json!({"operation": 1}),
+            serde_json::json!({}),
+        ] {
+            let err = lfs_need(&v).map(|_| ()).unwrap_err();
+            assert!(
+                matches!(&err, Error::Protocol(m) if m == "lfs operation must be download or upload"),
+                "{err}"
+            );
+        }
     }
 
     /// A chunk that counts its copies, so a test can see that none ran.
