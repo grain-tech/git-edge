@@ -81,6 +81,25 @@ pub(crate) fn encoded_bound(n: usize) -> usize {
         .saturating_add(320)
 }
 
+/// How a PackWriter finish treats its multipart upload on failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Finish {
+    /// A push: nothing resumes it, so a failure aborts the upload rather
+    /// than leave it and its parts orphaned in R2.
+    Ordinary,
+    /// The import job: the upload is a checkpoint a retry resumes, so a
+    /// failure keeps it.
+    Resumable,
+}
+
+/// The seal's last budget charge before complete(). On failure, returns
+/// the error and whether to abort the upload: an ordinary finish must not
+/// drop the writer silently (abort best-effort, like every other finish
+/// error path); a resumable finish keeps its checkpointed upload.
+fn seal_charge(budget: &mut ReqBudget, mode: Finish) -> Result<(), (Error, bool)> {
+    budget.charge(1).map_err(|e| (e, mode == Finish::Ordinary))
+}
+
 /// Split `buf` at `n`: returns a tight `n`-byte Vec for upload while `buf`
 /// keeps the tail in its existing allocation. Always the copy-out form —
 /// the head is exact-size so the chunk held across `upload_part` never
@@ -783,25 +802,25 @@ impl PackWriter {
             let _ = self.mpu.abort().await;
             return Err(e);
         }
-        self.seal(budget).await
+        self.seal(budget, Finish::Ordinary).await
     }
     /// finish() for a resumable caller (the import job): a mid-finish failure —
-    /// a transient part-upload error, a fixed-in-a-later-build check — leaves
-    /// the MPU and its parts alive so the retry resumes the checkpoint and
-    /// re-finishes instead of rebuilding gigabytes of output from scratch.
+    /// a transient part-upload error, a fixed-in-a-later-build check, or a
+    /// budget failure right before complete() — leaves the MPU and its parts
+    /// alive so the retry resumes the checkpoint and re-finishes instead of
+    /// rebuilding gigabytes of output from scratch.
     pub async fn finish_resumable(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
         self.finish_inner(budget).await?;
-        self.seal(budget).await
+        self.seal(budget, Finish::Resumable).await
     }
-    async fn seal(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+    async fn seal(mut self, budget: &mut ReqBudget, mode: Finish) -> Result<PackMeta, Error> {
         let bytes = self
             .offset
             .saturating_add(u64::try_from(self.kind.len_in_bytes()).map_err(|_| Error::Internal("ds".into()))?);
-        if let Err(e) = budget.charge(1) {
-            // the last gap before complete(): a budget failure here must not
-            // drop the writer silently — abort the MPU best-effort like every
-            // other finish error path
-            let _ = self.mpu.abort().await;
+        if let Err((e, abort)) = seal_charge(budget, mode) {
+            if abort {
+                let _ = self.mpu.abort().await;
+            }
             return Err(e);
         }
         let obj = self
@@ -1801,6 +1820,28 @@ mod tests {
         assert!(buf.capacity() >= 3 && buf.capacity() <= 16, "cap={}", buf.capacity());
         room(&mut buf, 8, 5); // need 5 still fits the reserved part -> no regrow
         assert!(buf.capacity() <= 16, "cap={}", buf.capacity());
+    }
+
+    /// Codex #6: a budget failure at the seal aborts an ordinary finish's
+    /// upload but KEEPS a resumable finish's checkpointed upload, so the
+    /// import retry resumes instead of rebuilding its output.
+    #[test]
+    fn seal_budget_failure_aborts_only_ordinary_finish() {
+        let spent = || {
+            let mut b = ReqBudget::paid();
+            b.used = b.max_subrequests;
+            b
+        };
+        let (e, abort) = seal_charge(&mut spent(), Finish::Ordinary).unwrap_err();
+        assert!(matches!(e, Error::Budget));
+        assert!(abort, "an ordinary finish aborts its upload");
+        let (e, abort) = seal_charge(&mut spent(), Finish::Resumable).unwrap_err();
+        assert!(matches!(e, Error::Budget));
+        assert!(!abort, "a resumable finish keeps its checkpointed upload");
+        let mut fresh = ReqBudget::paid();
+        assert!(seal_charge(&mut fresh, Finish::Resumable).is_ok());
+        assert!(seal_charge(&mut fresh, Finish::Ordinary).is_ok());
+        assert_eq!(fresh.used, 2, "the seal charges exactly one subrequest");
     }
 
     /// Codex #3 / Claude #5: the preflight is the moving-realloc PEAK. A
