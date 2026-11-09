@@ -3,6 +3,7 @@
 //! returns HTTP 200 carrying `unpack <err>` + `ng <ref>` for each command.
 
 use std::cell::Cell;
+use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -45,6 +46,16 @@ fn body_push(body: &mut Vec<u8>, chunk: &[u8], cap: usize, too_big: &'static str
     Ok(())
 }
 
+/// The declared Content-Length checked before a byte is read. An absent
+/// or unparsable header falls through — the streamed check bounds the real
+/// body. A length beyond usize's reach counts as over-cap.
+fn declared_len_ok(header: Option<&str>, cap: usize, too_big: &'static str) -> Result<(), Error> {
+    if let Some(n) = header.and_then(|v| v.parse::<u64>().ok()) {
+        check_body_len(usize::try_from(n).unwrap_or(usize::MAX), cap, too_big)?;
+    }
+    Ok(())
+}
+
 /// `Request::bytes()` without worker's infallible `vec![0; len]` inside
 /// `Uint8Array::to_vec()`, and bounded by `cap`: the declared
 /// Content-Length is checked before a byte is read, and the streamed
@@ -52,15 +63,8 @@ fn body_push(body: &mut Vec<u8>, chunk: &[u8], cap: usize, too_big: &'static str
 /// never buys a reservation. A refused reservation is the in-band
 /// memory Limit.
 async fn request_body_bytes(req: &mut Request, cap: usize, too_big: &'static str) -> Result<Vec<u8>, Error> {
-    if let Some(n) = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        check_body_len(usize::try_from(n).unwrap_or(usize::MAX), cap, too_big)?;
-    }
+    let declared = req.headers().get("content-length").ok().flatten();
+    declared_len_ok(declared.as_deref(), cap, too_big)?;
     let mut body = Vec::new();
     if req.inner().body().is_none() {
         return Ok(body); // no body — the same empty Vec array_buffer() produced
@@ -566,15 +570,32 @@ async fn pack_get(req: &Request, env: &Env, _route: &RepoRoute, name: &str, spen
     Ok(resp)
 }
 
+/// The lfs_batch gate as a seam: `auth` settles before `body` is invoked —
+/// a failed auth returns its error and the body reader never runs.
+async fn auth_then_body<S, T, A, B, FB>(auth: A, body: B) -> Result<T, Error>
+where
+    A: Future<Output = Result<S, Error>>,
+    B: FnOnce() -> FB,
+    FB: Future<Output = Result<T, Error>>,
+{
+    auth.await?;
+    body().await
+}
+
 /// POST /:owner/:repo/info/lfs/objects/batch — Git LFS batch API (#21, basic
 /// transfer). The operation picks the auth level: download needs read, upload
 /// needs write. The DO does existence checks + mints the signed `/_lfs/` URLs.
 async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     // authenticate at the minimum level before the body is read — the
     // required level depends on `operation`, known only after parsing.
-    // An upload re-checks at Write below.
-    auth::authenticate(&req, env, Level::Read, route, spend).await?;
-    let body = request_body_bytes(&mut req, 1_048_576, "lfs batch body too large").await?;
+    // An upload re-checks at Write below. Credentials come out
+    // synchronously so the auth future holds no borrow on `req`.
+    let creds = auth::credentials(&req);
+    let body = auth_then_body(
+        auth::authenticate_with(creds, env, Level::Read, route, spend),
+        || request_body_bytes(&mut req, 1_048_576, "lfs batch body too large"),
+    )
+    .await?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("lfs batch: {e}")))?;
     match v.get("operation").and_then(|o| o.as_str()) {
@@ -1435,5 +1456,82 @@ mod tests {
         // the declared-length check shares the rule
         check_body_len(65, 64, "declared too large").unwrap_err();
         check_body_len(64, 64, "declared too large").unwrap();
+    }
+
+    /// The declared-length precheck: over-cap refuses with the caller's
+    /// Protocol wording, len == cap is admitted, and an absent or
+    /// unparsable header falls through to the streamed check. A length
+    /// beyond usize's reach counts as over-cap.
+    #[test]
+    fn declared_len_precheck() {
+        let err = declared_len_ok(Some("65"), 64, "declared too large").unwrap_err();
+        assert!(matches!(&err, Error::Protocol(m) if m == "declared too large"), "{err}");
+        declared_len_ok(Some("64"), 64, "declared too large").unwrap();
+        declared_len_ok(None, 64, "declared too large").unwrap();
+        declared_len_ok(Some("not-a-number"), 64, "declared too large").unwrap();
+        declared_len_ok(Some("18446744073709551615"), 64, "declared too large").unwrap_err();
+    }
+
+    /// A waker that does nothing — auth_then_body's fakes resolve on
+    /// first poll, so its future never really pends in these tests.
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn no_op(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    /// Drive `f` to completion — the seam's fakes never pend.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let w = noop_waker();
+        let mut cx = std::task::Context::from_waker(&w);
+        let mut f = std::pin::pin!(f);
+        for _ in 0..1_000_000 {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+        panic!("future did not resolve");
+    }
+
+    /// lfs_batch's order as a seam: a failed Read auth returns its own
+    /// error and the body reader is never invoked; on success auth runs
+    /// before the body read.
+    #[test]
+    fn auth_then_body_gates_the_body_read() {
+        let ran = Rc::new(Cell::new(false));
+        let r = Rc::clone(&ran);
+        let err = block_on(auth_then_body(
+            async { Err::<(), Error>(Error::Forbidden) },
+            move || {
+                r.set(true);
+                async { Ok::<Vec<u8>, Error>(Vec::new()) }
+            },
+        ))
+        .unwrap_err();
+        assert!(matches!(err, Error::Forbidden), "{err}");
+        assert!(!ran.get(), "the body reader ran despite the auth failure");
+
+        let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (a, b) = (Rc::clone(&order), Rc::clone(&order));
+        let out = block_on(auth_then_body(
+            async move {
+                a.borrow_mut().push("auth");
+                Ok::<(), Error>(())
+            },
+            move || {
+                let b = Rc::clone(&b);
+                async move {
+                    b.borrow_mut().push("body");
+                    Ok(vec![1u8, 2])
+                }
+            },
+        ))
+        .unwrap();
+        assert_eq!(out, vec![1, 2]);
+        assert_eq!(order.borrow().as_slice(), ["auth", "body"]);
     }
 }

@@ -39,7 +39,7 @@ pub fn token_hash(token: &str) -> Result<String, Error> {
 }
 
 /// Extract (token, principal) from the Authorization header.
-fn credentials(req: &Request) -> Result<(String, String), Error> {
+pub(crate) fn credentials(req: &Request) -> Result<(String, String), Error> {
     let hdr = req
         .headers()
         .get("authorization")
@@ -93,7 +93,21 @@ pub fn is_admin(req: &Request, env: &Env) -> bool {
 /// admin-assigned name, so pushes attribute to a meaningful identity. `spend`
 /// tallies the stub call so a 401/403 still reports x-ge-subrequests.
 pub async fn authenticate(req: &Request, env: &Env, need: Level, route: &RepoRoute, spend: &Spend) -> Result<String, Error> {
-    let (token, principal) = match credentials(req) {
+    authenticate_with(credentials(req), env, need, route, spend).await
+}
+
+/// The post-credential half of authenticate. Split out so a caller that
+/// must not hold a borrow on `req` across the await — lfs_batch reads the
+/// body after auth — can extract credentials synchronously, then sequence
+/// the check before the read.
+pub(crate) async fn authenticate_with(
+    creds: Result<(String, String), Error>,
+    env: &Env,
+    need: Level,
+    route: &RepoRoute,
+    spend: &Spend,
+) -> Result<String, Error> {
+    let (token, principal) = match creds {
         Ok(c) => c,
         // no usable credential on a read route: a public repo answers anonymously.
         // (A presented-but-invalid credential still gets the challenge — anonymous
