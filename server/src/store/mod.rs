@@ -17,17 +17,34 @@ pub const PART: usize = 8 << 20; // 6.4: every part exactly 8 MiB except the las
 pub const PART_MIN: usize = 5 << 20;
 pub const MAX_OBJECT: u64 = 16 << 20; // A7: single-object cap, inflated
 
-/// Grow `buf` for `extra` incoming bytes in whole-part steps: capacity stays a
-/// multiple of `part` (one part plus at most the overshoot append) instead of
-/// Vec's doubling holding ~2x across a flush boundary. `part` must be > 0.
-fn room(buf: &mut Vec<u8>, part: usize, extra: usize) {
-    let need = buf.len().saturating_add(extra);
-    if need <= buf.capacity() {
-        return;
+/// The capacity `room` would grow `buf` to for `extra` incoming bytes:
+/// whole-part steps, so capacity stays a multiple of `part` (one part plus
+/// at most the overshoot append) instead of Vec's doubling holding ~2x
+/// across a flush boundary. `part` must be > 0. Returns `cap` unchanged
+/// when the need already fits — i.e. no growth.
+fn room_target(len: usize, cap: usize, part: usize, extra: usize) -> usize {
+    let need = len.saturating_add(extra);
+    if need <= cap {
+        return cap;
     }
     let step = part.max(1);
-    let target = need.div_ceil(step).saturating_mul(step);
-    buf.reserve_exact(target.saturating_sub(buf.len()));
+    need.div_ceil(step).saturating_mul(step)
+}
+
+/// Grow `buf` for `extra` incoming bytes in whole-part steps.
+pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) {
+    let target = room_target(buf.len(), buf.capacity(), part, extra);
+    if target > buf.capacity() {
+        buf.reserve_exact(target.saturating_sub(buf.len()));
+    }
+}
+
+/// The capacity bytes `room` would add for `extra` incoming bytes — the
+/// memory guard's preflight size for append paths (0 when it already fits).
+/// reserve_exact can round up past `target` by allocator slack; callers add
+/// their own flat slack for encoder/stream state.
+pub(crate) fn room_growth(buf: &Vec<u8>, part: usize, extra: usize) -> usize {
+    room_target(buf.len(), buf.capacity(), part, extra).saturating_sub(buf.capacity())
 }
 
 /// Upper bound on `codec::encode_entry`'s appended bytes for `n` input bytes:
@@ -35,7 +52,7 @@ fn room(buf: &mut Vec<u8>, part: usize, extra: usize) {
 /// deflate's worst case, and the flat slack covers the varint header and
 /// rounding — used to pre-size `part` so the encoder's own growth never
 /// doubles past the reserved whole parts.
-fn encoded_bound(n: usize) -> usize {
+pub(crate) fn encoded_bound(n: usize) -> usize {
     n.saturating_add(n >> 12)
         .saturating_add(n >> 14)
         .saturating_add(n >> 25)
@@ -43,19 +60,14 @@ fn encoded_bound(n: usize) -> usize {
         .saturating_add(320)
 }
 
-/// Split `buf` at `n`: the head becomes an owned Vec for upload while `buf`
-/// keeps the tail. `split_off` allocates a tail-sized copy while the whole
-/// buffer is still live — the cheaper transient only when the tail is no
-/// bigger than the head. A bigger tail (the common case: one part out of a
-/// ~part-size+ buffer) instead copies the head out exact-size and memmoves
-/// the tail down inside the same allocation, peaking at capacity + n — the
-/// drain(..).collect() pattern's footprint without its second copy.
+/// Split `buf` at `n`: returns a tight `n`-byte Vec for upload while `buf`
+/// keeps the tail in its existing allocation. Always the copy-out form —
+/// the head is exact-size so the chunk held across `upload_part` never
+/// retains a part-sized-plus allocation for one part of data, and neither
+/// branch holds capacity + a second full-size copy: the transient is the
+/// head's `n` bytes on top of `buf`'s existing capacity.
 /// Caller guarantees `n <= buf.len()`.
-fn split_part(buf: &mut Vec<u8>, n: usize) -> Vec<u8> {
-    if buf.len().saturating_sub(n) <= n {
-        let rest = buf.split_off(n);
-        return std::mem::replace(buf, rest);
-    }
+pub(crate) fn split_part(buf: &mut Vec<u8>, n: usize) -> Vec<u8> {
     let head = buf[..n].to_vec();
     buf.copy_within(n.., 0);
     buf.truncate(buf.len() - n);
@@ -553,7 +565,12 @@ impl RawWriter {
             let _ = self.mpu.abort().await;
             return Err(e);
         }
-        budget.charge(1)?;
+        if let Err(e) = budget.charge(1) {
+            // same orphan rule as finish_inner: dropping the writer without
+            // abort leaves the MPU and its parts in R2
+            let _ = self.mpu.abort().await;
+            return Err(e);
+        }
         self.mpu
             .complete(std::mem::take(&mut self.parts))
             .await
@@ -573,6 +590,24 @@ impl RawWriter {
     pub async fn abort(self) {
         let _ = self.mpu.abort().await;
     }
+}
+
+/// The output-pack write surface pass B drives — `PackWriter` (R2 multipart)
+/// in production, an in-memory Vec under tests. Only the incremental
+/// append/flush calls the resolve loop makes are shared; finish/abort stay
+/// on the concrete type.
+pub trait PackOut {
+    fn offset(&self) -> u64;
+    fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error>;
+    fn raw_extend(&mut self, bytes: &[u8]);
+    fn raw_entry_done(&mut self, kind: Kind, start: u64) -> Result<(u64, u32), Error>;
+    /// Capacity bytes `room` would add for `extra` incoming bytes — the
+    /// memory guard's preflight size for append paths (0 when it fits).
+    fn growth_bound(&self, extra: usize) -> usize;
+    /// Bytes one `flush_if_full` chunk allocates — the uploaded part the
+    /// guard preflights before the split can grow unchecked.
+    fn chunk_bound(&self) -> usize;
+    fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> impl std::future::Future<Output = Result<(), Error>> + 'a;
 }
 
 /// One normalized pack: one multipart upload, running hash for the trailer (1.2, 6.4).
@@ -741,7 +776,13 @@ impl PackWriter {
         let bytes = self
             .offset
             .saturating_add(u64::try_from(self.kind.len_in_bytes()).map_err(|_| Error::Internal("ds".into()))?);
-        budget.charge(1)?;
+        if let Err(e) = budget.charge(1) {
+            // the last gap before complete(): a budget failure here must not
+            // drop the writer silently — abort the MPU best-effort like every
+            // other finish error path
+            let _ = self.mpu.abort().await;
+            return Err(e);
+        }
         let obj = self
             .mpu
             .complete(std::mem::take(&mut self.parts))
@@ -949,6 +990,30 @@ pub fn check_params(n: usize) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+impl PackOut for PackWriter {
+    fn offset(&self) -> u64 {
+        self.offset()
+    }
+    fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error> {
+        self.append_entry(kind, data)
+    }
+    fn raw_extend(&mut self, bytes: &[u8]) {
+        self.raw_extend(bytes)
+    }
+    fn raw_entry_done(&mut self, kind: Kind, start: u64) -> Result<(u64, u32), Error> {
+        self.raw_entry_done(kind, start)
+    }
+    fn growth_bound(&self, extra: usize) -> usize {
+        room_growth(&self.part, self.part_size, extra)
+    }
+    fn chunk_bound(&self) -> usize {
+        self.part_size
+    }
+    async fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> Result<(), Error> {
+        PackWriter::flush_if_full(self, budget).await
+    }
 }
 
 /// The one `SqlStorage::exec` wrapper — every call site in the crate routes
@@ -1612,29 +1677,33 @@ mod tests {
         assert!(matches!(ck.hash().unwrap(), CkptHash::Sha1(_)));
     }
 
-    /// split_part hands the head off whole and leaves a tight tail — the
-    /// drain(..).collect() it replaced kept a second full-part copy alive.
+    /// split_part hands the head off exact-size and keeps the tail in the
+    /// buffer's existing allocation — the chunk held across upload_part
+    /// never retains a part-sized-plus allocation for one part of data,
+    /// and neither branch holds capacity + a second full-size copy.
     #[test]
     fn split_part_preserves_bytes_and_tight_tail() {
         let mut buf: Vec<u8> = (0..41u8).collect();
+        buf.reserve_exact(64); // the part buffer's spare capacity
         let mut flat = Vec::new();
         while buf.len() >= 8 {
-            flat.extend_from_slice(&split_part(&mut buf, 8));
+            let head = split_part(&mut buf, 8);
+            assert_eq!(head.len(), head.capacity(), "uploaded chunk is exact-size");
+            flat.extend_from_slice(&head);
         }
         flat.extend_from_slice(&buf);
         assert_eq!(flat, (0..41u8).collect::<Vec<_>>(), "bytes and order preserved");
-        assert!(buf.capacity() <= buf.len() + 16, "tail must not keep the part buffer");
+        // buf keeps its allocation — it is the reusable part buffer, not a
+        // leak: the tightness contract is on the returned head
     }
 
-    /// The two split_part branches pick the cheaper transient: a tail no
-    /// bigger than the head takes split_off's tail-sized copy (the head
-    /// keeps the donor allocation, the tail arrives tight); a bigger tail
-    /// copies the head out exact-size and memmoves the tail inside the
-    /// same allocation — split_off would hold capacity + tail live.
+    /// One branch for every split: the head is always an exact-size copy,
+    /// the tail memmoves down inside the same allocation. A small tail
+    /// (the split_off case the old code special-cased) gets the same tight
+    /// head — the donor's spare capacity never rides along on the upload.
     #[test]
     fn split_part_branches_on_tail_vs_head() {
-        // tail (15) > head (8): the part-buffer case — head comes back
-        // exact-size, the tail stays in the original allocation
+        // tail (15) > head (8): head exact-size, tail keeps the buffer
         let mut buf: Vec<u8> = (0..23u8).collect();
         let cap = buf.capacity();
         let head = split_part(&mut buf, 8);
@@ -1642,14 +1711,12 @@ mod tests {
         assert_eq!(head.len(), head.capacity(), "head copy is exact-size");
         assert_eq!(buf.as_slice(), &(8..23u8).collect::<Vec<_>>()[..]);
         assert_eq!(buf.capacity(), cap, "tail keeps the part buffer");
-        // tail (2) <= head (8): split_off — head keeps the donor's whole
-        // allocation, the tail vec is tight
+        // tail (2) <= head (8): same form — head exact-size, tail tight
         let mut buf: Vec<u8> = (0..10u8).collect();
         let head = split_part(&mut buf, 8);
         assert_eq!(head, (0..8u8).collect::<Vec<_>>());
-        assert!(head.capacity() > head.len(), "head is the donor allocation's front");
+        assert_eq!(head.len(), head.capacity(), "head is exact-size, never the donor's spare");
         assert_eq!(buf.as_slice(), &[8u8, 9]);
-        assert!(buf.capacity() <= buf.len() + 16, "split_off tail stays tight");
     }
 
     /// `read_entries_bound` prices the fetch before it allocates: every
