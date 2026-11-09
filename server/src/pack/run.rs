@@ -1028,6 +1028,28 @@ mod tests {
         ObjLoc { pack: PackId("p".into()), idx: n, offset: 0, len: 1, kind: gix_object::Kind::Blob, size: 1 }
     }
 
+    /// Two thin-pack entries, each a ref-delta on its own base — enough
+    /// for collect_bases to count, reserve and return two ids.
+    fn ref_delta_entries() -> Vec<super::super::ingest::EntryRec> {
+        use gix_pack::data::entry::Header;
+        vec![
+            super::super::ingest::EntryRec { offset: 12, header_len: 5, kind_or_delta: Header::RefDelta { base_id: oid(1) }, compressed_len: 10, size: 4 },
+            super::super::ingest::EntryRec { offset: 30, header_len: 5, kind_or_delta: Header::RefDelta { base_id: oid(2) }, compressed_len: 10, size: 4 },
+        ]
+    }
+
+    /// The line of the try_grow call that ends `snippet`, found in this
+    /// file's production code — ingest.rs's guarded_site twin, so a test
+    /// names a guarded site by its code, not by a line number.
+    fn guarded_site(snippet: &str) -> (&'static str, u32) {
+        let src = include_str!("run.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests module")];
+        let hits: Vec<usize> = prod.match_indices(snippet).map(|(i, _)| i).collect();
+        assert_eq!(hits.len(), 1, "snippet must name one site: {snippet:?}");
+        let end = hits[0] + snippet.len();
+        (file!(), u32::try_from(prod[..end].matches('\n').count() + 1).unwrap())
+    }
+
     /// The three run()-side growth preflights live inside the steps whose
     /// results run() needs: the base list, the filled externals map and
     /// the finished pack's meta. Each step records its tag with the bytes
@@ -1035,6 +1057,7 @@ mod tests {
     #[test]
     fn run_side_growth_preflights_record_their_tags() {
         use gix_pack::data::entry::Header;
+        let _guard = crate::try_grow::HookGuard;
         let entries = vec![
             super::super::ingest::EntryRec { offset: 12, header_len: 5, kind_or_delta: Header::RefDelta { base_id: oid(1) }, compressed_len: 10, size: 4 },
             super::super::ingest::EntryRec { offset: 30, header_len: 5, kind_or_delta: Header::RefDelta { base_id: oid(2) }, compressed_len: 10, size: 4 },
@@ -1050,7 +1073,6 @@ mod tests {
         let mut budget = test_budget();
         let out = FakeOut { bound: 1 << 20, done: done.clone() };
         block_on(finish_writer(out, &mut budget)).unwrap();
-        crate::mem::set_live_override(None);
         assert_eq!(done.get(), "finish");
         let sites = crate::pack::ingest::preflight_sites();
         let tags: Vec<_> = sites.iter().map(|(t, _)| *t).collect();
@@ -1062,11 +1084,11 @@ mod tests {
     /// A refused finish preflight aborts the upload and never finishes.
     #[test]
     fn finish_writer_refusal_aborts_the_upload() {
+        let _guard = crate::try_grow::HookGuard;
         crate::mem::set_live_override(Some(std::rc::Rc::new(|| 200 << 20)));
         let done = Rc::new(Cell::new(""));
         let mut budget = test_budget();
         let res = block_on(finish_writer(FakeOut { bound: 1 << 20, done: done.clone() }, &mut budget));
-        crate::mem::set_live_override(None);
         assert!(matches!(res, Err(Error::Limit(_))), "a refused finish preflight is the Limit");
         assert_eq!(done.get(), "abort");
     }
@@ -1076,6 +1098,7 @@ mod tests {
     /// leaves the map as it was.
     #[test]
     fn add_externals_preflights_and_reserves_hits() {
+        let _guard = crate::try_grow::HookGuard;
         let found: Vec<_> = (0..1_000u32).map(|n| (oid(n), (n % 2 == 0).then(|| loc(n)))).collect();
         let mut ext = HashMap::new();
         crate::mem::set_live_override(Some(std::rc::Rc::new(|| 16 << 20)));
@@ -1094,10 +1117,44 @@ mod tests {
         assert!(matches!(err, Err(Error::Limit(_))));
         crate::try_grow::fail_above(Some(1 << 10));
         let err = add_externals(&mut ext, more, None);
-        crate::try_grow::fail_above(None);
-        crate::mem::set_live_override(None);
         assert!(matches!(&err, Err(e) if crate::try_grow::is_retry(e)));
         assert_eq!(ext.len(), 500);
+    }
+
+    /// Codex/Claude r11: collect_bases' "grow:bases" preflight must be able
+    /// to refuse — a heap already over MEM_HARD answers the in-band Limit
+    /// before the id list reserves. Replacing the `?` with `.ok()` lets
+    /// this return Ok and fails here.
+    #[test]
+    fn collect_bases_refuses_over_the_memory_hard_line() {
+        let _guard = crate::try_grow::HookGuard;
+        let entries = ref_delta_entries();
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 200 << 20)));
+        let res = collect_bases(&entries, None);
+        assert!(
+            matches!(&res, Err(Error::Limit(m)) if m.contains("smaller slices")),
+            "a refused grow:bases preflight is the memory Limit: {res:?}"
+        );
+    }
+
+    /// The reservation under the preflight: fail_only_at pins
+    /// collect_bases' try_grow call and a zero threshold refuses its
+    /// block — the answer is the in-band retry Limit. Reverting to
+    /// Vec::with_capacity leaves the site ungated and this returns Ok.
+    #[test]
+    fn collect_bases_refuses_when_its_reservation_fails() {
+        let _guard = crate::try_grow::HookGuard;
+        let entries = ref_delta_entries();
+        let site = guarded_site("crate::try_grow::with_capacity(n_bases)");
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(0));
+        crate::try_grow::log_asks();
+        let res = collect_bases(&entries, None);
+        let seen = crate::try_grow::take_asks();
+        assert!(matches!(&res, Err(e) if crate::try_grow::is_retry(e)), "a refused reservation is the retry Limit: {res:?}");
+        let refused: Vec<_> = seen.iter().filter(|a| a.refused).collect();
+        assert_eq!(refused.len(), 1, "one refusal ends the run: {seen:?}");
+        assert_eq!((refused[0].file, refused[0].line), site, "the refusal must be at the bases site");
     }
     use gix_object::Kind;
 

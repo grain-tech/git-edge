@@ -2847,6 +2847,7 @@ mod tests {
     #[test]
     fn mini_write_overflow_grows_fallibly_or_limits() {
         use std::io::Write as _;
+        let _guard = crate::try_grow::HookGuard;
         // hook refuses the growth -> WriteZero -> mini_io -> the Limit
         let mut v: Vec<u8> = Vec::with_capacity(8);
         v.extend_from_slice(&[0u8; 8]);
@@ -3109,6 +3110,7 @@ mod tests {
     /// built, and a refusal (or a failed reservation) builds nothing.
     #[test]
     fn prefetch_locs_bounds_rows_and_preflights_metadata() {
+        let _guard = crate::try_grow::HookGuard;
         let mut bases = HashMap::new();
         for n in 0..10_000u32 {
             let mut b = [0u8; 20];
@@ -3682,6 +3684,7 @@ mod tests {
     /// guarded reservation and succeed at or above every reservation.
     #[test]
     fn resolve_fail_hook_sweep_is_always_the_in_band_limit() {
+        let _guard = crate::try_grow::HookGuard;
         let (mem, key, recs, ext) = sweep_fixture();
         let (res, asks) = sweep_run(&mem, key, &recs, &ext);
         let rows = res.expect("the clean run must resolve");
@@ -3730,12 +3733,12 @@ mod tests {
             crate::try_grow::fail_above(Some(t));
             let (res, _) = sweep_run(&mem, key, &recs, &ext);
             crate::try_grow::fail_above(None);
+            if t >= all_max {
+                assert!(res.is_ok(), "threshold {t} covers every ask — the hooked run must succeed");
+            }
             match res {
                 Err(e) => assert!(crate::try_grow::is_retry(&e), "threshold {t}: refusal must be the in-band Limit, got {e}"),
                 Ok(_) => assert!(t >= guarded_max, "threshold {t} < guarded ask {guarded_max} must refuse"),
-            }
-            if t >= all_max {
-                assert!(sweep_run(&mem, key, &recs, &ext).0.is_ok(), "threshold {t} covers every ask");
             }
         }
         // Source::Parts (the DO import's multi-part window) reserves the
@@ -3821,6 +3824,7 @@ mod tests {
     /// guard isn't just unit-tested, it gates production flow.
     #[test]
     fn forced_pressure_makes_real_path_limit() {
+        let _guard = crate::try_grow::HookGuard;
         let blob = b"pressure test blob".as_slice();
         let (pack, recs) = mk_pack(&[(Kind::Blob, blob)]);
         let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
@@ -3833,7 +3837,6 @@ mod tests {
         clear_preflights();
         crate::mem::set_live_override(Some(std::rc::Rc::new(|| MEM_HARD + (1 << 20))));
         let res = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
-        crate::mem::set_live_override(None);
         match res {
             Err(Error::Limit(m)) => assert!(m.contains("smaller slices") || m.contains("busy"), "{m}"),
             other => panic!("expected Limit, got {:?}", other.map(|r| r.len())),
@@ -3844,11 +3847,11 @@ mod tests {
     /// a body that fits and fails in-band on one that would cross MEM_HARD.
     #[test]
     fn mem_preflight_guards_the_final_index_post() {
+        let _guard = crate::try_grow::HookGuard;
         clear_preflights();
         crate::mem::set_live_override(Some(std::rc::Rc::new(|| 50 << 20)));
         let ok = mem_preflight(None, 8 << 20, "grow:index-final");
         let err = mem_preflight(None, 47 << 20, "grow:index-final");
-        crate::mem::set_live_override(None);
         ok.unwrap();
         assert!(matches!(err, Err(Error::Limit(_))), "{err:?}");
         let sites = preflight_sites();
@@ -4030,6 +4033,7 @@ mod tests {
     /// Limit, never a panic.
     #[test]
     fn decode_mini_failed_reservation_is_in_band() {
+        let _guard = crate::try_grow::HookGuard;
         let mem = MemReads::new(crate::store::RepoId("o/r".into()));
         let empty = HashMap::new();
         let mut cx = bare_cx(&mem, &empty);
@@ -4217,6 +4221,7 @@ mod tests {
     /// of 524,289-750,000 objects with a retry that can never succeed.
     #[test]
     fn pass_a_last_doubling_passes_the_real_guard() {
+        let _guard = crate::try_grow::HookGuard;
         const MIB: usize = 1 << 20;
         let elem = std::mem::size_of::<EntryRec>();
         let (len, live, linear) = (524_288usize, 42 * MIB, 64 * MIB);
@@ -4232,8 +4237,6 @@ mod tests {
         crate::mem::set_linear_override(Some(std::rc::Rc::new(move || linear)));
         clear_preflights();
         let res = reserve_entries(&mut recs, MAX_ENTRIES, |peak| mem_preflight(None, peak, "grow:pass-a-entries"));
-        crate::mem::set_live_override(None);
-        crate::mem::set_linear_override(None);
         res.unwrap();
         assert_eq!(recs.capacity(), MAX_ENTRIES);
         assert_eq!(preflight_sites(), vec![("grow:pass-a-entries", incoming)]);
@@ -4243,6 +4246,7 @@ mod tests {
     /// in-band memory Limit, never a panic, and the state stays as it was.
     #[test]
     fn links_and_cache_failed_reservation_is_in_band() {
+        let _guard = crate::try_grow::HookGuard;
         let ids = vec![ObjectId::null(H::Sha1); 1_000];
         let mut sink = MemSink::default();
         let mut c = Cache::with_budget(usize::MAX);
@@ -4273,6 +4277,7 @@ mod tests {
     /// in-band retry Limit instead of trapping.
     #[test]
     fn resolve_loop_failed_reservation_is_in_band() {
+        let _guard = crate::try_grow::HookGuard;
         let big = vec![3u8; 1 << 20];
         let (pack, recs) = mk_pack(&[(Kind::Blob, b"small"), (Kind::Blob, &big)]);
         let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
@@ -4283,7 +4288,6 @@ mod tests {
         let mut sink = MemSink::default();
         crate::try_grow::fail_above(Some(256 << 10));
         let res = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
-        crate::try_grow::fail_above(None);
         match res {
             Err(e) => assert!(crate::try_grow::is_retry(&e), "{e}"),
             Ok(_) => panic!("the 1 MiB decode must be refused"),
@@ -4354,6 +4358,7 @@ mod tests {
     /// in-band retry Limit.
     #[test]
     fn pass_a_loop_records_entry_table_growth() {
+        let _guard = crate::try_grow::HookGuard;
         let n = PRESIZE_RECORDS + 1;
         let mut enc = Vec::new();
         codec::encode_entry(Kind::Blob, b"", &mut enc).unwrap();
@@ -4383,7 +4388,6 @@ mod tests {
         // the growth's block refused: in-band, no panic
         crate::try_grow::fail_above(Some(PRESIZE_RECORDS * elem));
         let (r, _) = run(&pack);
-        crate::try_grow::fail_above(None);
         assert!(matches!(&r, Err(e) if crate::try_grow::is_retry(e)));
     }
 

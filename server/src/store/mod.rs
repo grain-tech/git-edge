@@ -2091,6 +2091,7 @@ mod tests {
     /// allocator refuses the block — and leave the buffer as it was.
     #[test]
     fn writer_growth_and_split_fail_in_band() {
+        let _guard = crate::try_grow::HookGuard;
         let mut part: Vec<u8> = vec![7u8; 100];
         crate::try_grow::fail_above(Some(150));
         let grow = room(&mut part, 64, 100);
@@ -2098,7 +2099,6 @@ mod tests {
         let split_refused = split_part(&mut part, 50);
         crate::try_grow::fail_above(Some(150));
         let split = split_part(&mut part, 99);
-        crate::try_grow::fail_above(None);
         assert!(crate::try_grow::is_retry(&grow.unwrap_err()), "a 256-byte block over a 150-byte cap");
         assert!(crate::try_grow::is_retry(&split_refused.unwrap_err()));
         assert_eq!(split.unwrap().len(), 99, "a 99-byte head fits the cap, the refused split left all 100 bytes");
@@ -2190,13 +2190,13 @@ mod tests {
     /// chunks first, as the old reader did, panics in the probe.
     #[test]
     fn fill_exact_reserves_before_polling_the_body() {
+        let _guard = crate::try_grow::HookGuard;
         let want = 4096;
         let copies = std::rc::Rc::new(std::cell::Cell::new(0));
         let (mut s, polls) = probe(vec![Counted(vec![7; want], copies.clone())]);
         s.panic_on_poll = true;
         crate::try_grow::fail_above(Some(want - 1));
         let r = ready(fill_exact(want, s));
-        crate::try_grow::fail_above(None);
         let err = r.unwrap_err();
         assert!(crate::try_grow::is_retry(&err), "{err}");
         assert_eq!(polls.get(), 0, "the stream must not be polled");
@@ -2252,6 +2252,7 @@ mod tests {
     /// a fitting reservation returns the filled bytes.
     #[test]
     fn js_body_reserves_fallibly_then_fills() {
+        let _guard = crate::try_grow::HookGuard;
         crate::try_grow::fail_above(Some(8));
         let mut filled = false;
         let err = js_body(16, |_| {
@@ -2278,6 +2279,7 @@ mod tests {
     /// counters and the part holds only the new tail.
     #[test]
     fn resume_tail_reserves_before_clearing() {
+        let _guard = crate::try_grow::HookGuard;
         // a buffer with a live tail to lose if the order were wrong
         let mut part: Vec<u8> = Vec::with_capacity(4 * 1024);
         part.extend_from_slice(&[9u8; 100]);

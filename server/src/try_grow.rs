@@ -83,6 +83,25 @@ pub(crate) fn take_asks() -> Vec<Ask> {
     ASKS.with(|a| a.borrow_mut().take()).unwrap_or_default()
 }
 
+/// Test-only RAII guard: disarms this thread's hooks on drop — the fail
+/// threshold, the site filter, the ask log and the mem readings — so a
+/// failed assertion cannot leave one armed for the next test on the
+/// thread. Hold it for the test's whole scope; arm the hooks after
+/// creating it.
+#[cfg(test)]
+pub(crate) struct HookGuard;
+
+#[cfg(test)]
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        fail_above(None);
+        fail_only_at(None);
+        ASKS.with(|a| *a.borrow_mut() = None);
+        crate::mem::set_live_override(None);
+        crate::mem::set_linear_override(None);
+    }
+}
+
 /// The test hook's gate for a new block of `bytes`. A no-op outside
 /// tests. In tests, `track_caller` names the helper's caller, so the
 /// log and the site filter see the real call site.
@@ -224,6 +243,7 @@ mod tests {
     /// growth that fits the capacity allocates nothing and never fails.
     #[test]
     fn hook_fails_blocks_over_the_threshold_only() {
+        let _guard = HookGuard;
         fail_above(Some(64));
         let over = copy(&[0u8; 65]);
         let at = copy(&[0u8; 64]);
@@ -249,11 +269,11 @@ mod tests {
     /// The amortized gate prices Vec's real doubling, not the bare need.
     #[test]
     fn amortized_gate_prices_the_doubling() {
+        let _guard = HookGuard;
         let mut v: Vec<u8> = vec![0; 100];
         assert_eq!(v.capacity(), 100);
         fail_above(Some(150));
         let r = vec(&mut v, 1);
-        fail_above(None);
         assert!(is_retry(&r.unwrap_err()), "101 bytes fit 150 but the doubled 200-byte block does not");
     }
 }

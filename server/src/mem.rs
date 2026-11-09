@@ -211,6 +211,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn native_linear_bytes_is_zero_without_override() {
+        let _guard = crate::try_grow::HookGuard;
         set_linear_override(None);
         assert_eq!(linear_bytes(), 0);
         set_linear_override(Some(std::rc::Rc::new(|| 7)));
