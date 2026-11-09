@@ -92,10 +92,29 @@ const MEM_HARD: usize = 96 << 20;
 /// before the growth itself can trap. (The old LINEAR_CAP at 120 MiB left
 /// only ~2.1 MB: under one window buffer, and its `live > MEM_SOFT` gate
 /// let a 16 MiB alloc trap at 58 MiB live / 119 MiB linear.) Linear memory
-/// never shrinks and fragmentation means a grow near the wall can trap
-/// even with free pages inside, so the check is `linear() + incoming` —
-/// independent of MEM_SOFT — with one forced shed then an in-band Limit.
+/// never shrinks, so the check (`linear_trip`) applies only when an
+/// allocation may need fresh pages — independent of MEM_SOFT — with one
+/// forced shed then an in-band Limit.
 const LINEAR_CAP: usize = 112 << 20;
+/// Free space inside linear memory that the allocator may be unable to use
+/// for one request. Freed blocks are scattered, so a contiguous `incoming`
+/// block can need fresh pages even when the total free bytes exceed it.
+/// 16 MiB is one MAX_OBJ — the largest single block pass B allocates — so
+/// a heap with that much spare beyond `live + incoming` can place the
+/// block inside existing pages even if one MAX_OBJ-sized hole is unusable.
+const FRAG_MARGIN: usize = 16 << 20;
+
+/// Would allocating `incoming` bytes risk growing linear memory past
+/// LINEAR_CAP? Only when the allocation may need fresh pages — live +
+/// incoming + FRAG_MARGIN no longer fits inside the current linear size —
+/// and those pages would cross the cap. A high-water linear size with a
+/// low live heap reuses its free pages and does not trip. `incoming == 0`
+/// allocates nothing and never trips.
+fn linear_trip(live: usize, linear: usize, incoming: usize) -> bool {
+    incoming > 0
+        && live.saturating_add(incoming).saturating_add(FRAG_MARGIN) > linear
+        && linear.saturating_add(incoming) > LINEAR_CAP
+}
 /// Decode bounds above this cannot fit even on a minimally-loaded heap —
 /// the unavoidable coexisting working set around one decode (a window
 /// fetch, the part buffer's first whole part, the raw entry copy,
@@ -1040,11 +1059,12 @@ fn delta_varint(d: &[u8]) -> Option<(u64, usize)> {
     let mut size = 0u64;
     let mut consumed = 0usize;
     for &cmd in d {
-        if shift >= u64::BITS {
-            return None;
-        }
         consumed = consumed.saturating_add(1);
-        size |= u64::from(cmd & 0x7f) << shift;
+        // a group whose bits would shift past u64 is a corrupt header:
+        // checked_shl refuses shift >= 64, and the round trip refuses bits
+        // the shift would drop (the 10th byte may carry only bit 63)
+        let part = u64::from(cmd & 0x7f);
+        size |= part.checked_shl(shift).filter(|v| v >> shift == part)?;
         shift += 7;
         if cmd & 0x80 == 0 {
             return Some((size, consumed));
@@ -1372,8 +1392,8 @@ fn chain_too_large(edge: bool) -> Error {
 /// `cache.clear()` — the post-shed level, so hysteresis measures regrowth
 /// from the drained heap. The first crossing always sheds; later sheds
 /// inside the soft band need MEM_HYSTERESIS of growth. Above MEM_HARD —
-/// and whenever linear memory sits at LINEAR_CAP — the shed always runs:
-/// it is the last relief before the Limit, not hysteresis fodder.
+/// and whenever the linear trip fires — the shed always runs: it is the
+/// last relief before the Limit, not hysteresis fodder.
 #[derive(Default)]
 pub struct MemGuard {
     cleared_at: Option<usize>,
@@ -1383,6 +1403,9 @@ pub struct MemGuard {
     lease: Option<Rc<super::run::Lease>>,
 }
 
+/// The linear-memory trip's wording: the isolate's high-water mark, not
+/// this push's size, is the wall — slicing would not help, a retry will.
+const LINEAR_PRESSURE_MSG: &str = "server under memory pressure; retry in a minute";
 /// The alone-case wording for a pressure trip: the push's aggregate heap is
 /// what needs slicing.
 const MEM_PRESSURE_MSG: &str =
@@ -1523,38 +1546,30 @@ fn mem_guard_peak(
     // lowest live reading since the last shed, so regrowth is measured from
     // the drained trough — a baseline parked high would hide real regrowth
     if let Some(at) = state.cleared_at {
-        if live_now < at {
-            state.cleared_at = Some(live_now);
-        }
+        state.cleared_at = Some(at.min(live_now));
     }
-    // LINEAR_CAP trip — independent of MEM_SOFT: wasm linear memory never
-    // shrinks and fragmentation means a grow near the wall can trap even
-    // with free pages inside, so `linear() + incoming` is judged on its
-    // own. Over the cap: shed once (forced — the last relief), re-check,
-    // and still over -> in-band Limit. Clearing cannot shrink linear, so
-    // the re-check is deterministic on wasm; it still matters for the
-    // scripted readings tests inject.
-    if linear().saturating_add(incoming) > LINEAR_CAP {
+    // LINEAR_CAP trip — independent of MEM_SOFT. Linear memory never
+    // shrinks, so a high reading alone says nothing about pressure now:
+    // the trip fires only when this allocation may need FRESH pages (live
+    // + incoming + FRAG_MARGIN no longer fits inside linear) AND those
+    // pages would cross the cap. Over it: shed once (forced — the last
+    // relief, and it can help, since a lower live reading lets the
+    // allocation reuse free pages), re-check, and still over -> in-band
+    // Limit with the retry wording. A relief call (incoming 0) never trips.
+    let lin = linear();
+    if linear_trip(live_now, lin, incoming) {
         cache.clear();
+        let after_live = live();
+        state.cleared_at = Some(after_live);
         mem_log(format_args!(
-            "git-edge mem guard: forced cache clear, linear {} + {} incoming over {} cap",
-            linear(),
-            incoming,
-            LINEAR_CAP
+            "git-edge mem guard: forced cache clear, linear {lin} + {incoming} incoming over {LINEAR_CAP} cap (live {live_now} -> {after_live})"
         ));
-        state.cleared_at = Some(live());
-        if linear().saturating_add(incoming) > LINEAR_CAP {
+        let lin = linear();
+        if linear_trip(after_live, lin, incoming) {
             mem_log(format_args!(
-                "git-edge mem guard: linear {} + {} incoming still over {} cap — rejecting",
-                linear(),
-                incoming,
-                LINEAR_CAP
+                "git-edge mem guard: linear {lin} + {incoming} incoming still over {LINEAR_CAP} cap at live {after_live} — rejecting"
             ));
-            return Err(Error::Limit(if peers() > 1 {
-                INGEST_BUSY_MSG.into()
-            } else {
-                MEM_PRESSURE_MSG.into()
-            }));
+            return Err(Error::Limit(LINEAR_PRESSURE_MSG.into()));
         }
     }
     let now = live_now.saturating_add(incoming);
@@ -1587,7 +1602,7 @@ fn mem_guard_peak(
             format!(
                 "{} needs ~{} MiB to resolve, more than this server allows per object",
                 l.render(),
-                (incoming >> 20).max(1)
+                incoming.div_ceil(1 << 20)
             )
         } else {
             MEM_PRESSURE_MSG.into()
@@ -2130,38 +2145,130 @@ mod tests {
         assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
     }
 
-    /// The linear trip is independent of MEM_SOFT: `linear() + incoming`
-    /// over LINEAR_CAP sheds once (forced — the last relief) then fails
-    /// in-band, whatever the live heap reads. At or under the cap — or
-    /// with no incoming to add — the trip stays inert, so a calm heap on
-    /// a near-wall isolate keeps working until a growth would actually
-    /// cross (linear never shrinks; the 10 MiB margin covers the small
-    /// unguarded allocations the preflights don't name).
+    /// The linear trip is independent of MEM_SOFT and fires only when the
+    /// allocation may need fresh pages that would cross LINEAR_CAP. Then it
+    /// sheds once (forced — the last relief) and still over fails in-band
+    /// with the retry wording, never "smaller slices".
     #[test]
-    fn mem_guard_linear_trip_is_heap_independent() {
-        // over the cap even with a calm heap and nothing incoming: shed
-        // then Limit — the trip never consults the live reading
+    fn mem_guard_linear_trip_needs_fresh_pages_over_the_cap() {
+        const MIB: usize = 1 << 20;
+        // live high enough that the allocation cannot reuse free pages
+        let live = LINEAR_CAP - 8 * MIB;
         let mut c = Cache::default();
         c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
         let mut g = MemGuard::default();
-        let err = mem_guard(&mut c, || MEM_SOFT, || LINEAR_CAP + 1, || 1, &mut g).unwrap_err();
+        let err = mem_guard_peak(&mut c, || live, || LINEAR_CAP, || 1, &mut g, MIB, None, "test:lin").unwrap_err();
         assert!(matches!(err, Error::Limit(_)));
-        assert!(err.message().contains("smaller slices"), "{err}");
+        assert_eq!(err.message(), LINEAR_PRESSURE_MSG);
+        assert!(!err.message().contains("smaller slices"), "{err}");
         assert!(c.get(&Key::Off(1)).is_none(), "the forced shed ran before the Limit");
-        // at the cap exactly with no incoming: no growth crosses — inert
-        let mut c = Cache::default();
+        // peers in flight get the same retry wording: linear is the wall
         let mut g = MemGuard::default();
-        mem_guard(&mut c, || MEM_SOFT, || LINEAR_CAP, || 1, &mut g).unwrap();
-        // under the cap but incoming would cross: shed then Limit
+        let err = mem_guard_peak(&mut Cache::default(), || live, || LINEAR_CAP, || 2, &mut g, MIB, None, "test:lin")
+            .unwrap_err();
+        assert_eq!(err.message(), LINEAR_PRESSURE_MSG);
+        // relief calls (incoming 0) never trip, even far over the cap
         let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
         let mut g = MemGuard::default();
-        let err = mem_guard_peak(&mut c, || MEM_SOFT, || LINEAR_CAP - 4, || 1, &mut g, 8, None, "test:lin").unwrap_err();
-        assert!(matches!(err, Error::Limit(_)));
-        // peers in flight get the busy wording on the linear trip too
+        mem_guard(&mut c, || 10 * MIB, || LINEAR_CAP + 64 * MIB, || 1, &mut g).unwrap();
+        assert!(c.get(&Key::Off(1)).is_some(), "no forced clear when the check passes");
+    }
+
+    /// Claude #3: sticky high linear with a low live heap. Linear sits over
+    /// the cap from an earlier push, but live + incoming + FRAG_MARGIN fits
+    /// inside it — the allocation reuses free pages, so it is admitted and
+    /// the cache is not cleared.
+    #[test]
+    fn mem_guard_sticky_high_linear_with_low_live_admits_reuse() {
+        const MIB: usize = 1 << 20;
         let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
         let mut g = MemGuard::default();
-        let err = mem_guard(&mut c, || MEM_SOFT, || LINEAR_CAP + 1, || 2, &mut g).unwrap_err();
-        assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
+        // 120 MiB linear (over the cap), 20 MiB live, a 16 MiB window fetch
+        mem_guard_peak(&mut c, || 20 * MIB, || 120 * MIB, || 1, &mut g, 16 * MIB, None, "test:lin").unwrap();
+        assert!(c.get(&Key::Off(1)).is_some(), "a reuse fit must not force a clear");
+        // the fit boundary: live + incoming + FRAG_MARGIN == linear still fits
+        let lin = 120 * MIB;
+        let incoming = 16 * MIB;
+        let live = lin - incoming - FRAG_MARGIN;
+        assert!(!linear_trip(live, lin, incoming));
+        assert!(linear_trip(live + 1, lin, incoming), "one byte more needs fresh pages");
+        // the cap boundary: linear + incoming == LINEAR_CAP does not cross
+        assert!(!linear_trip(LINEAR_CAP, LINEAR_CAP - incoming, incoming));
+        assert!(linear_trip(LINEAR_CAP, LINEAR_CAP - incoming + 1, incoming));
+        assert!(!linear_trip(LINEAR_CAP, LINEAR_CAP + 1, 0), "incoming 0 never trips");
+        assert_eq!(FRAG_MARGIN, 16 << 20);
+    }
+
+    /// The forced clear helps now: when the shed drops live far enough
+    /// that the allocation reuses free pages, the re-check passes. The
+    /// re-check's cap boundary is exact too (`>` not `>=`).
+    #[test]
+    fn mem_guard_linear_recheck_after_shed() {
+        const MIB: usize = 1 << 20;
+        let incoming = 8 * MIB;
+        // live reads: before the shed, after the shed (re-check), then
+        // the hard-band reading; linear reads before and after
+        let reads = |v: Vec<usize>| {
+            let q = std::cell::RefCell::new(std::collections::VecDeque::from(v));
+            move || {
+                let mut q = q.borrow_mut();
+                let x = q.pop_front().unwrap();
+                if q.is_empty() {
+                    q.push_back(x);
+                }
+                x
+            }
+        };
+        // shed frees enough: re-check fits inside linear -> Ok
+        let mut g = MemGuard::default();
+        mem_guard_peak(
+            &mut Cache::default(),
+            reads(vec![100 * MIB, 40 * MIB]),
+            || 110 * MIB,
+            || 1,
+            &mut g,
+            incoming,
+            None,
+            "test:lin",
+        )
+        .unwrap();
+        assert_eq!(g.cleared_at, Some(40 * MIB), "the forced shed recorded its post-clear reading");
+        // shed does not free enough, but the re-check's linear reading sits
+        // exactly at the cap with the incoming bytes: not over -> Ok
+        let mut g = MemGuard::default();
+        mem_guard_peak(
+            &mut Cache::default(),
+            reads(vec![100 * MIB, 100 * MIB, 40 * MIB]),
+            reads(vec![LINEAR_CAP, LINEAR_CAP - incoming]),
+            || 1,
+            &mut g,
+            incoming,
+            None,
+            "test:lin",
+        )
+        .unwrap();
+        // one byte over at the re-check -> Limit
+        let mut g = MemGuard::default();
+        let err = mem_guard_peak(
+            &mut Cache::default(),
+            reads(vec![100 * MIB, 100 * MIB]),
+            reads(vec![LINEAR_CAP, LINEAR_CAP - incoming + 1]),
+            || 1,
+            &mut g,
+            incoming,
+            None,
+            "test:lin",
+        )
+        .unwrap_err();
+        assert_eq!(err.message(), LINEAR_PRESSURE_MSG);
+        // and the first check's cap boundary: exactly at the cap never sheds
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        let mut g = MemGuard::default();
+        mem_guard_peak(&mut c, || 60 * MIB, || LINEAR_CAP - incoming, || 1, &mut g, incoming, None, "test:lin").unwrap();
+        assert!(c.get(&Key::Off(1)).is_some(), "at the cap exactly: no trip, no forced clear");
     }
 
     /// Between MEM_SOFT and MEM_HARD the cache sheds once per MEM_HYSTERESIS
@@ -2232,20 +2339,17 @@ mod tests {
         assert_eq!(g.cleared_at, Some(84 << 20));
     }
 
-    /// The linear trip sheds BEFORE it judges, hysteresis aside: over
-    /// LINEAR_CAP the forced clear runs even inside the hysteresis band —
-    /// it is the last relief before the in-band Limit, never skipped for
-    /// a fail verdict. Linear never shrinks, so the still-over re-check
-    /// always fails after the shed; what the shed buys is the drained
-    /// heap the request's unwind path runs on.
+    /// The linear trip sheds BEFORE it judges, hysteresis aside: when it
+    /// fires, the forced clear runs even inside the hysteresis band — it is
+    /// the last relief before the in-band Limit, never skipped for a fail
+    /// verdict.
     #[test]
     fn mem_guard_linear_trip_sheds_before_judging() {
         let mut c = Cache::default();
         c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
         let mut g = MemGuard::default();
         g.cleared_at = Some(82 << 20); // sub-hysteresis regrowth — hysteresis alone would skip
-        let lin = std::cell::Cell::new(LINEAR_CAP + 1);
-        let err = mem_guard(&mut c, || 85 << 20, || lin.get(), || 1, &mut g).unwrap_err();
+        let err = mem_guard_peak(&mut c, || 85 << 20, || LINEAR_CAP, || 1, &mut g, 12 << 20, None, "test:lin").unwrap_err();
         assert!(matches!(err, Error::Limit(_)));
         assert!(c.get(&Key::Off(1)).is_none(), "the forced shed ran before the Limit");
         // the shed recorded the post-clear reading as the hysteresis base
@@ -2329,6 +2433,65 @@ mod tests {
         assert_eq!(delta_varint(&[0x80, 0x80, 0x01]), Some((16_384, 3)));
         assert_eq!(delta_varint(&[]), None);
         assert_eq!(delta_varint(&[0x80]), None, "truncated varint");
+    }
+
+    /// delta_varint's u64 edge, exactly: nine continuation bytes put the
+    /// 10th group at shift 63, where only bit 0 fits. A 10th group of 1
+    /// parses to 1 << 63; a 10th group of 2 would drop its bit and is
+    /// refused; an 11th group (shift 70) is always refused.
+    #[test]
+    fn delta_varint_u64_boundary() {
+        let mut nine = vec![0x80u8; 9];
+        nine.push(0x01);
+        assert_eq!(delta_varint(&nine), Some((1u64 << 63, 10)));
+        let mut max = vec![0xffu8; 9];
+        max.push(0x01);
+        assert_eq!(delta_varint(&max), Some((u64::MAX, 10)));
+        let mut over = vec![0x80u8; 9];
+        over.push(0x02);
+        assert_eq!(delta_varint(&over), None, "bit 64 would be dropped");
+        let mut eleven = vec![0x80u8; 10];
+        eleven.push(0x00);
+        assert_eq!(delta_varint(&eleven), None, "shift 70 is past u64");
+        // the 9th group (shift 56) still takes all seven bits
+        let mut eight = vec![0x80u8; 8];
+        eight.push(0x7f);
+        assert_eq!(delta_varint(&eight), Some((0x7f << 56, 9)));
+    }
+
+    /// The per-object wording boundary is strict: a bound of exactly
+    /// PER_OBJECT_DECODE gets the whole-push wording; one byte more names
+    /// the object, and its size rounds UP to whole MiB (56 MiB + 1 byte
+    /// reads ~57 MiB).
+    #[test]
+    fn mem_guard_per_object_boundary_and_mib_rounding() {
+        let oid = ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap();
+        let live = MEM_HARD - PER_OBJECT_DECODE + 1; // every incoming here crosses MEM_HARD
+        let mut g = MemGuard::default();
+        let err = mem_guard_peak(&mut Cache::default(), || live, || 0, || 1, &mut g, PER_OBJECT_DECODE, Some(ObjLabel::Sha(oid)), "test:decode")
+            .unwrap_err();
+        assert_eq!(err.message(), MEM_PRESSURE_MSG, "at the bound exactly: whole-push wording");
+        let mut g = MemGuard::default();
+        let err = mem_guard_peak(&mut Cache::default(), || live, || 0, || 1, &mut g, PER_OBJECT_DECODE + 1, Some(ObjLabel::Sha(oid)), "test:decode")
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "object 0123456789ab needs ~57 MiB to resolve, more than this server allows per object"
+        );
+        assert_eq!(PER_OBJECT_DECODE, 56 << 20);
+    }
+
+    /// The hysteresis baseline follows the heap down to the lowest reading
+    /// and never rises without a shed — equal readings leave it unchanged.
+    #[test]
+    fn mem_guard_baseline_tracks_the_trough() {
+        let mut g = MemGuard { cleared_at: Some(70 << 20), lease: None };
+        mem_guard(&mut Cache::default(), || 60 << 20, || 0, || 1, &mut g).unwrap();
+        assert_eq!(g.cleared_at, Some(60 << 20), "follows the heap down");
+        mem_guard(&mut Cache::default(), || 60 << 20, || 0, || 1, &mut g).unwrap();
+        assert_eq!(g.cleared_at, Some(60 << 20));
+        mem_guard(&mut Cache::default(), || 65 << 20, || 0, || 1, &mut g).unwrap();
+        assert_eq!(g.cleared_at, Some(60 << 20), "never rises without a shed");
     }
 
     /// decode_mini_bound counts the mini-pack copy (raw body + re-deflated

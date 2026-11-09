@@ -202,6 +202,19 @@ mod tests {
         assert_eq!(t.peak(), 256, "peak keeps the high-water mark");
     }
 
+    /// Native builds have no wasm linear memory: with no test override the
+    /// reading is exactly 0, so the linear trip stays inert natively.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_linear_bytes_is_zero_without_override() {
+        set_linear_override(None);
+        assert_eq!(linear_bytes(), 0);
+        set_linear_override(Some(std::rc::Rc::new(|| 7)));
+        assert_eq!(linear_bytes(), 7);
+        set_linear_override(None);
+        assert_eq!(linear_bytes(), 0);
+    }
+
     #[test]
     fn global_counters_are_sane() {
         // the test binary itself allocates through the counting allocator;
