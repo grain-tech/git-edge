@@ -3583,93 +3583,182 @@ mod tests {
         ]);
     }
 
-    /// Fail-hook sweep over the real resolve loop: a pack mixing a plain
-    /// blob, an ofs-delta chain and a ref-delta to an external base, run
-    /// with the fail hook at each threshold. EVERY refusal must be the
-    /// in-band memory Limit — never Internal, never a panic — and at
-    /// least the smallest thresholds must actually refuse (the hook
-    /// engages). A site swapped back to an infallible push/with_capacity
-    /// allocates outside the hook and shows up as an Ok (or a later,
-    /// different failure) at its threshold.
-    #[test]
-    fn resolve_fail_hook_sweep_is_always_the_in_band_limit() {
+    /// The line of the try_grow call that ends `snippet`, found in this
+    /// file's production code. The snippet must occur there exactly once,
+    /// so a test names a guarded site by its code, not by a line number.
+    fn guarded_site(snippet: &str) -> (&'static str, u32) {
+        let src = include_str!("ingest.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests module")];
+        let hits: Vec<usize> = prod.match_indices(snippet).map(|(i, _)| i).collect();
+        assert_eq!(hits.len(), 1, "snippet must name one site: {snippet:?}");
+        let end = hits[0] + snippet.len();
+        (file!(), u32::try_from(prod[..end].matches('\n').count() + 1).unwrap())
+    }
+
+    /// The sweep's fixture: a forward ref-delta that waits on a later
+    /// base, that base, an ofs-delta over it, a ref-delta to an external
+    /// base, then FILLER plain blobs so the entry-sized reservations grow
+    /// past the small ones.
+    fn sweep_fixture() -> (MemReads, &'static str, Vec<EntryRec>, HashMap<ObjectId, ObjLoc>) {
+        const FILLER: usize = 300;
         let base = b"sweep base payload".as_slice();
         let base_id = gix_object::compute_hash(H::Sha1, Kind::Blob, base).unwrap();
-        let d = base.len();
-        // entry 0: the plain base; entry 1: ofs-delta over it; entry 2:
-        // ref-delta to an external base — exercises chain walk + prefetch
-        let (pack, recs) = {
-            let mut p = b"PACK\0\0\0\x02\0\0\0\x00".to_vec();
-            let mut rs = Vec::new();
+        let ext = b"sweep external base".as_slice();
+        let ext_id = gix_object::compute_hash(H::Sha1, Kind::Blob, ext).unwrap();
+        let fillers: Vec<Vec<u8>> = (0..FILLER).map(|i| format!("filler blob {i}").repeat(40).into_bytes()).collect();
+        let mut p = b"PACK\0\0\0\x02\0\0\0\x00".to_vec();
+        let mut rs = Vec::new();
+        let mut push = |p: &mut Vec<u8>, raw: &[u8], hdr: Option<Header>| {
             let off = p.len() as u64;
-            let mut enc = Vec::new();
-            codec::encode_entry(Kind::Blob, base, &mut enc).unwrap();
-            let e = PackEntry::from_bytes(&enc, 0, H::Sha1).unwrap();
+            let e = PackEntry::from_bytes(raw, 0, H::Sha1).unwrap();
             let hlen = e.header_size();
-            rs.push(EntryRec { offset: off, header_len: u8::try_from(hlen).unwrap(), kind_or_delta: e.header, compressed_len: u32::try_from(enc.len() - hlen).unwrap(), size: e.decompressed_size });
-            p.extend_from_slice(&enc);
-            let off1 = p.len() as u64;
-            let dist = off1 - off;
-            let raw_ofs = mk_delta_raw(Header::OfsDelta { base_distance: dist }, d as u64, d as u64, &insert_ops(base));
-            let e = PackEntry::from_bytes(&raw_ofs, 0, H::Sha1).unwrap();
-            let hlen = e.header_size();
-            rs.push(EntryRec { offset: off1, header_len: u8::try_from(hlen).unwrap(), kind_or_delta: Header::OfsDelta { base_distance: dist }, compressed_len: u32::try_from(raw_ofs.len() - hlen).unwrap(), size: e.decompressed_size });
-            p.extend_from_slice(&raw_ofs);
-            let off2 = p.len() as u64;
-            let raw_ref = mk_delta_raw(Header::RefDelta { base_id }, d as u64, d as u64, &insert_ops(base));
-            let e = PackEntry::from_bytes(&raw_ref, 0, H::Sha1).unwrap();
-            let hlen = e.header_size();
-            rs.push(EntryRec { offset: off2, header_len: u8::try_from(hlen).unwrap(), kind_or_delta: Header::RefDelta { base_id }, compressed_len: u32::try_from(raw_ref.len() - hlen).unwrap(), size: e.decompressed_size });
-            p.extend_from_slice(&raw_ref);
-            p[8..12].copy_from_slice(&3u32.to_be_bytes());
-            p.extend_from_slice(&[0u8; 20]);
-            (p, rs)
+            rs.push(EntryRec {
+                offset: off,
+                header_len: u8::try_from(hlen).unwrap(),
+                kind_or_delta: hdr.unwrap_or(e.header),
+                compressed_len: u32::try_from(raw.len() - hlen).unwrap(),
+                size: e.decompressed_size,
+            });
+            p.extend_from_slice(raw);
+            off
         };
-        let mut ext: HashMap<ObjectId, ObjLoc> = HashMap::new();
-        ext.insert(base_id, ObjLoc {
+        let (d, x) = (base.len() as u64, ext.len() as u64);
+        let fwd = mk_delta_raw(Header::RefDelta { base_id }, d, d, &insert_ops(base));
+        push(&mut p, &fwd, Some(Header::RefDelta { base_id }));
+        let mut enc = Vec::new();
+        codec::encode_entry(Kind::Blob, base, &mut enc).unwrap();
+        let off_base = push(&mut p, &enc, None);
+        let dist = p.len() as u64 - off_base;
+        let ofs = mk_delta_raw(Header::OfsDelta { base_distance: dist }, d, d, &insert_ops(base));
+        push(&mut p, &ofs, Some(Header::OfsDelta { base_distance: dist }));
+        let rf = mk_delta_raw(Header::RefDelta { base_id: ext_id }, x, x, &insert_ops(ext));
+        push(&mut p, &rf, Some(Header::RefDelta { base_id: ext_id }));
+        for f in &fillers {
+            let mut enc = Vec::new();
+            codec::encode_entry(Kind::Blob, f, &mut enc).unwrap();
+            push(&mut p, &enc, None);
+        }
+        p[8..12].copy_from_slice(&u32::try_from(rs.len()).unwrap().to_be_bytes());
+        p.extend_from_slice(&[0u8; 20]);
+        let mut ext_enc = Vec::new();
+        codec::encode_entry(Kind::Blob, ext, &mut ext_enc).unwrap();
+        let mut locs: HashMap<ObjectId, ObjLoc> = HashMap::new();
+        locs.insert(ext_id, ObjLoc {
             pack: crate::store::PackId("extpack".into()),
             idx: 0,
             offset: 0,
-            len: 64,
+            len: u32::try_from(ext_enc.len()).unwrap(),
             kind: Kind::Blob,
-            size: base.len() as u64,
+            size: x,
         });
-        let mut base_enc = Vec::new();
-        codec::encode_entry(Kind::Blob, base, &mut base_enc).unwrap();
         let key = "pending/sweep.pack";
         let repo = crate::store::RepoId("o/r".into());
         let mut mem = MemReads::new(repo.clone());
-        mem.put(key, pack);
-        mem.put(&crate::store::keys::pack(&repo, &crate::store::PackId("extpack".into())), base_enc);
-        let mut refused = 0usize;
-        for t in [
-            1usize << 10,
-            64 << 10,
-            256 << 10,
-            1 << 20,
-            4 << 20,
-            8 << 20,
-            16 << 20,
-            32 << 20,
-            64 << 20,
-        ] {
+        mem.put(key, p);
+        mem.put(&crate::store::keys::pack(&repo, &crate::store::PackId("extpack".into())), ext_enc);
+        (mem, key, rs, locs)
+    }
+
+    /// Run the sweep fixture once, logging every gated reservation.
+    fn sweep_run(
+        mem: &MemReads,
+        key: &str,
+        recs: &[EntryRec],
+        ext: &HashMap<ObjectId, ObjLoc>,
+    ) -> (Result<Vec<ObjRow>, Error>, Vec<crate::try_grow::Ask>) {
+        let mut out = MemPackOut { buf: Vec::new() };
+        let mut sink = MemSink::default();
+        crate::try_grow::log_asks();
+        let res = block_on(drive(mem, key, recs, Externals::Map(ext), &mut out, &mut sink));
+        (res, crate::try_grow::take_asks())
+    }
+
+    /// Fail-hook sweep over the real resolve loop. A clean run logs every
+    /// gated reservation by call site. Each guarded resolve site must be
+    /// in that log, and a refusal aimed at that one site alone must be
+    /// the in-band memory Limit. A site reverted to an infallible push or
+    /// `Vec::with_capacity` leaves the log and never refuses, so the test
+    /// fails. A plain size sweep then must refuse below the largest
+    /// guarded reservation and succeed at or above every reservation.
+    #[test]
+    fn resolve_fail_hook_sweep_is_always_the_in_band_limit() {
+        let (mem, key, recs, ext) = sweep_fixture();
+        let (res, asks) = sweep_run(&mem, key, &recs, &ext);
+        let rows = res.expect("the clean run must resolve");
+        assert_eq!(rows.len(), recs.len(), "every entry emitted");
+        let guarded = [
+            ("window", guarded_site("entry outside window\".into()))?;\n        crate::try_grow::copy(bytes)")),
+            ("cache-map", guarded_site("crate::try_grow::map(&mut self.map, 1)?;")),
+            ("cache-order", guarded_site("crate::try_grow::deque(&mut self.order, 1)?;")),
+            ("mini-pack", guarded_site("let mut mini = crate::try_grow::with_capacity(terms.mini)?;")),
+            ("mini-out", guarded_site("let mut out = crate::try_grow::with_capacity(terms.out)?;")),
+            ("by_id", guarded_site("crate::try_grow::map(&mut ids, entries.len())?;")),
+            ("order", guarded_site("let mut order: Vec<usize> = crate::try_grow::with_capacity(entries.len())?;")),
+            ("order-wake", guarded_site("crate::try_grow::vec(&mut order, ws.len())?;")),
+            ("pending", guarded_site("crate::try_grow::map(&mut pending, 1)?;")),
+            ("waiters", guarded_site("crate::try_grow::vec(waiters, 1)?;")),
+            ("rows", guarded_site("out.flush_if_full(budget).await?;\n    crate::try_grow::vec(rows, 1)?;")),
+        ];
+        let biggest = |site: (&str, u32)| {
+            asks.iter().filter(|a| (a.file, a.line) == site).map(|a| a.bytes).max()
+        };
+        let mut guarded_max = 0usize;
+        for (name, site) in guarded {
+            let Some(max) = biggest(site) else {
+                panic!("{name} ({}:{}) never reserved through try_grow", site.0, site.1);
+            };
+            assert!(max > 0, "{name}: a zero-byte ask cannot be refused");
+            guarded_max = guarded_max.max(max);
+            // refuse this site alone, just below its largest ask
+            crate::try_grow::fail_only_at(Some(site));
+            crate::try_grow::fail_above(Some(max - 1));
+            let (res, seen) = sweep_run(&mem, key, &recs, &ext);
+            crate::try_grow::fail_above(None);
+            crate::try_grow::fail_only_at(None);
+            match res {
+                Err(e) => assert!(crate::try_grow::is_retry(&e), "{name}: refusal must be the in-band Limit, got {e}"),
+                Ok(_) => panic!("{name}: a refused reservation must fail the resolve, got Ok"),
+            }
+            let refused: Vec<_> = seen.iter().filter(|a| a.refused).collect();
+            assert_eq!(refused.len(), 1, "{name}: one refusal ends the run: {refused:?}");
+            assert_eq!((refused[0].file, refused[0].line), site, "{name}: the refusal must be at its site");
+        }
+        // the plain size sweep: below the largest guarded ask the run must
+        // refuse in-band; at or above every ask it must succeed
+        let all_max = asks.iter().map(|a| a.bytes).max().unwrap();
+        for t in [16usize, 256, 1 << 10, 4 << 10, 16 << 10, 64 << 10, 1 << 20, 8 << 20, 16 << 20] {
             crate::try_grow::fail_above(Some(t));
-            let mut out = MemPackOut { buf: Vec::new() };
-            let mut sink = MemSink::default();
-            let res = block_on(drive(&mem, key, &recs, Externals::Map(&ext), &mut out, &mut sink));
+            let (res, _) = sweep_run(&mem, key, &recs, &ext);
             crate::try_grow::fail_above(None);
             match res {
-                Err(e) => {
-                    refused += 1;
-                    assert!(
-                        crate::try_grow::is_retry(&e),
-                        "threshold {t}: refusal must be the in-band Limit, got {e}"
-                    );
-                }
-                Ok(_) => {}
+                Err(e) => assert!(crate::try_grow::is_retry(&e), "threshold {t}: refusal must be the in-band Limit, got {e}"),
+                Ok(_) => assert!(t >= guarded_max, "threshold {t} < guarded ask {guarded_max} must refuse"),
+            }
+            if t >= all_max {
+                assert!(sweep_run(&mem, key, &recs, &ext).0.is_ok(), "threshold {t} covers every ask");
             }
         }
-        assert!(refused > 0, "the sweep must exercise refusals");
+        // Source::Parts (the DO import's multi-part window) reserves the
+        // whole span once, fallibly, before any part is read
+        let parts = [("parts/a".to_string(), 4u64), ("parts/b".to_string(), 6u64)];
+        let mut pm = MemReads::new(crate::store::RepoId("o/r".into()));
+        pm.put("parts/a", b"0123".to_vec());
+        pm.put("parts/b", b"456789".to_vec());
+        let src = Source::Parts(&parts);
+        let mut budget = test_budget();
+        let whole = block_on(src.read(&Reader::Mem(&pm), 2, 7, &mut budget)).unwrap();
+        assert_eq!(whole, b"2345678");
+        let site = guarded_site("let mut out = crate::try_grow::with_capacity(usize::try_from(n).unwrap_or(0))?;");
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(6));
+        crate::try_grow::log_asks();
+        let res = block_on(src.read(&Reader::Mem(&pm), 2, 7, &mut budget));
+        let seen = crate::try_grow::take_asks();
+        crate::try_grow::fail_above(None);
+        crate::try_grow::fail_only_at(None);
+        assert!(crate::try_grow::is_retry(&res.unwrap_err()), "Parts: refusal must be the in-band Limit");
+        assert_eq!(seen.len(), 1, "Parts: the span is refused before any part is read: {seen:?}");
+        assert!(seen[0].refused && (seen[0].file, seen[0].line) == site);
     }
 
     /// A forward ref-delta (base is a LATER pack entry) exercises the

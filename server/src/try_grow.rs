@@ -39,6 +39,11 @@ thread_local! {
     /// Test hook: reservations whose new block exceeds this many bytes
     /// fail the way a failed `memory.grow` does. None is the real path.
     static FAIL_ABOVE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test hook: when set, only reservations from this call site
+    /// (file, line) can fail. None lets every site fail.
+    static FAIL_SITE: std::cell::Cell<Option<(&'static str, u32)>> = const { std::cell::Cell::new(None) };
+    /// Test log: every gated reservation on this thread while logging is on.
+    static ASKS: std::cell::RefCell<Option<Vec<Ask>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Test hook: make every reservation whose new block is larger than `n`
@@ -48,11 +53,54 @@ pub(crate) fn fail_above(n: Option<usize>) {
     FAIL_ABOVE.with(|f| f.set(n));
 }
 
-/// The test hook's gate for a new block of `bytes`. A no-op outside tests.
+/// Test hook: limit `fail_above` to the reservations from one call site.
+/// `None` lets every site fail again.
+#[cfg(test)]
+pub(crate) fn fail_only_at(site: Option<(&'static str, u32)>) {
+    FAIL_SITE.with(|f| f.set(site));
+}
+
+/// One gated reservation, as the test log records it: the caller's
+/// file and line, the new block's size, and whether the hook refused it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ask {
+    pub file: &'static str,
+    pub line: u32,
+    pub bytes: usize,
+    pub refused: bool,
+}
+
+/// Test log: start recording every gated reservation on this thread.
+#[cfg(test)]
+pub(crate) fn log_asks() {
+    ASKS.with(|a| *a.borrow_mut() = Some(Vec::new()));
+}
+
+/// Test log: stop recording and return what was recorded.
+#[cfg(test)]
+pub(crate) fn take_asks() -> Vec<Ask> {
+    ASKS.with(|a| a.borrow_mut().take()).unwrap_or_default()
+}
+
+/// The test hook's gate for a new block of `bytes`. A no-op outside
+/// tests. In tests, `track_caller` names the helper's caller, so the
+/// log and the site filter see the real call site.
+#[cfg_attr(test, track_caller)]
 fn gate(bytes: usize) -> Result<(), Error> {
     #[cfg(test)]
-    if FAIL_ABOVE.with(|f| f.get()).is_some_and(|n| bytes > n) {
-        return Err(failed());
+    {
+        let at = std::panic::Location::caller();
+        let site_ok = FAIL_SITE.with(|f| f.get()).is_none_or(|(file, line)| at.file() == file && at.line() == line);
+        let refused = site_ok && FAIL_ABOVE.with(|f| f.get()).is_some_and(|n| bytes > n);
+        ASKS.with(|a| {
+            if let Some(log) = a.borrow_mut().as_mut() {
+                log.push(Ask { file: at.file(), line: at.line(), bytes, refused });
+            }
+        });
+        if refused {
+            return Err(failed());
+        }
     }
     let _ = bytes;
     Ok(())
@@ -60,6 +108,7 @@ fn gate(bytes: usize) -> Result<(), Error> {
 
 /// Reserve room for `additional` more elements with Vec's amortized
 /// growth, fallibly. Nothing allocates when they already fit.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn vec<T>(v: &mut Vec<T>, additional: usize) -> Result<(), Error> {
     let need = v.len().saturating_add(additional);
     if need <= v.capacity() {
@@ -71,6 +120,7 @@ pub(crate) fn vec<T>(v: &mut Vec<T>, additional: usize) -> Result<(), Error> {
 }
 
 /// Reserve room for exactly `additional` more elements, fallibly.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn vec_exact<T>(v: &mut Vec<T>, additional: usize) -> Result<(), Error> {
     let need = v.len().saturating_add(additional);
     if need <= v.capacity() {
@@ -81,6 +131,7 @@ pub(crate) fn vec_exact<T>(v: &mut Vec<T>, additional: usize) -> Result<(), Erro
 }
 
 /// An empty Vec with room for exactly `n` elements, fallibly.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn with_capacity<T>(n: usize) -> Result<Vec<T>, Error> {
     let mut v = Vec::new();
     vec_exact(&mut v, n)?;
@@ -89,6 +140,7 @@ pub(crate) fn with_capacity<T>(n: usize) -> Result<Vec<T>, Error> {
 
 /// A tight copy of `src`: `try_reserve_exact`, then `extend_from_slice`
 /// inside the reserved capacity.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn copy(src: &[u8]) -> Result<Vec<u8>, Error> {
     let mut v = with_capacity(src.len())?;
     v.extend_from_slice(src);
@@ -96,6 +148,7 @@ pub(crate) fn copy(src: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 /// `n` zero bytes, fallibly — an inflate target or a scratch buffer.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn zeroed(n: usize) -> Result<Vec<u8>, Error> {
     let mut v = with_capacity(n)?;
     v.resize(n, 0);
@@ -103,6 +156,7 @@ pub(crate) fn zeroed(n: usize) -> Result<Vec<u8>, Error> {
 }
 
 /// A copy of `src` in one exact, fallible block.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn string(src: &str) -> Result<String, Error> {
     let mut s = String::new();
     if !src.is_empty() {
@@ -115,6 +169,7 @@ pub(crate) fn string(src: &str) -> Result<String, Error> {
 
 /// Reserve room for `additional` more entries in a HashMap, fallibly.
 /// The gate prices the new table's slots at one `(K, V)` each.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn map<K: Eq + Hash, V, S: BuildHasher>(
     m: &mut HashMap<K, V, S>,
     additional: usize,
@@ -129,6 +184,7 @@ pub(crate) fn map<K: Eq + Hash, V, S: BuildHasher>(
 }
 
 /// Reserve room for `additional` more elements in a VecDeque, fallibly.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn deque<T>(q: &mut VecDeque<T>, additional: usize) -> Result<(), Error> {
     let need = q.len().saturating_add(additional);
     if need <= q.capacity() {
