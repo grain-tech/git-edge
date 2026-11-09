@@ -56,6 +56,25 @@ impl ReqBudget {
         self.sink = Some(Rc::clone(spend));
         self
     }
+    /// Wall-clock milliseconds left in this budget's window — the pass-B
+    /// admission wait caps itself at this minus a reserve, so a queued push
+    /// can't spend the time pass B itself needs (CONTRACTS.md 7.1).
+    pub fn ms_left(&self) -> f64 {
+        (self.started_ms + self.max_ms - js_sys::Date::now()).max(0.0)
+    }
+    /// A small fresh budget for must-run cleanup — the push abort. The
+    /// request's own budget is often WHY cleanup runs (it timed out or hit
+    /// a cap), so the abort gets its own clock and cap while still
+    /// reporting into the request's spend tally.
+    pub fn cleanup(spend: &Spend) -> Self {
+        Self {
+            max_subrequests: 8,
+            used: 0,
+            started_ms: js_sys::Date::now(),
+            max_ms: 10_000.0,
+            sink: Some(Rc::clone(spend)),
+        }
+    }
     /// Subrequests already spent elsewhere in the request (e.g. the DO's R2
     /// spend read from its own x-ge-subrequests header): counted in the
     /// response header but not against this budget's limit — a DO error must

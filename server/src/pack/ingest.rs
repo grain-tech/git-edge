@@ -17,7 +17,7 @@ use crate::error::Error;
 use crate::store::{codec, keys, Bucket, ObjLoc, ObjRow, PackWriter, PushId, RawWriter};
 use crate::ReqBudget;
 
-use super::run::{ingest_in_flight, IndexSink, INGEST_BUSY_MSG};
+use super::run::{receive_packs, IndexSink, INGEST_BUSY_MSG};
 
 
 #[derive(Clone, Copy)]
@@ -60,6 +60,11 @@ const EDGE_CACHE: usize = 24 << 20;
 /// with an in-band Limit the client can act on (smaller slices).
 const MEM_SOFT: usize = 80 << 20;
 const MEM_HARD: usize = 96 << 20;
+/// Live heap must grow this far past the last shed before the cache clears
+/// again — hysteresis so a heap parked between MEM_SOFT and MEM_HARD doesn't
+/// shed at every entry boundary (each shed makes delta chains re-resolve
+/// through window re-reads, one R2 subrequest apiece).
+const MEM_HYSTERESIS: usize = 8 << 20;
 const MAX_DEPTH: usize = 64; // git's default delta depth is 50
 const MAX_CHAIN_BYTES: u64 = 64 << 20; // chain holds raw compressed delta bodies
 /// Rows per push_links INSERT; it keeps one statement at <= 90 bound params,
@@ -826,25 +831,44 @@ pub async fn resolve_at(
     Ok(Base::Ready((kind, data)))
 }
 
+/// The guard's memory across entry boundaries: `cleared_at` is the
+/// live_bytes() reading that triggered the last shed. The first crossing
+/// always sheds; later sheds inside the soft band need MEM_HYSTERESIS of
+/// growth. Above MEM_HARD the shed always runs — it is the last relief
+/// before the Limit, not hysteresis fodder.
+#[derive(Default)]
+struct MemGuard {
+    cleared_at: Option<usize>,
+}
+
 /// Pass-B memory guard, run at each entry boundary of the edge resolve loop.
-/// `live` reads the counting allocator's live bytes and `in_flight` the
-/// isolate's pass-B admission count (this push's own slot included). Clearing
-/// the cache is the soft relief (resolved objects re-resolve lazily), and only
-/// a reading still above MEM_HARD after the clear earns the client an in-band
-/// Limit. The message is honest about cause: a peer ingest in flight means
-/// the isolate was busy — retry — while an alone push really is too big for
-/// one request and smaller slices will do.
+/// `live` reads the counting allocator's live bytes and `peers` the
+/// isolate's in-progress receive-pack count (pass A included — this push's
+/// own request counts as 1). Clearing the cache is the soft relief
+/// (resolved objects re-resolve lazily), and only a reading still above
+/// MEM_HARD after the clear earns the client an in-band Limit. The message
+/// is honest about cause: another receive-pack in flight means the isolate
+/// was busy — retry — while an alone push really is too big for one
+/// request and smaller slices will do.
 fn mem_guard(
     cache: &mut Cache,
     live: impl Fn() -> usize,
-    in_flight: impl Fn() -> usize,
+    peers: impl Fn() -> usize,
+    state: &mut MemGuard,
 ) -> Result<(), Error> {
-    if live() <= MEM_SOFT {
+    let now = live();
+    if now <= MEM_SOFT {
         return Ok(());
     }
-    cache.clear();
+    let grew = state
+        .cleared_at
+        .is_some_and(|at| now.saturating_sub(at) >= MEM_HYSTERESIS);
+    if now > MEM_HARD || state.cleared_at.is_none() || grew {
+        cache.clear();
+        state.cleared_at = Some(now);
+    }
     if live() > MEM_HARD {
-        return Err(Error::Limit(if in_flight() > 1 {
+        return Err(Error::Limit(if peers() > 1 {
             INGEST_BUSY_MSG.into()
         } else {
             "push needs more memory than one request allows; push it in smaller slices".into()
@@ -911,6 +935,7 @@ pub async fn resolve_and_normalize(
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
     let toc = Toc::Mem(entries);
     let mut rows = Vec::new();
+    let mut mem = MemGuard::default();
     // A REF_DELTA may name a base that appears LATER in the same pack — including
     // mid-chain inside another delta. `one_entry` returns `Await(base)` for those;
     // resolving an entry wakes exactly its waiters (index-pack parity, O(n) not O(n^2)).
@@ -918,7 +943,7 @@ pub async fn resolve_and_normalize(
     let mut order: Vec<usize> = (0..entries.len()).collect();
     let mut i = 0;
     while i < order.len() {
-        mem_guard(&mut cx.cache, crate::mem::live_bytes, ingest_in_flight)?;
+        mem_guard(&mut cx.cache, crate::mem::live_bytes, receive_packs, &mut mem)?;
         let at = order[i];
         i += 1;
         match one_entry(&mut cx, &toc, at, need_ids, out, &mut sink, &mut rows, budget, 0).await? {
@@ -1204,27 +1229,70 @@ mod tests {
         // under the soft ceiling: untouched
         let mut c = Cache::default();
         c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
-        mem_guard(&mut c, || MEM_SOFT, || 1).unwrap();
+        let mut g = MemGuard::default();
+        mem_guard(&mut c, || MEM_SOFT, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_some());
-        // past soft but under hard after the clear: cache shed, push continues
-        mem_guard(&mut c, || MEM_SOFT + 1, || 1).unwrap();
+        // first crossing past soft but under hard: cache shed, push continues
+        mem_guard(&mut c, || MEM_SOFT + 1, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_none());
-        // still above hard after the clear: typed Limit, actionable message
+        // still above hard: typed Limit, actionable message
         let mut c = Cache::default();
-        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1).unwrap_err();
+        let mut g = MemGuard::default();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1, &mut g).unwrap_err();
         assert!(matches!(err, Error::Limit(_)));
         assert!(err.message().contains("smaller slices"), "{err}");
     }
 
     /// The MEM_HARD message names the real cause: alone -> smaller slices;
-    /// a peer ingest in flight -> the isolate was busy, retry instead.
+    /// another receive-pack in flight (pass A included) -> the isolate was
+    /// busy, retry instead. `peers` counts this push's own request as 1.
     #[test]
     fn mem_guard_message_names_busy_when_peers_run() {
         let mut c = Cache::default();
-        // in_flight counts this push's own slot: 1 = alone, 2 = a peer too
-        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1).unwrap_err();
+        let mut g = MemGuard::default();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1, &mut g).unwrap_err();
         assert!(err.message().contains("smaller slices"), "{err}");
-        let err = mem_guard(&mut c, || MEM_HARD + 1, || 2).unwrap_err();
+        let mut g = MemGuard::default();
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 2, &mut g).unwrap_err();
         assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
+    }
+
+    /// Between MEM_SOFT and MEM_HARD the cache sheds once per MEM_HYSTERESIS
+    /// of live-heap growth, not at every entry — a heap parked in the band
+    /// keeps its cache (and its subrequest count) instead of re-resolving
+    /// every delta chain through window re-reads.
+    #[test]
+    fn mem_guard_hysteresis_sheds_once_per_growth() {
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        let mut g = MemGuard::default();
+        // first crossing sheds and records the reading
+        mem_guard(&mut c, || MEM_SOFT + 1, || 1, &mut g).unwrap();
+        assert!(c.get(&Key::Off(1)).is_none());
+        assert_eq!(g.cleared_at, Some(MEM_SOFT + 1));
+        // the cache refills; heap grew < MEM_HYSTERESIS since the shed and
+        // stays under MEM_HARD: no shed — the whole point of the hysteresis
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        let live = MEM_SOFT + 1 + MEM_HYSTERESIS - 1;
+        mem_guard(&mut c, || live, || 1, &mut g).unwrap();
+        assert!(c.get(&Key::Off(2)).is_some(), "sub-hysteresis growth keeps the cache");
+        // heap grew >= MEM_HYSTERESIS since the last shed: shed again
+        let live = MEM_SOFT + 1 + MEM_HYSTERESIS;
+        mem_guard(&mut c, || live, || 1, &mut g).unwrap();
+        assert!(c.get(&Key::Off(2)).is_none(), "full hysteresis growth sheds again");
+        assert_eq!(g.cleared_at, Some(live));
+    }
+
+    /// Above MEM_HARD the shed is not hysteretic — it is the last relief
+    /// before the Limit, so it runs even right after a recent shed.
+    #[test]
+    fn mem_guard_hard_band_always_sheds() {
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        let mut g = MemGuard::default();
+        g.cleared_at = Some(MEM_HARD); // a shed just happened — still sheds
+        let err = mem_guard(&mut c, || MEM_HARD + 1, || 1, &mut g).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(c.get(&Key::Off(1)).is_none(), "hard-band shed ignores hysteresis");
     }
 }

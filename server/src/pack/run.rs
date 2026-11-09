@@ -1,8 +1,8 @@
 //! Phase one of the two-phase push (CONTRACTS.md 2.4-2.5, 3 ordering), in the edge Worker.
 //! Ported from research/proofs/two-phase-push.md.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap};
 
 use gix_hash::ObjectId;
 use gix_pack::data::entry::Header;
@@ -105,6 +105,13 @@ pub async fn run(
     }
     let pack = PackId::random()?;
     let mut sink = IndexSink { stub, repo, pack: pack.clone(), push: push.clone(), links: Vec::new(), tags: HashMap::new() };
+    // Pass B is the isolate's memory-heavy phase: admit at most
+    // GE_EDGE_INGEST_SLOTS concurrent ingests — BEFORE the 'ingesting' row
+    // and the pack MPU exist, so a busy or cancelled wait leaves nothing
+    // behind. Pass A above already streamed the body to R2, so waiting
+    // here never holds the client's upload. The permit stays held through
+    // out.finish + the final post_meta: the gated span ends there.
+    let permit = admit_pass_b(env, budget).await?;
     sink.post_meta(&PackMeta::EMPTY, &[], budget).await?; // packs row 'ingesting' before any part is uploaded
     let key = keys::pack(&bucket.repo, &pack);
     let mut out = match PackWriter::create(bucket, &key, u32::try_from(entries.len()).unwrap_or(u32::MAX), kind, budget).await {
@@ -112,10 +119,6 @@ pub async fn run(
         Err(e) => return Err(e),
     };
     let pending = keys::pending(&bucket.repo, push);
-    // Pass B is the isolate's memory-heavy phase: admit at most
-    // GE_EDGE_INGEST_SLOTS concurrent ingests. Pass A above already streamed
-    // the body to R2, so waiting here never holds the client's upload.
-    let permit = admit_pass_b(env).await?;
     let tail = match super::ingest::resolve_and_normalize(
         bucket,
         &pending,
@@ -174,26 +177,8 @@ impl IndexSink<'_> {
         rows: &[ObjRow],
         budget: &mut ReqBudget,
     ) -> Result<(), Error> {
-        if self.links.len() > MAX_LINKS {
-            return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
-        }
-        const SAFE_MAX: i64 = (1 << 53) - 1;
-        let commit_lo = i64::try_from(meta.commit_lo).unwrap_or(SAFE_MAX).min(SAFE_MAX);
-        let pack = IndexPack {
-            id: &self.pack.0,
-            push_id: &self.push.0,
-            count: meta.count,
-            bytes: meta.bytes,
-            commit_lo,
-            commit_hi: meta.commit_hi,
-        };
-        // chunk the rows: an empty post still goes out once — it plants the
-        // 'ingesting' packs row the whole two-phase ordering depends on
-        if rows.is_empty() {
-            return self.post_rows(&pack, &[], budget).await;
-        }
-        for chunk in rows.chunks(INDEX_BATCH) {
-            self.post_rows(&pack, chunk, budget).await?;
+        for post in index_chunks(&self.pack.0, &self.push.0, self.links.len(), meta, rows)? {
+            self.post_rows(&post.pack, post.rows, budget).await?;
         }
         Ok(())
     }
@@ -208,6 +193,37 @@ impl IndexSink<'_> {
             stub_json(self.stub, self.repo, "/_do/push/index", &body, budget).await?;
         Ok(())
     }
+}
+
+/// The /_do/push/index posts one post_meta call sends, in order — pure (no
+/// stub) so tests count the chunks and check the meta on each. An empty
+/// `rows` still yields exactly one post: it plants the 'ingesting' packs
+/// row the whole two-phase ordering depends on. Every chunk carries the
+/// same real meta — the DO upserts it idempotently.
+fn index_chunks<'a>(
+    pack: &'a str,
+    push: &'a str,
+    links: usize,
+    meta: &PackMeta,
+    rows: &'a [ObjRow],
+) -> Result<Vec<IndexPost<'a>>, Error> {
+    if links > MAX_LINKS {
+        return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
+    }
+    const SAFE_MAX: i64 = (1 << 53) - 1;
+    let commit_lo = i64::try_from(meta.commit_lo).unwrap_or(SAFE_MAX).min(SAFE_MAX);
+    let pack = IndexPack {
+        id: pack,
+        push_id: push,
+        count: meta.count,
+        bytes: meta.bytes,
+        commit_lo,
+        commit_hi: meta.commit_hi,
+    };
+    if rows.is_empty() {
+        return Ok(vec![IndexPost { pack, rows: &[] }]);
+    }
+    Ok(rows.chunks(INDEX_BATCH).map(|c| IndexPost { pack, rows: c }).collect())
 }
 
 #[derive(serde::Deserialize)]
@@ -242,16 +258,26 @@ pub async fn lookup(
 /// limit — while one slot measured 66 MiB / 98 MiB.
 const INGEST_SLOTS_DEFAULT: i64 = 1;
 /// How long a push waits for a slot or a calm heap before answering busy.
-/// Default 240 s: a large unsliced pass B can run ~90 s, and an HTTP request
-/// has no wall-clock limit while the client stays connected, so outwaiting
-/// the queue beats rejecting the push busy — at 60 s a queued push was
-/// refused behind one ~90 s pass B.
+/// Default 240 s: a large unsliced pass B can run ~90 s, and outwaiting
+/// the queue beats rejecting the push busy. This is only the configured
+/// upper bound — the request budget's own wall clock caps the effective
+/// wait at (time left - GE_EDGE_INGEST_PASS_B_RESERVE_MS), because pass B
+/// still needs that reserve to finish; a push that cannot cover it fails
+/// busy up front instead of dying mid-pass on Error::Budget.
 const INGEST_WAIT_MS_DEFAULT: i64 = 240_000;
+/// Milliseconds of request budget pass B must still have for admission to
+/// be worth it — the measured worst pass B for a ~26k-object push was
+/// ~150 s wall. GE_EDGE_INGEST_PASS_B_RESERVE_MS overrides; <= 0 drops
+/// the reserve.
+const INGEST_PASS_B_RESERVE_MS_DEFAULT: i64 = 150_000;
 /// Poll cadence while waiting — short enough that a freed slot is picked up
 /// quickly, long enough that a queued push costs ~nothing.
 const INGEST_POLL_MS: u64 = 100;
 /// Live heap above this while a peer ingest runs means its leftovers are
 /// still draining — a new pass-B waits rather than stacking on top.
+/// Caveat: one large pass B holds ~60 MiB live, always above this mark, so
+/// while it runs no second ingest admits regardless of GE_EDGE_INGEST_SLOTS
+/// — effective concurrency for large pushes is 1 even with slots > 1.
 const INGEST_LOW_WATER: usize = 40 << 20;
 /// The in-band busy message, shared by the admit timeout and a peer-contended
 /// MEM_HARD trip: a retry helps, smaller slices would not have.
@@ -261,30 +287,53 @@ pub(crate) const INGEST_BUSY_MSG: &str =
 /// The gate's pure state — unit-tested without a worker::Env or the isolate.
 /// `slots == 0` disables admission: every caller acquires, and `in_flight`
 /// still counts so the low-water wait and the honest Limit keep working.
+/// Waiters queue on FIFO tickets (`next_ticket` issues them, `waiting`
+/// holds the live ones in order): only the lowest live ticket may take a
+/// freed slot, so later arrivals can't starve an earlier push. A ticket
+/// leaves `waiting` when its waiter acquires, times out, or is dropped —
+/// the head can never point at a dead waiter.
 struct Admission {
     in_flight: usize,
     slots: usize,
+    next_ticket: u64,
+    waiting: BTreeSet<u64>,
 }
 
 impl Admission {
     fn new(slots: usize) -> Self {
-        Self { in_flight: 0, slots }
+        Self { in_flight: 0, slots, next_ticket: 0, waiting: BTreeSet::new() }
     }
-    /// Admit one ingest iff a slot is free AND the heap is calm. `heap_busy`
-    /// reports live_bytes() over INGEST_LOW_WATER; it blocks only while a
-    /// peer ingest is in flight (`in_flight` counts admitted ingests — the
-    /// caller isn't one yet), so stale heap from finished work can't stall
-    /// the queue and unrelated heap can't either.
-    fn try_acquire(&mut self, heap_busy: bool) -> bool {
-        if self.slots == 0 {
-            self.in_flight += 1;
-            return true;
-        }
-        if self.in_flight >= self.slots || (heap_busy && self.in_flight > 0) {
+    /// Issue a FIFO ticket and queue the waiter behind every earlier one.
+    fn enqueue(&mut self) -> u64 {
+        let t = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.waiting.insert(t);
+        t
+    }
+    /// A waiter gave up (timeout or cancel): its ticket leaves the queue so
+    /// the next-oldest waiter becomes head — an abandoned ticket must never
+    /// wedge the line. Removing an already-gone ticket is a no-op.
+    fn leave(&mut self, ticket: u64) {
+        self.waiting.remove(&ticket);
+    }
+    /// Admit the ticketed waiter iff it is the queue head AND a slot is free
+    /// AND the heap is calm. `heap_busy` reports live_bytes() over
+    /// INGEST_LOW_WATER; it blocks only while a peer ingest is in flight
+    /// (`in_flight` counts admitted ingests — the caller isn't one yet), so
+    /// stale heap from finished work can't stall the queue and unrelated
+    /// heap can't either. slots == 0 disables the gate: every ticket
+    /// acquires — there is no contention to order.
+    fn try_acquire(&mut self, ticket: u64, heap_busy: bool) -> bool {
+        if self.slots != 0 && self.waiting.first() != Some(&ticket) {
             return false;
         }
-        self.in_flight += 1;
-        true
+        let admit =
+            self.slots == 0 || (self.in_flight < self.slots && !(heap_busy && self.in_flight > 0));
+        if admit {
+            self.waiting.remove(&ticket);
+            self.in_flight += 1;
+        }
+        admit
     }
     fn release(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -297,6 +346,10 @@ impl Admission {
     fn in_flight(&self) -> usize {
         self.in_flight
     }
+    #[cfg(test)]
+    fn waiting_len(&self) -> usize {
+        self.waiting.len()
+    }
 }
 
 thread_local! {
@@ -305,11 +358,39 @@ thread_local! {
     /// exercise `Admission` directly; slots starts disabled until admit()
     /// reads env.
     static ADMISSION: RefCell<Admission> = RefCell::new(Admission::new(0));
+    /// git-receive-pack requests inside the edge handler right now — pass A
+    /// included (pass A isn't gated but still holds heap). The pass-B memory
+    /// guard reads this to pick "server busy" over "smaller slices": a peer
+    /// in pass A can push a lone pass B over MEM_HARD just like a peer in
+    /// pass B can.
+    static RECEIVE_PACKS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts one in-progress receive-pack request for the isolate — held for
+/// the whole edge handler so pass-A heap pressure counts toward the memory
+/// guard's busy-vs-slices message. try_with: a drop during thread-local
+/// teardown must not panic.
+pub(crate) struct ReceivePackGuard;
+impl ReceivePackGuard {
+    pub(crate) fn new() -> Self {
+        RECEIVE_PACKS.with(|c| c.set(c.get() + 1));
+        Self
+    }
+}
+impl Drop for ReceivePackGuard {
+    fn drop(&mut self) {
+        let _ = RECEIVE_PACKS.try_with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// In-progress receive-pack requests in this isolate, the caller's own
+/// included — mem_guard's "is the isolate busy" signal.
+pub(crate) fn receive_packs() -> usize {
+    RECEIVE_PACKS.with(|c| c.get())
 }
 
 /// Pass-B ingests inside the gated span, this request's permit included —
-/// the memory guard reads it to choose between "smaller slices" (alone) and
-/// the busy message (peers running).
+/// the admit log reads it for diagnostics.
 pub(crate) fn ingest_in_flight() -> usize {
     ADMISSION.with(|a| a.borrow().in_flight())
 }
@@ -323,6 +404,15 @@ impl Drop for IngestPermit {
     }
 }
 
+/// RAII queue ticket — dropping it (timeout, cancel, any error path) pulls
+/// the waiter out of line so the next-oldest ticket can acquire.
+struct AdmitTicket(u64);
+impl Drop for AdmitTicket {
+    fn drop(&mut self) {
+        let _ = ADMISSION.try_with(|a| a.borrow_mut().leave(self.0));
+    }
+}
+
 /// GE_EDGE_INGEST_SLOTS / GE_EDGE_INGEST_WAIT_MS as pure values: absent or
 /// unparseable falls back to the defaults (the env_i64 rule), slots <= 0
 /// disables the gate, wait <= 0 fails fast on contention.
@@ -332,35 +422,101 @@ fn ingest_gate(slots: Option<i64>, wait: Option<i64>) -> (usize, i64) {
     (usize::try_from(slots).unwrap_or(0), wait.max(0))
 }
 
-/// Wait for a pass-B slot (bounded by GE_EDGE_INGEST_WAIT_MS), then hold the
-/// RAII permit through `out.finish` + the final post_meta. On timeout the
-/// push fails in-band — the body is already durable in R2, so the client
-/// gets the report-status busy message, never a bare 5xx.
-async fn admit_pass_b(env: &Env) -> Result<IngestPermit, Error> {
-    let raw = |n: &str| env.var(n).ok().and_then(|v| v.to_string().parse::<i64>().ok());
-    let (slots, wait_ms) = ingest_gate(raw("GE_EDGE_INGEST_SLOTS"), raw("GE_EDGE_INGEST_WAIT_MS"));
-    ADMISSION.with(|a| a.borrow_mut().set_slots(slots));
-    let started = crate::platform::now_ms();
+/// GE_EDGE_INGEST_PASS_B_RESERVE_MS: absent or unparseable falls back to the
+/// default; <= 0 drops the reserve (the budget caps the wait by itself).
+fn ingest_reserve(raw: Option<i64>) -> i64 {
+    raw.unwrap_or(INGEST_PASS_B_RESERVE_MS_DEFAULT).max(0)
+}
+
+/// The admission wait bound in ms — `None` when the request budget cannot
+/// cover the pass-B reserve, meaning even an instant admission would start
+/// pass B already doomed to Error::Budget; the push fails busy instead.
+/// Otherwise the configured wait capped by (budget left - reserve): the
+/// request's own wall clock is the real deadline.
+fn admit_wait_ms(wait_ms: i64, budget_left_ms: i64, reserve_ms: i64) -> Option<i64> {
+    let usable = budget_left_ms.saturating_sub(reserve_ms);
+    (usable > 0).then(|| wait_ms.min(usable))
+}
+
+/// console_log! aborts off-wasm (the native test binary has no JS console),
+/// so admit diagnostics route through this shim — a no-op in tests.
+#[cfg(target_arch = "wasm32")]
+fn admit_log(msg: std::fmt::Arguments<'_>) {
+    worker::console_log!("{msg}");
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn admit_log(_msg: std::fmt::Arguments<'_>) {}
+
+/// Wait for a pass-B slot (bounded by the effective deadline admit_wait_ms
+/// computed), then hold the RAII permit through `out.finish` + the final
+/// post_meta. On timeout the push fails in-band — the body is already
+/// durable in R2, so the client gets the report-status busy message, never
+/// a bare 5xx. Clock, heap reading and sleep are injected so the loop's
+/// tests run natively (js_sys::Date and worker::Delay are wasm-only).
+async fn admit_wait<F, SF, Fut>(
+    wait_ms: i64,
+    heap_busy: F,
+    now: impl Fn() -> i64,
+    sleep: SF,
+) -> Result<IngestPermit, Error>
+where
+    F: Fn() -> bool,
+    SF: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // FIFO ticket up front: only the oldest live waiter may take a freed
+    // slot. The RAII guard drops it from the queue on timeout/cancel.
+    let ticket = ADMISSION.with(|a| a.borrow_mut().enqueue());
+    let _ticket = AdmitTicket(ticket);
+    let started = now();
     let mut waited = false;
     loop {
-        let heap_busy = crate::mem::live_bytes() > INGEST_LOW_WATER;
-        if ADMISSION.with(|a| a.borrow_mut().try_acquire(heap_busy)) {
+        let busy = heap_busy();
+        if ADMISSION.with(|a| a.borrow_mut().try_acquire(ticket, busy)) {
             if waited {
-                let waited_ms = crate::platform::now_ms() - started;
+                let waited_ms = now() - started;
                 let n = ingest_in_flight();
-                worker::console_log!("git-edge ingest admit: waited {waited_ms}ms (slots={slots} in_flight={n})");
+                admit_log(format_args!("git-edge ingest admit: waited {waited_ms}ms (in_flight={n})"));
             }
             return Ok(IngestPermit);
         }
         waited = true;
-        let waited_ms = crate::platform::now_ms() - started;
+        let waited_ms = now() - started;
         if waited_ms >= wait_ms {
             let n = ingest_in_flight();
-            worker::console_log!("git-edge ingest admit: timed out after {waited_ms}ms (slots={slots} in_flight={n})");
+            admit_log(format_args!("git-edge ingest admit: timed out after {waited_ms}ms (in_flight={n})"));
             return Err(Error::Limit(INGEST_BUSY_MSG.into()));
         }
-        Delay::from(std::time::Duration::from_millis(INGEST_POLL_MS)).await;
+        sleep(INGEST_POLL_MS).await;
     }
+}
+
+/// Wait for a pass-B slot, bounded by GE_EDGE_INGEST_WAIT_MS *and* by what
+/// the request budget has left after the pass-B reserve — the budget clock
+/// started before pass A, so an uncapped wait could admit a push with no
+/// time left and fail it mid-pass on Error::Budget instead of answering
+/// busy. `budget` is read-only: waiting itself spends no subrequests.
+async fn admit_pass_b(env: &Env, budget: &ReqBudget) -> Result<IngestPermit, Error> {
+    let raw = |n: &str| env.var(n).ok().and_then(|v| v.to_string().parse::<i64>().ok());
+    let (slots, wait_ms) = ingest_gate(raw("GE_EDGE_INGEST_SLOTS"), raw("GE_EDGE_INGEST_WAIT_MS"));
+    let reserve_ms = ingest_reserve(raw("GE_EDGE_INGEST_PASS_B_RESERVE_MS"));
+    ADMISSION.with(|a| a.borrow_mut().set_slots(slots));
+    let wait_ms = match admit_wait_ms(wait_ms, budget.ms_left() as i64, reserve_ms) {
+        Some(w) => w,
+        None => {
+            admit_log(format_args!(
+                "git-edge ingest admit: request budget cannot cover the {reserve_ms}ms pass-B reserve; busy"
+            ));
+            return Err(Error::Limit(INGEST_BUSY_MSG.into()));
+        }
+    };
+    admit_wait(
+        wait_ms,
+        || crate::mem::live_bytes() > INGEST_LOW_WATER,
+        crate::platform::now_ms,
+        |ms: u64| Delay::from(std::time::Duration::from_millis(ms)),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -400,17 +556,55 @@ mod tests {
         assert!(INDEX_BATCH <= 10_000, "DO push_index caps at 10,000 rows");
     }
 
+    /// The /_do/push/index chunking post_meta performs, pure: 0 rows still
+    /// posts once (the 'ingesting' row), batches cap at INDEX_BATCH, and
+    /// every post carries the same real meta — never the EMPTY placeholder.
+    #[test]
+    fn index_chunks_batch_and_meta() {
+        let meta = PackMeta {
+            pack: PackId("p".into()),
+            push_id: Some("pu".into()),
+            count: 7,
+            bytes: 4096,
+            commit_lo: 11,
+            commit_hi: 22,
+            created_at: 33,
+        };
+        // 0 rows -> exactly one post, and it is the empty one
+        let posts = index_chunks("pid", "push", 0, &meta, &[]).unwrap();
+        assert_eq!(posts.len(), 1);
+        assert!(posts[0].rows.is_empty());
+        // ceil(n / INDEX_BATCH) posts, rows covered exactly once, real meta on each
+        for (n, want) in [(1usize, 1usize), (2_500, 1), (2_501, 2), (10_000, 4)] {
+            let rows: Vec<ObjRow> = (0..n as u32).map(row).collect();
+            let posts = index_chunks("pid", "push", 0, &meta, &rows).unwrap();
+            assert_eq!(posts.len(), want, "{n} rows");
+            assert_eq!(posts.iter().map(|p| p.rows.len()).sum::<usize>(), n);
+            for p in &posts {
+                assert_eq!(p.pack.id, "pid");
+                assert_eq!(p.pack.push_id, "push");
+                assert_eq!(p.pack.count, 7);
+                assert_eq!(p.pack.bytes, 4096);
+                assert_eq!(p.pack.commit_lo, 11);
+                assert_eq!(p.pack.commit_hi, 22);
+            }
+        }
+        // over MAX_LINKS refuses before any post is built
+        assert!(index_chunks("pid", "push", MAX_LINKS + 1, &meta, &[]).is_err());
+    }
+
     /// Slots cap concurrency, release frees them, and the count can't go
     /// negative — the three behaviours the whole gate rests on.
     #[test]
     fn admission_acquire_release_and_capacity() {
         let mut a = Admission::new(2);
-        assert!(a.try_acquire(false));
-        assert!(a.try_acquire(false));
+        let (t0, t1, t2) = (a.enqueue(), a.enqueue(), a.enqueue());
+        assert!(a.try_acquire(t0, false));
+        assert!(a.try_acquire(t1, false));
         assert_eq!(a.in_flight(), 2);
-        assert!(!a.try_acquire(false), "third ingest must wait at capacity");
+        assert!(!a.try_acquire(t2, false), "third ingest must wait at capacity");
         a.release();
-        assert!(a.try_acquire(false), "a freed slot admits the next waiter");
+        assert!(a.try_acquire(t2, false), "a freed slot admits the next waiter");
         assert_eq!(a.in_flight(), 2);
         a.release();
         a.release();
@@ -425,7 +619,8 @@ mod tests {
     fn admission_disabled_acquires_but_still_counts() {
         let mut a = Admission::new(0);
         for _ in 0..5 {
-            assert!(a.try_acquire(true), "disabled gate ignores heap pressure too");
+            let t = a.enqueue();
+            assert!(a.try_acquire(t, true), "disabled gate ignores heap pressure too");
         }
         assert_eq!(a.in_flight(), 5);
     }
@@ -436,17 +631,53 @@ mod tests {
     #[test]
     fn admission_heap_busy_waits_only_while_a_peer_runs() {
         let mut a = Admission::new(2);
+        let t0 = a.enqueue();
         // no peers in flight: busy heap alone can't block (it's not ours to drain)
-        assert!(a.try_acquire(true));
+        assert!(a.try_acquire(t0, true));
         assert_eq!(a.in_flight(), 1);
         // a slot is free but heap is busy and the first ingest still runs: wait
-        assert!(!a.try_acquire(true));
+        let t1 = a.enqueue();
+        assert!(!a.try_acquire(t1, true));
         // heap calm: the free slot admits despite the peer
-        assert!(a.try_acquire(false));
+        assert!(a.try_acquire(t1, false));
         assert_eq!(a.in_flight(), 2);
         // at capacity the heap reading is irrelevant
-        assert!(!a.try_acquire(false));
-        assert!(!a.try_acquire(true));
+        let t2 = a.enqueue();
+        assert!(!a.try_acquire(t2, false));
+        assert!(!a.try_acquire(t2, true));
+    }
+
+    /// Only the oldest live ticket may take a freed slot — a younger
+    /// waiter can't barge ahead of an earlier push that has waited longer.
+    #[test]
+    fn admission_serves_oldest_ticket_first() {
+        let mut a = Admission::new(1);
+        let (t0, t1, t2) = (a.enqueue(), a.enqueue(), a.enqueue());
+        assert!(a.try_acquire(t0, false));
+        a.release(); // the slot frees while t1 and t2 still queue
+        assert!(!a.try_acquire(t2, false), "the younger ticket must not barge");
+        assert!(a.try_acquire(t1, false), "the oldest waiter takes the slot");
+        assert_eq!(a.in_flight(), 1);
+    }
+
+    /// A waiter that times out or is dropped leaves the queue — its ticket
+    /// is removed, so the next-oldest waiter becomes head instead of the
+    /// line wedging behind a dead ticket.
+    #[test]
+    fn admission_abandoned_ticket_does_not_wedge_queue() {
+        let mut a = Admission::new(1);
+        let (t0, t1, t2) = (a.enqueue(), a.enqueue(), a.enqueue());
+        assert!(a.try_acquire(t0, false));
+        a.leave(t1); // t1 timed out or its future was dropped
+        a.release();
+        assert!(a.try_acquire(t2, false), "t2 is head now — t1's exit freed it");
+        assert_eq!(a.in_flight(), 1);
+        // leaving an already-acquired or unknown ticket is a harmless no-op
+        a.leave(t0);
+        a.leave(999);
+        a.release();
+        let t3 = a.enqueue();
+        assert!(a.try_acquire(t3, false));
     }
 
     /// GE_EDGE_INGEST_* parsing: defaults when absent/unparseable (env_i64's
@@ -459,5 +690,209 @@ mod tests {
         assert_eq!(ingest_gate(Some(-3), None).0, 0);
         assert_eq!(ingest_gate(None, Some(-1)).1, 0, "wait <= 0 fails fast");
         assert_eq!(ingest_gate(Some(8), Some(0)).1, 0);
+    }
+
+    /// The pass-B reserve knob: default 150 s, <= 0 drops it.
+    #[test]
+    fn ingest_reserve_defaults_and_clamps() {
+        assert_eq!(ingest_reserve(None), 150_000);
+        assert_eq!(ingest_reserve(Some(1_000)), 1_000);
+        assert_eq!(ingest_reserve(Some(-1)), 0, "<= 0 drops the reserve");
+    }
+
+    /// The effective wait is min(configured wait, budget left - reserve):
+    /// `None` when the budget can't cover the reserve — admission then
+    /// would start pass B already doomed to Error::Budget, so the push
+    /// fails busy instead.
+    #[test]
+    fn admit_wait_ms_caps_by_budget_minus_reserve() {
+        // fresh budget: configured wait is the bound
+        assert_eq!(admit_wait_ms(240_000, 240_000, 150_000), Some(90_000));
+        // a smaller configured wait still wins
+        assert_eq!(admit_wait_ms(60_000, 240_000, 150_000), Some(60_000));
+        // budget nearly spent: the cap shrinks to what's left over the reserve
+        assert_eq!(admit_wait_ms(240_000, 160_000, 150_000), Some(10_000));
+        // exactly the reserve left: nothing usable — fail busy up front
+        assert_eq!(admit_wait_ms(240_000, 150_000, 150_000), None);
+        // less than the reserve: same
+        assert_eq!(admit_wait_ms(240_000, 100_000, 150_000), None);
+        // wait <= 0 keeps its fail-fast meaning when the reserve IS covered
+        assert_eq!(admit_wait_ms(0, 240_000, 150_000), Some(0));
+        assert_eq!(admit_wait_ms(-5, 240_000, 150_000), Some(-5));
+    }
+
+    /// A fake admit clock: now() reads the cell, sleep(ms) advances it —
+    /// the wait loop's deadline math runs deterministically, no real time.
+    #[derive(Clone)]
+    struct FakeClock(std::rc::Rc<std::cell::Cell<i64>>);
+    impl FakeClock {
+        fn new(t: i64) -> Self {
+            Self(std::rc::Rc::new(std::cell::Cell::new(t)))
+        }
+        fn now(&self) -> i64 {
+            self.0.get()
+        }
+        fn sleep(&self, ms: u64) -> std::future::Ready<()> {
+            self.0.set(self.0.get() + i64::try_from(ms).unwrap_or(i64::MAX));
+            std::future::ready(())
+        }
+    }
+
+    fn clock_fns(
+        clock: &FakeClock,
+    ) -> (
+        impl Fn() -> i64,
+        impl Fn(u64) -> std::future::Ready<()>,
+    ) {
+        let c = clock.clone();
+        let n = move || c.now();
+        let c = clock.clone();
+        let s = move |ms: u64| c.sleep(ms);
+        (n, s)
+    }
+
+    /// A sleep the test opens by hand: Pending until the shared flag flips —
+    /// lets admit_wait futures queue first, then interleave their polls.
+    struct GateSleep(std::rc::Rc<std::cell::Cell<bool>>);
+    impl std::future::Future for GateSleep {
+        type Output = ();
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if self.0.get() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// A waker that does nothing — admit_wait's injected sleep resolves
+    /// immediately, so its future never really pends in these tests.
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn no_op(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    /// Poll `f` once with the noop waker.
+    fn poll_once<F: std::future::Future>(f: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let w = noop_waker();
+        let mut cx = std::task::Context::from_waker(&w);
+        f.poll(&mut cx)
+    }
+
+    /// Drive `f` to completion — the injected clock/sleep make admit_wait
+    /// resolve without real time, so a bounded poll loop is enough.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let w = noop_waker();
+        let mut cx = std::task::Context::from_waker(&w);
+        let mut f = std::pin::pin!(f);
+        for _ in 0..1_000_000 {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+        panic!("future did not resolve");
+    }
+
+    /// A contended waiter that outlives wait_ms answers the in-band busy
+    /// Limit, holds no slot, and leaves no ticket behind — the gate still
+    /// admits afterwards.
+    #[test]
+    fn admit_wait_timeout_is_busy_and_leaves_no_ticket() {
+        ADMISSION.with(|a| a.borrow_mut().set_slots(1));
+        let clock = FakeClock::new(1_000);
+        let (n, s) = clock_fns(&clock);
+        let hold = block_on(admit_wait(60_000, || false, n, s)).unwrap();
+        assert_eq!(ingest_in_flight(), 1);
+        // the only slot is held; wait_ms=250 -> three 100 ms polls, then busy
+        let (n, s) = clock_fns(&clock);
+        let err = block_on(admit_wait(250, || false, n, s)).err().unwrap();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
+        assert_eq!(ingest_in_flight(), 1, "the timed-out waiter holds no slot");
+        ADMISSION.with(|a| assert_eq!(a.borrow().waiting_len(), 0, "timeout must drop the ticket"));
+        drop(hold);
+        assert_eq!(ingest_in_flight(), 0, "dropping the permit releases the slot");
+        let (n, s) = clock_fns(&clock);
+        let _next = block_on(admit_wait(60_000, || false, n, s)).unwrap();
+        assert_eq!(ingest_in_flight(), 1, "the gate still admits after the timeout");
+    }
+
+    /// A waiter dropped mid-wait (the client went away) must leave the
+    /// queue — its ticket is RAII, so the next-oldest waiter is not wedged
+    /// behind it.
+    #[test]
+    fn admit_wait_cancel_mid_wait_releases_ticket() {
+        ADMISSION.with(|a| a.borrow_mut().set_slots(1));
+        let clock = FakeClock::new(0);
+        // occupy the only slot so the waiter below must queue
+        let (n, s) = clock_fns(&clock);
+        let hold = block_on(admit_wait(60_000, || false, n, s)).unwrap();
+        assert_eq!(ingest_in_flight(), 1);
+        let (n, _s) = clock_fns(&clock);
+        // Box::pin (not pin!): drop(fut) must drop the future itself so its
+        // RAII ticket runs — a pin! shadow would only drop the Pin wrapper
+        let mut fut = Box::pin(admit_wait(
+            60_000,
+            || false,
+            n,
+            |_ms: u64| std::future::pending::<()>(),
+        ));
+        // first poll: acquire fails (slot held), deadline not hit, sleep pends
+        assert!(poll_once(fut.as_mut()).is_pending());
+        ADMISSION.with(|a| assert_eq!(a.borrow().waiting_len(), 1, "the waiter queued"));
+        drop(fut); // client went away — the RAII ticket must leave the queue
+        ADMISSION.with(|a| assert_eq!(a.borrow().waiting_len(), 0, "abandoned ticket skipped"));
+        assert_eq!(ingest_in_flight(), 1, "the holder is untouched");
+        drop(hold);
+        assert_eq!(ingest_in_flight(), 0);
+    }
+
+    /// End to end: with one slot held, two admit_wait futures queue in
+    /// ticket order — the younger one keeps pending even after the slot
+    /// frees, and only the head (oldest ticket) acquires.
+    #[test]
+    fn admit_wait_is_fifo_end_to_end() {
+        ADMISSION.with(|a| a.borrow_mut().set_slots(1));
+        let clock = FakeClock::new(0);
+        let (n, s) = clock_fns(&clock);
+        let elder = block_on(admit_wait(60_000, || false, n, s)).unwrap();
+        assert_eq!(ingest_in_flight(), 1);
+
+        // each waiter's sleep pends on a shared gate the test opens by hand,
+        // so both futures queue first and their polls interleave below
+        let gate = std::rc::Rc::new(std::cell::Cell::new(false));
+        let sleep = {
+            let g = gate.clone();
+            move |_ms: u64| GateSleep(g.clone())
+        };
+        let mut w1 = Box::pin(admit_wait(60_000, || false, || 0i64, sleep.clone()));
+        let mut w2 = Box::pin(admit_wait(60_000, || false, || 0i64, sleep));
+        assert!(poll_once(w1.as_mut()).is_pending());
+        assert!(poll_once(w2.as_mut()).is_pending());
+        ADMISSION.with(|a| assert_eq!(a.borrow().waiting_len(), 2));
+
+        drop(elder); // frees the slot — but only the head ticket may take it
+        // w2 polls while w1 still sleeps: must NOT acquire (not head)
+        assert!(poll_once(w2.as_mut()).is_pending(), "younger waiter can't barge");
+        // open the gates: w1 is head with capacity free -> it acquires
+        gate.set(true);
+        let p1 = match poll_once(w1.as_mut()) {
+            std::task::Poll::Ready(Ok(p)) => p,
+            std::task::Poll::Ready(Err(e)) => panic!("head waiter errored: {e}"),
+            std::task::Poll::Pending => panic!("head waiter should have acquired"),
+        };
+        assert_eq!(ingest_in_flight(), 1, "the elder waiter's permit is held");
+        drop(p1);
+        drop(w2); // still queued — its ticket leaves with it
+        ADMISSION.with(|a| assert_eq!(a.borrow().waiting_len(), 0));
+        assert_eq!(ingest_in_flight(), 0);
     }
 }

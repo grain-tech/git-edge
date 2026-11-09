@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use futures_util::{Stream, StreamExt};
 use gix_hash::ObjectId;
-use worker::{Env, Method, Request, Response};
+use worker::{Env, Method, Request, Response, Stub};
 
 use crate::auth::{self, Level};
 use crate::error::{respond, Error};
@@ -1082,6 +1082,9 @@ async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute, spend: &Spen
 
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
 async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spend) -> Result<Response, Error> {
+    // the pass-B memory guard's "is the isolate busy" count — pass A isn't
+    // admission-gated but still holds heap, so the whole handler counts
+    let _receive_pack = pack::run::ReceivePackGuard::new();
     let principal = auth::authenticate(&req, &env, Level::Write, &route, spend).await?;
     // A27: sha1 of the presented token is the rate-limit bucket key — the raw
     // credential never crosses the stub boundary (8.1)
@@ -1187,15 +1190,7 @@ async fn receive_inner(
     // error; the Limit message reaches the client in `unpack`.
     if !begin.claimed {
         if let Err(e) = owner_claim(env, route, &mut budget).await {
-            let _: serde_json::Value = stub_json(
-                &stub,
-                route,
-                "/_do/push/abort",
-                &serde_json::json!({ "push_id": push.0 }),
-                &mut budget,
-            )
-            .await
-            .unwrap_or_default();
+            push_abort(&stub, route, &push, spend).await;
             return Err(e);
         }
     }
@@ -1205,15 +1200,7 @@ async fn receive_inner(
     // janitor's 1h expiry lets 64 failures DoS all pushes
     let run = pack::run::run(body, &bucket, &stub, route, &push, hdr.caps.object_format, env, &mut budget).await;
     if run.is_err() {
-        let _: serde_json::Value = stub_json(
-            &stub,
-            route,
-            "/_do/push/abort",
-            &serde_json::json!({ "push_id": push.0 }),
-            &mut budget,
-        )
-        .await
-        .unwrap_or_default();
+        push_abort(&stub, route, &push, spend).await;
     }
     let (pack, tags) = run?;
     let commands: Vec<serde_json::Value> = hdr
@@ -1248,15 +1235,7 @@ async fn receive_inner(
     let res: Commit = match commit {
         Ok(r) => r,
         Err(e) => {
-            let _: serde_json::Value = stub_json(
-                &stub,
-                route,
-                "/_do/push/abort",
-                &serde_json::json!({ "push_id": push.0 }),
-                &mut budget,
-            )
-            .await
-            .unwrap_or_default();
+            push_abort(&stub, route, &push, spend).await;
             return Err(e);
         }
     };
@@ -1269,6 +1248,25 @@ async fn receive_inner(
         })
         .collect();
     report_status_200(hdr, Ok(()), &results)
+}
+
+/// One bounded attempt at /_do/push/abort. The request's own budget is
+/// often WHY the abort runs — an admission timeout or a Budget failure
+/// means it is already exhausted — so the abort gets a fresh small budget
+/// (ReqBudget::cleanup) that still reports into the request's spend tally.
+/// Best-effort: the result is discarded; if this attempt also fails the
+/// row expires via the janitor.
+async fn push_abort(stub: &Stub, route: &RepoRoute, push: &PushId, spend: &Spend) {
+    let mut budget = ReqBudget::cleanup(spend);
+    let _: serde_json::Value = stub_json(
+        stub,
+        route,
+        "/_do/push/abort",
+        &serde_json::json!({ "push_id": push.0 }),
+        &mut budget,
+    )
+    .await
+    .unwrap_or_default();
 }
 
 /// report-status `ng` reasons are `&'static str`; the DO's known reasons get their static form,
