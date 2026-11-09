@@ -1132,10 +1132,13 @@ impl Cx<'_> {
 }
 
 /// Bound for decode_mini's level-0 re-deflate of the base: zlib level 0
-/// stores — input plus 5 bytes per <=64 KiB-1 block plus the 6-byte wrapper.
-/// len/8192 is ~1.6x the real per-block overhead; +64 covers wrapper+rounding.
+/// stores — input plus a 5-byte header per stored block plus the 6-byte
+/// wrapper. gix-zlib's deflate::Write flushes through a 32 KiB output
+/// buffer (BUF_SIZE = 4096*8), so real stored blocks are ~32 KiB; the
+/// bound prices blocks as small as 16 KiB so a smaller buffer still
+/// fits, and +64 covers wrapper+rounding slack.
 fn stored_deflate_bound(len: usize) -> usize {
-    len.saturating_add(len / 8_192).saturating_add(64)
+    len.saturating_add(5usize.saturating_mul(len / 16_384 + 1)).saturating_add(64)
 }
 
 /// One git delta-header size varint (7 bits per byte, high bit = continue) —
@@ -1255,21 +1258,40 @@ fn decode_mini_bound(
     decode_mini_terms(z, base_len, e, raw, obj_kind).bound()
 }
 
-/// An io::Write into a Vec that never grows it: a write past the reserved
-/// capacity fails instead of reallocating. decode_mini reserves the
-/// mini-pack's full size up front, so no moving reallocation can hold an
-/// old and a new copy of it at once.
+/// An io::Write into a Vec that never grows it INFALLIBLY: a write past
+/// the reserved capacity first tries FALLIBLE growth through try_grow —
+/// a refused block is the in-band memory Limit, never a trap — and only
+/// then fails WriteZero, which decode_mini maps to that same Limit. The
+/// mini-pack's size is reserved up front by `terms`; this fallback is the
+/// belt under the bound's braces for a deflate block layout the bound
+/// did not price.
 struct NoGrow<'a>(&'a mut Vec<u8>);
 impl std::io::Write for NoGrow<'_> {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
         if self.0.len().saturating_add(b.len()) > self.0.capacity() {
-            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "mini-pack capacity exceeded"));
+            crate::try_grow::vec(self.0, b.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::WriteZero, "mini-pack capacity exceeded")
+            })?;
+            mem_log(format_args!(
+                "git-edge decode_mini: mini-pack write passed its reserved bound; grew fallibly"
+            ));
         }
         self.0.extend_from_slice(b);
         Ok(b.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// decode_mini's io-error mapping: a NoGrow WriteZero means the fallible
+/// growth above was refused — the in-band retry Limit (`MEM_RETRY_MSG`).
+/// Every other io failure stays Internal.
+fn mini_io(e: std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::WriteZero {
+        crate::try_grow::failed()
+    } else {
+        internal(e)
     }
 }
 
@@ -1302,7 +1324,7 @@ pub fn decode_mini(
     let terms = decode_mini_terms(&mut cx.z, base.map(|(_, d)| d.len()), &e, raw, obj_kind);
     cx.mem_decode(terms.bound(), Some(label), "decode:mini")?;
     let mut mini = crate::try_grow::with_capacity(terms.mini)?;
-    NoGrow(&mut mini).write_all(b"PACK\0\0\0\x02\0\0\0\x02").map_err(internal)?;
+    NoGrow(&mut mini).write_all(b"PACK\0\0\0\x02\0\0\0\x02").map_err(mini_io)?;
     if let Some((k, d)) = base {
         let hk = match k {
             Kind::Commit => Header::Commit,
@@ -1310,9 +1332,9 @@ pub fn decode_mini(
             Kind::Blob => Header::Blob,
             Kind::Tag => Header::Tag,
         };
-        hk.write_to(d.len() as u64, &mut NoGrow(&mut mini)).map_err(internal)?;
+        hk.write_to(d.len() as u64, &mut NoGrow(&mut mini)).map_err(mini_io)?;
         let mut w = gix_zlib::stream::deflate::Write::new(NoGrow(&mut mini), Compression::new(0).unwrap_or_default());
-        w.write_all(d).and_then(|_| std::io::Write::flush(&mut w)).map_err(internal)?;
+        w.write_all(d).and_then(|_| std::io::Write::flush(&mut w)).map_err(mini_io)?;
     }
     let at = mini.len() as u64;
     let body = raw.get(e.header_size()..).ok_or_else(|| unpack("short entry"))?;
@@ -1321,9 +1343,9 @@ pub fn decode_mini(
         (true, None) => return Err(unpack("delta without base")),
         (false, _) => e.header,
     };
-    hdr.write_to(e.decompressed_size, &mut NoGrow(&mut mini)).map_err(internal)?;
-    NoGrow(&mut mini).write_all(body).map_err(internal)?;
-    NoGrow(&mut mini).write_all(&[0u8; 32][..obj_kind.len_in_bytes()]).map_err(internal)?;
+    hdr.write_to(e.decompressed_size, &mut NoGrow(&mut mini)).map_err(mini_io)?;
+    NoGrow(&mut mini).write_all(body).map_err(mini_io)?;
+    NoGrow(&mut mini).write_all(&[0u8; 32][..obj_kind.len_in_bytes()]).map_err(mini_io)?;
     let file = File::<&[u8]>::from_data(&mini, "mini".into(), obj_kind)
         .map_err(internal)?
         .with_alloc_limit_bytes(usize::try_from(MAX_OBJ).ok());
@@ -2748,15 +2770,103 @@ mod tests {
         assert_eq!(decode_entry_bound(b"junk"), MAX_OBJ as usize + DECODE_SCRATCH);
     }
 
-    /// stored_deflate_bound stays above the real level-0 overhead
-    /// (5 bytes per <=64 KiB-1 stored block + 6-byte zlib wrapper).
+    /// The bound is checked against REAL level-0 deflate output through
+    /// the same gix_zlib::stream::deflate::Write path decode_mini uses —
+    /// not a stored-block-size model. gix-zlib flushes through a 32 KiB
+    /// output buffer, so real blocks are ~32 KiB with a 5-byte header;
+    /// the bound must cover them at sizes up to MAX_OBJ.
     #[test]
-    fn stored_deflate_bound_covers_level0_overhead() {
-        for len in [0usize, 1, 65_535, 65_536, 1 << 20, MAX_OBJ as usize] {
-            let real_blocks = len / 65_535 + usize::from(len % 65_535 != 0);
-            let real = len + 5 * real_blocks + 6;
-            assert!(stored_deflate_bound(len) >= real, "len {len}");
+    fn stored_deflate_bound_covers_real_level0_output() {
+        use std::io::Write as _;
+        let mut x = 0x9e37_79b9_u32;
+        for len in [1usize << 20, 4 << 20, 16 << 20, MAX_OBJ as usize] {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            let mut out = Vec::new();
+            {
+                let mut w =
+                    gix_zlib::stream::deflate::Write::new(&mut out, Compression::new(0).unwrap_or_default());
+                w.write_all(&data).unwrap();
+                std::io::Write::flush(&mut w).unwrap();
+            }
+            // level 0 stores: output is input + per-block headers + wrapper
+            assert!(out.len() > len, "len {len}: level-0 output {} should exceed input", out.len());
+            assert!(
+                out.len() <= stored_deflate_bound(len),
+                "len {len}: real level-0 output {} exceeds bound {}",
+                out.len(),
+                stored_deflate_bound(len)
+            );
         }
+    }
+
+    /// A delta over a >=4 MiB base decodes end to end: the base's level-0
+    /// re-deflate inside decode_mini's synthetic pack stays inside
+    /// stored_deflate_bound. (The old 64 KiB-block model under-counted
+    /// real 32 KiB-block output and failed these with Internal.)
+    #[test]
+    fn decode_mini_delta_over_large_bases() {
+        let mem = MemReads::new(crate::store::RepoId("o/r".into()));
+        let empty = HashMap::new();
+        let mut cx = bare_cx(&mem, &empty);
+        for mib in [4usize, 16] {
+            let n = mib << 20;
+            let mut x = 0x1234_5678_u32;
+            let base: Vec<u8> = (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            let result = b"patched tail";
+            let raw = mk_delta_raw(
+                Header::OfsDelta { base_distance: 1 },
+                n as u64,
+                result.len() as u64,
+                &insert_ops(result),
+            );
+            let (k, out) = decode_mini(&mut cx, Some((Kind::Blob, &base)), &raw, ObjLabel::Offset(0))
+                .unwrap_or_else(|e| panic!("{mib} MiB base delta must decode: {e}"));
+            assert_eq!(k, Kind::Blob);
+            assert_eq!(out, result, "{mib} MiB base");
+        }
+    }
+
+    /// The NoGrow overflow fallback: a write past the reserved capacity
+    /// grows FALLIBLY — the fail hook's refusal surfaces as the in-band
+    /// memory Limit via mini_io, never Error::Internal — and with the
+    /// hook off the same write lands after a real reservation.
+    #[test]
+    fn mini_write_overflow_grows_fallibly_or_limits() {
+        use std::io::Write as _;
+        // hook refuses the growth -> WriteZero -> mini_io -> the Limit
+        let mut v: Vec<u8> = Vec::with_capacity(8);
+        v.extend_from_slice(&[0u8; 8]);
+        crate::try_grow::fail_above(Some(16));
+        let err = {
+            let mut w = NoGrow(&mut v);
+            w.write_all(&[1u8; 32]).unwrap_err()
+        };
+        crate::try_grow::fail_above(None);
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero, "{err}");
+        assert!(crate::try_grow::is_retry(&mini_io(err)), "refused growth must be the in-band Limit");
+        // hook off -> the overflow grows through try_grow and the write lands
+        let mut v: Vec<u8> = Vec::with_capacity(8);
+        v.extend_from_slice(&[0u8; 8]);
+        {
+            let mut w = NoGrow(&mut v);
+            w.write_all(&[1u8; 32]).unwrap();
+        }
+        assert_eq!(v.len(), 40);
+        assert_eq!(&v[8..], &[1u8; 32]);
     }
 
     /// The preflight projects live + incoming: a decode whose working set
