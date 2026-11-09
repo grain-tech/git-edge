@@ -743,7 +743,11 @@ impl AnySink<'_, '_> {
             AnySink::Edge(s) => s.post(rows, budget).await,
             AnySink::Job(s) => s.post(rows, budget).await,
             #[cfg(test)]
-            AnySink::Mem(_) => Ok(()),
+            AnySink::Mem(s) => {
+                s.posts += 1;
+                s.rows.extend_from_slice(rows);
+                Ok(())
+            }
         }
     }
     /// Preflight bytes for `post(rows)`: the largest single index post's
@@ -771,7 +775,7 @@ impl AnySink<'_, '_> {
             AnySink::Edge(_) => super::run::INDEX_BATCH,
             AnySink::Job(_) => 10_000,
             #[cfg(test)]
-            AnySink::Mem(_) => super::run::INDEX_BATCH,
+            AnySink::Mem(s) => s.batch.unwrap_or(super::run::INDEX_BATCH),
         }
     }
     /// 2.5 links bookkeeping — bounded by MAX_LINKS either way.
@@ -872,6 +876,9 @@ pub struct MemSink {
     pub tags: HashMap<ObjectId, ObjectId>,
     pub rows: Vec<ObjRow>,
     pub posts: usize,
+    /// Rows per flush — None is the edge's INDEX_BATCH; tests lower it to
+    /// drive the index-post preflights with a handful of entries.
+    pub batch: Option<usize>,
 }
 
 /// DO-side sink for the import job: objects rows and links batches go straight
@@ -1001,17 +1008,10 @@ impl Cx<'_> {
     /// before control returns to the boundary guard. Sheds the cache over
     /// MEM_SOFT (hysteresis) and fails in-band over MEM_HARD / the linear
     /// trip. A no-op on the DO path (`mem` is `None` there).
-    fn mem_relief(&mut self) -> Result<(), Error> {
-        if let Some(m) = self.mem.as_mut() {
-            mem_guard(
-                &mut self.cache,
-                crate::mem::live_bytes,
-                crate::mem::linear_bytes,
-                receive_packs,
-                m,
-            )?;
-        }
-        Ok(())
+    /// `site` tags the test probe — every call site has its own tag, so
+    /// deleting any single relief call fails its test.
+    fn mem_relief(&mut self, site: &'static str) -> Result<(), Error> {
+        self.mem_grow(0, None, site)
     }
 
     /// The single entry point every large pass-B allocation preflights
@@ -1366,7 +1366,7 @@ pub async fn resolve_at(
         // window, cache, and decode buffers before control returns to the
         // entry-boundary guard — shed over MEM_SOFT / fail over MEM_HARD
         // right here, before the body joins `chain` or a decode grows
-        cx.mem_relief()?;
+        cx.mem_relief("relief:chain-fetch")?;
         // the chain holds each delta's compressed bytes: 64 × ~16 MiB worst case is a
         // GiB-scale allocation — bound the bytes, not just the depth. chain_live bounds
         // the SAME memory summed across every nested resolve_at frame.
@@ -1397,7 +1397,7 @@ pub async fn resolve_at(
                 }
                 // decode_mini grows the re-deflated base plus the delta
                 // body plus the output object — it preflights its own bound
-                cx.mem_relief()?;
+                cx.mem_relief("relief:chain-base")?;
                 let (k, d) = decode_mini(cx, None, &raw, ObjLabel::Offset(off))?;
                 break cx.cache_put(Key::Off(off), k, d, "grow:cache-chain-base")?;
             }
@@ -1406,7 +1406,7 @@ pub async fn resolve_at(
     while let Some((o, raw)) = chain.pop() {
         // each apply decodes a <= 16 MiB object on top of the bytes the
         // rest of the chain still retains — same in-walk relief
-        cx.mem_relief()?;
+        cx.mem_relief("relief:chain-apply")?;
         let (_, d) = decode_mini(cx, Some((kind, &data)), &raw, ObjLabel::Offset(o))?;
         data = cx.cache_put(Key::Off(o), kind, d, "grow:cache-chain")?.1;
     }
@@ -1544,6 +1544,9 @@ impl ObjLabel {
 /// the clear earns the client an in-band Limit. The message is honest
 /// about cause: another receive-pack in flight means the isolate was busy
 /// — retry — while an alone push really is too big for one request.
+/// Test-only: production relief goes through `Cx::mem_relief` with a
+/// per-site tag.
+#[cfg(test)]
 fn mem_guard(
     cache: &mut Cache,
     live: impl Fn() -> usize,
@@ -1846,7 +1849,7 @@ pub async fn resolve_and_normalize<O: PackOut>(
     order.extend(0..entries.len());
     let mut i = 0;
     while i < order.len() {
-        cx.mem_relief()?;
+        cx.mem_relief("relief:loop")?;
         let at = order[i];
         i += 1;
         match one_entry(&mut cx, &toc, at, need_ids, out, sink, &mut rows, budget, 0).await? {
@@ -1930,7 +1933,7 @@ pub async fn one_entry<O: PackOut>(
     }
     // the entry's own decode grows re-deflated base + body + output on top
     // of whatever the base walk just retained — last in-walk relief point
-    cx.mem_relief()?;
+    cx.mem_relief("relief:entry")?;
     let (kind, data) =
         decode_mini(cx, base.as_ref().map(|(k, d)| (*k, d.as_slice())), &raw, ObjLabel::Offset(rec.offset))?;
     let id = gix_object::compute_hash(cx.obj_kind, kind, &data).map_err(|_| unpack("hash collision"))?;
@@ -2897,6 +2900,7 @@ mod tests {
 
     /// One raw delta-entry body: `varint(base) varint(result) ops` zlib'd,
     /// headed by `hdr` — the wire bytes Window::entry returns for a delta.
+    /// The header's size is the delta stream's length, as git writes it.
     fn mk_delta_raw(hdr: Header, base_size: u64, result_size: u64, ops: &[u8]) -> Vec<u8> {
         use std::io::Write as _;
         let mut d = Vec::new();
@@ -2909,8 +2913,10 @@ mod tests {
             w.write_all(&d).unwrap();
             std::io::Write::flush(&mut w).unwrap();
         }
+        // a pack entry header carries the DECOMPRESSED stream length — for
+        // a delta that is the instruction stream, not the result object
         let mut raw = Vec::new();
-        hdr.write_to(result_size, &mut raw).unwrap();
+        hdr.write_to(d.len() as u64, &mut raw).unwrap();
         raw.extend_from_slice(&body);
         raw
     }
@@ -2983,48 +2989,102 @@ mod tests {
             r.offset.saturating_add(u64::from(r.header_len)).saturating_add(u64::from(r.compressed_len)).saturating_add(20)
         })
     }
-    /// The blobs-only pack exercises the whole per-entry spine: relief at
-    /// the boundary, the prefetch batch guard, the window fetch, the
-    /// decode, links extract+sink, writer growth and flush, order/pending.
+    /// Assert every tag in `want` was recorded by the probe.
+    fn assert_sites(want: &[&str]) {
+        let tags = sites_of(&preflight_sites());
+        for w in want {
+            assert!(tags.contains(w), "missing preflight site {w} in {tags:?}");
+        }
+    }
+
+    /// A minimal annotated tag object naming `target`.
+    fn tag_bytes(target: &ObjectId) -> Vec<u8> {
+        format!("object {target}\ntype blob\ntag v1\ntagger T <t@e> 0 +0000\n\nmsg\n").into_bytes()
+    }
+
+    /// The per-entry spine records every one of its sites: relief at the
+    /// loop and before the entry's decode, the prefetch batch guard, the
+    /// window fetch, the decode, links extract+sink, the tag map, writer
+    /// growth and flush, the cache put, the index post (batch 1 so every
+    /// entry flushes), and order/pending.
     #[test]
     fn resolve_records_every_entry_site() {
         let blob = b"hello world, this is a blob".as_slice();
-        let (pack, recs) = mk_pack(&[(Kind::Blob, blob), (Kind::Blob, b"second blob")]);
+        let blob_id = gix_object::compute_hash(H::Sha1, Kind::Blob, blob).unwrap();
+        let tag = tag_bytes(&blob_id);
+        let (pack, recs) = mk_pack(&[(Kind::Blob, blob), (Kind::Blob, b"second blob"), (Kind::Tag, &tag)]);
         let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
         let key = "pending/p1.pack";
         let repo = crate::store::RepoId("o/r".into());
         let mut mem = MemReads::new(repo);
         mem.put(key, pack);
         let mut out = MemPackOut { buf: Vec::new() };
-        let mut sink = MemSink::default();
+        let mut sink = MemSink { batch: Some(1), ..MemSink::default() };
         clear_preflights();
         let res = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
         res.unwrap();
-        let tags = sites_of(&preflight_sites());
-        for want in [
-            "relief",
+        assert_sites(&[
+            "relief:loop",
+            "relief:entry",
             "entries:prefetch",
             "fetch:entry",
             "decode:mini",
             "grow:links-extract",
             "grow:links-sink",
+            "grow:tags",
             "grow:writer-entry",
             "grow:writer-flush",
+            "grow:cache-entry",
+            "grow:index-entry",
             "grow:order",
-        ] {
-            assert!(tags.contains(&want), "missing preflight site {want} in {tags:?}");
-        }
+        ]);
+        let tags = sites_of(&preflight_sites());
         // no ref-deltas -> no by_id reserve, no chain walk, no external fetch
         assert!(!tags.contains(&"grow:by_id"), "{tags:?}");
         assert!(!tags.contains(&"fetch:chain"), "{tags:?}");
         assert!(!tags.contains(&"entries:external"), "{tags:?}");
         assert!(out.buf.len() > 12, "writer emitted pack bytes");
+        assert_eq!(sink.posts, 3, "batch 1: one index post per entry");
+        assert_eq!(sink.tags.len(), 1, "the tag was recorded");
     }
 
-    /// An ofs-delta chain walks resolve_at: the chain fetch, the in-walk
-    /// reliefs, and both decode_mini hops are all preflighted sites. Driven
-    /// directly — through the orchestrated loop the base is always cache-
-    /// hot by the time the delta resolves, so fetch:chain never iterates.
+    /// Codex #7 / Claude #6: a blob over MAX_OBJ rides stream_blob — every
+    /// grow:blob-* site and its index post preflight fire, and the streamed
+    /// object hashes to the right id.
+    #[test]
+    fn stream_blob_records_every_blob_site() {
+        let big = vec![0u8; MAX_OBJ as usize + 1];
+        let (pack, recs) = mk_pack(&[(Kind::Blob, &big)]);
+        assert!(recs[0].size > MAX_OBJ, "the fixture must take the streaming path");
+        let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
+        let key = "pending/p6.pack";
+        let repo = crate::store::RepoId("o/r".into());
+        let mut mem = MemReads::new(repo);
+        mem.put(key, pack);
+        let mut out = MemPackOut { buf: Vec::new() };
+        let mut sink = MemSink { batch: Some(1), ..MemSink::default() };
+        clear_preflights();
+        let rows = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
+        rows.unwrap();
+        assert_sites(&[
+            "relief:loop",
+            "grow:blob-hdr",
+            "grow:blob-sinkbuf",
+            "grow:blob-chunk",
+            "grow:blob-raw",
+            "grow:blob-flush",
+            "grow:index-blob",
+        ]);
+        assert!(!sites_of(&preflight_sites()).contains(&"decode:mini"), "a streamed blob never decodes whole");
+        assert_eq!(sink.rows.len(), 1);
+        assert_eq!(sink.rows[0].sha, gix_object::compute_hash(H::Sha1, Kind::Blob, &big).unwrap());
+    }
+
+    /// An ofs-delta chain walks resolve_at: the chain fetch with its
+    /// relief, the base decode with its relief and cache put, and the
+    /// delta apply with its relief and cache put. Driven directly —
+    /// through the orchestrated loop the base is always cache-hot by the
+    /// time the delta resolves, so fetch:chain never iterates.
     #[test]
     fn ofs_delta_chain_records_chain_sites() {
         let base = b"the quick brown fox jumps over".as_slice();
@@ -3054,20 +3114,31 @@ mod tests {
         clear_preflights();
         let mut budget = test_budget();
         // resolve the DELTA entry itself: resolve_at walks its chain back
-        // to the base — every hop's fetch/decode is a preflight site. The
-        // hand-built delta may fail to fully apply; the sites already ran.
+        // to the base and applies it — it must succeed
         let mut cx = test_cx(&mem, key, pack_len_of(&recs), Externals::Map(&empty));
-        let _ = block_on(resolve_at(&mut cx, &toc, delta_off, &mut budget));
-        let tags = sites_of(&preflight_sites());
-        for want in ["fetch:chain", "decode:mini", "relief"] {
-            assert!(tags.contains(&want), "missing {want} in {tags:?}");
+        let got = block_on(resolve_at(&mut cx, &toc, delta_off, &mut budget)).unwrap();
+        match got {
+            Base::Ready((k, data)) => {
+                assert_eq!(k, Kind::Blob);
+                assert_eq!(data.as_slice(), base);
+            }
+            Base::Await(id) => panic!("unexpected await on {id}"),
         }
+        assert_sites(&[
+            "fetch:chain",
+            "relief:chain-fetch",
+            "relief:chain-base",
+            "relief:chain-apply",
+            "decode:mini",
+            "grow:cache-chain-base",
+            "grow:cache-chain",
+        ]);
     }
 
     /// A ref-delta to an external (repo-resident) base drives external():
-    /// the entries preflight, the decode preflight, the by_id reserve —
-    /// and the pack's own ref-delta sets need_ids. external() is driven
-    /// directly because the orchestrated prefetch caches the base first.
+    /// the entries preflight, the decode preflight and the cache put.
+    /// external() is driven directly because the orchestrated prefetch
+    /// caches the base first.
     #[test]
     fn ref_delta_external_records_external_sites() {
         let base = b"external base object".as_slice();
@@ -3091,14 +3162,14 @@ mod tests {
         clear_preflights();
         let mut budget = test_budget();
         let mut cx = test_cx(&mem, &ext_key, 1 << 20, Externals::Map(&ext));
-        let _ = block_on(external(&mut cx, base_id, &mut budget));
-        let tags = sites_of(&preflight_sites());
-        for want in ["entries:external", "decode:external"] {
-            assert!(tags.contains(&want), "missing {want} in {tags:?}");
-        }
+        let (k, data) = block_on(external(&mut cx, base_id, &mut budget)).unwrap();
+        assert_eq!(k, Kind::Blob);
+        assert_eq!(data.as_slice(), base);
+        assert_sites(&["entries:external", "decode:external", "grow:cache-external"]);
     }
 
-    /// The orchestrated ref-delta still proves the by_id reserve + the
+    /// The orchestrated ref-delta resolves end to end and proves the by_id
+    /// reserve, the prefetch batch (fetch, decode, cache put) and the
     /// per-entry spine fire on the edge path.
     #[test]
     fn ref_delta_orchestrated_records_by_id_and_entry_sites() {
@@ -3138,16 +3209,23 @@ mod tests {
         let mut out = MemPackOut { buf: Vec::new() };
         let mut sink = MemSink::default();
         clear_preflights();
-        let _res = block_on(drive(&mem, key, &recs, Externals::Map(&ext), &mut out, &mut sink));
-        let tags = sites_of(&preflight_sites());
-        for want in ["grow:by_id", "fetch:entry", "decode:mini", "entries:prefetch", "decode:prefetch"] {
-            assert!(tags.contains(&want), "missing {want} in {tags:?}");
-        }
+        let rows = block_on(drive(&mem, key, &recs, Externals::Map(&ext), &mut out, &mut sink)).unwrap();
+        assert_eq!(rows.len(), 1, "the delta resolved against the prefetched base");
+        assert_eq!(rows[0].sha, base_id, "an insert-all delta reproduces the base");
+        assert_sites(&[
+            "grow:by_id",
+            "fetch:entry",
+            "decode:mini",
+            "entries:prefetch",
+            "decode:prefetch",
+            "grow:cache-prefetch",
+        ]);
     }
 
     /// A forward ref-delta (base is a LATER pack entry) exercises the
     /// Await -> pending -> re-queue path: the entry defers, the base
-    /// resolves, the waiter wakes and completes.
+    /// resolves, the waiter wakes and completes — resolution must succeed
+    /// before the probes count.
     #[test]
     fn forward_ref_delta_awaits_and_resolves() {
         let base = b"forward base payload".as_slice();
@@ -3189,13 +3267,14 @@ mod tests {
         let mut out = MemPackOut { buf: Vec::new() };
         let mut sink = MemSink::default();
         clear_preflights();
-        let res = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
-        // the forward ref may or may not fully resolve depending on delta
-        // wire details — the by_id reserve + fetch preflights already ran
-        let _ = res;
-        let tags = sites_of(&preflight_sites());
-        assert!(tags.contains(&"grow:by_id"), "{tags:?}");
-        assert!(tags.contains(&"fetch:entry"), "{tags:?}");
+        let rows = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink))
+            .expect("the forward ref-delta must resolve");
+        assert_eq!(rows.len(), 2, "both entries emitted");
+        // the base (idx 1) resolves first, then the woken delta (idx 0)
+        assert_eq!(rows[0].idx, 1);
+        assert_eq!(rows[1].idx, 0);
+        assert_eq!(rows[1].sha, base_id, "the delta reproduces its base");
+        assert_sites(&["grow:by_id", "fetch:entry", "grow:order"]);
     }
 
     /// Forced pressure through the REAL path: a live-bytes override over
