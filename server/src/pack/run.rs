@@ -186,12 +186,11 @@ pub async fn run(
     };
     drop(entries);
     drop(external);
-    let meta = finish_writer(out, budget).await?; // section 3 (1): pack durable in R2
+    let meta = crate::store::finish_writer(out, budget).await?; // section 3 (1): pack durable in R2
     // the tail rows' serialization is pass-B memory too: preflight the
     // largest post before any body is built
     let bound = sink.post_bound(&meta, &tail)?;
-    super::ingest::mem_preflight(budget.lease.as_ref(), bound, "grow:index-final")?;
-    sink.post_meta(&meta, &tail, budget).await?; // section 3 (2): tail rows + real meta
+    post_final(bound, budget.lease.clone(), || sink.post_meta(&meta, &tail, budget)).await?; // section 3 (2): tail rows + real meta
     drop(permit); // the gated span ends here; the link check below is light
     let mut links = std::mem::take(&mut sink.links);
     links.sort_unstable();
@@ -210,8 +209,9 @@ pub async fn run(
 }
 
 /// The thin-pack base id list: count first (no allocation), preflight
-/// and reserve once, then sort+dedup. run() needs the list, so the
-/// "grow:bases" preflight cannot drop out of run() while the list stays.
+/// and reserve once, then sort+dedup. The "grow:bases" preflight lives
+/// inside this step — the only place run() builds the list — and the
+/// reservation tests pin it here.
 fn collect_bases(entries: &[super::ingest::EntryRec], lease: Option<&Rc<Lease>>) -> Result<Vec<ObjectId>, Error> {
     let base_of = |r: &super::ingest::EntryRec| match r.kind_or_delta {
         Header::RefDelta { base_id } => Some(base_id),
@@ -230,43 +230,24 @@ fn collect_bases(entries: &[super::ingest::EntryRec], lease: Option<&Rc<Lease>>)
     Ok(bases)
 }
 
-/// The writer steps `finish_writer` needs: PackWriter in production, an
-/// in-memory fake in native tests.
-trait FinishWriter {
-    fn finish_bound(&self) -> usize;
-    async fn abort(self);
-    async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error>;
-}
-impl FinishWriter for PackWriter {
-    fn finish_bound(&self) -> usize {
-        PackWriter::finish_bound(self)
-    }
-    async fn abort(self) {
-        PackWriter::abort(self).await
-    }
-    async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
-        PackWriter::finish(self, budget).await
-    }
-}
-
-/// Finish the pack writer. finish grows the part buffer for the trailer
-/// and splits one part off it: the "grow:writer-finish" preflight prices
-/// both while the upload can still abort cleanly. The growth itself is
-/// fallible too, and finish aborts on its failure. run() needs the
-/// PackMeta, so the preflight cannot drop out of run() while finish stays.
-async fn finish_writer<W: FinishWriter>(out: W, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
-    if let Err(e) = super::ingest::mem_preflight(budget.lease.as_ref(), out.finish_bound(), "grow:writer-finish") {
-        out.abort().await;
-        return Err(e);
-    }
-    out.finish(budget).await
+/// The final index post's memory guard as one step: `bound` is priced by
+/// the caller, the "grow:index-final" preflight runs inside, and `post`
+/// runs last — the result run() needs is the post's own Ok, so the
+/// preflight cannot drop out while the post stays on this path.
+async fn post_final<F, Fut>(bound: usize, lease: Option<Rc<Lease>>, post: F) -> Result<(), Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), Error>>,
+{
+    super::ingest::mem_preflight(lease.as_ref(), bound, "grow:index-final")?;
+    post().await
 }
 
 /// Move one lookup's hits into the externals map: the "grow:externals"
 /// preflight admits the map's growth for them, then the growth is
 /// reserved fallibly before any row moves in. A refusal leaves the map
-/// as it was. run() fills the map only here, so the preflight cannot drop
-/// out of run() while the map is filled.
+/// as it was. The preflight lives inside this step — the only place run()
+/// fills the map — and the reservation tests pin it here.
 fn add_externals(
     external: &mut HashMap<ObjectId, ObjLoc>,
     found: Vec<(ObjectId, Option<ObjLoc>)>,
@@ -1001,7 +982,7 @@ mod tests {
         bound: usize,
         done: Rc<Cell<&'static str>>,
     }
-    impl FinishWriter for FakeOut {
+    impl crate::store::FinishWriter for FakeOut {
         fn finish_bound(&self) -> usize {
             self.bound
         }
@@ -1072,7 +1053,7 @@ mod tests {
         let done = Rc::new(Cell::new(""));
         let mut budget = test_budget();
         let out = FakeOut { bound: 1 << 20, done: done.clone() };
-        block_on(finish_writer(out, &mut budget)).unwrap();
+        block_on(crate::store::finish_writer(out, &mut budget)).unwrap();
         assert_eq!(done.get(), "finish");
         let sites = crate::pack::ingest::preflight_sites();
         let tags: Vec<_> = sites.iter().map(|(t, _)| *t).collect();
@@ -1088,9 +1069,39 @@ mod tests {
         crate::mem::set_live_override(Some(std::rc::Rc::new(|| 200 << 20)));
         let done = Rc::new(Cell::new(""));
         let mut budget = test_budget();
-        let res = block_on(finish_writer(FakeOut { bound: 1 << 20, done: done.clone() }, &mut budget));
+        let res = block_on(crate::store::finish_writer(FakeOut { bound: 1 << 20, done: done.clone() }, &mut budget));
         assert!(matches!(res, Err(Error::Limit(_))), "a refused finish preflight is the Limit");
         assert_eq!(done.get(), "abort");
+    }
+
+    /// The final index post's guard is one step: a refused "grow:index-final"
+    /// preflight is the Limit and the post never runs; an admitted one
+    /// records the tag with the priced bound.
+    #[test]
+    fn final_index_post_preflights_before_posting() {
+        let _guard = crate::try_grow::HookGuard;
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 50 << 20)));
+        crate::pack::ingest::clear_preflights();
+        let posted = Rc::new(Cell::new(false));
+        let p = posted.clone();
+        let err = block_on(post_final(47 << 20, None, || {
+            p.set(true);
+            async { Ok(()) }
+        }))
+        .unwrap_err();
+        assert!(matches!(err, Error::Limit(_)), "{err}");
+        assert!(!posted.get(), "the post must not run past a refused preflight");
+        assert_eq!(crate::pack::ingest::preflight_sites(), vec![("grow:index-final", 47 << 20)]);
+        crate::pack::ingest::clear_preflights();
+        let posted = Rc::new(Cell::new(false));
+        let p = posted.clone();
+        block_on(post_final(8 << 20, None, || {
+            p.set(true);
+            async { Ok(()) }
+        }))
+        .unwrap();
+        assert!(posted.get());
+        assert_eq!(crate::pack::ingest::preflight_sites(), vec![("grow:index-final", 8 << 20)]);
     }
 
     /// The externals map's growth for a lookup's hits is

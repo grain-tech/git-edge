@@ -962,7 +962,9 @@ impl PackWriter {
         finish_growth(&self.part, self.part_size, self.kind.len_in_bytes())
     }
     /// Trailer, last part, complete. When this returns the pack is durable: section 3 step 1.
-    pub async fn finish(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+    /// Private: the edge push finishes only through `finish_writer` (the
+    /// "grow:writer-finish" preflight), the GC build through `finish_pack`.
+    async fn finish(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
         if let Err(e) = self.finish_inner(budget).await {
             // a dropped MultipartUpload leaves the upload and its parts orphaned in
             // R2 — abort on any mid-finish failure. A failed complete() consumes the
@@ -1183,6 +1185,45 @@ impl PackWriter {
             part_size: PART,
         })
     }
+}
+
+/// The GC build's finish — the ordinary abort-on-failure contract, without
+/// the edge push's memory preflight.
+pub async fn finish_pack(out: PackWriter, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+    out.finish(budget).await
+}
+
+/// The writer steps `finish_writer` needs: PackWriter in production, an
+/// in-memory fake in native tests.
+pub(crate) trait FinishWriter {
+    fn finish_bound(&self) -> usize;
+    async fn abort(self);
+    async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error>;
+}
+impl FinishWriter for PackWriter {
+    fn finish_bound(&self) -> usize {
+        PackWriter::finish_bound(self)
+    }
+    async fn abort(self) {
+        PackWriter::abort(self).await
+    }
+    async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+        PackWriter::finish(self, budget).await
+    }
+}
+
+/// Finish the pack writer. finish_inner grows the part buffer for the
+/// trailer and splits one part off it: the "grow:writer-finish" preflight
+/// prices both while the upload can still abort cleanly. The growth
+/// itself is fallible too, and finish aborts on its failure. run() needs
+/// the PackMeta; PackWriter::finish is private, so this preflighted
+/// wrapper is the only finish run() can reach.
+pub(crate) async fn finish_writer<W: FinishWriter>(out: W, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+    if let Err(e) = crate::pack::ingest::mem_preflight(budget.lease.as_ref(), out.finish_bound(), "grow:writer-finish") {
+        out.abort().await;
+        return Err(e);
+    }
+    out.finish(budget).await
 }
 
 fn i(n: u64) -> Result<V, Error> {

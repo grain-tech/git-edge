@@ -1267,7 +1267,7 @@ async fn build(
                 None => {
                     Index(sql).insert_objects(&PackId(pos.pack.clone()), &staged)?;
                     staged.clear();
-                    return match out.finish(&mut budget.req).await {
+                    return match crate::store::finish_pack(out, &mut budget.req).await {
                         Ok(meta) => {
                             // R12: after the MPU completes, before the swap's final
                             // fence — the pause a push or clone interleaves through
