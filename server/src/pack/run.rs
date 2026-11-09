@@ -136,20 +136,7 @@ pub async fn run(
     let (entries, _) = super::ingest::stream_to_pending(body, bucket, push, kind, budget).await?;
     // thin-pack bases: count first (no allocation), then preflight and
     // reserve the id list once
-    let base_of = |r: &super::ingest::EntryRec| match r.kind_or_delta {
-        Header::RefDelta { base_id } => Some(base_id),
-        _ => None,
-    };
-    let n_bases = entries.iter().filter(|r| base_of(r).is_some()).count();
-    super::ingest::mem_preflight(
-        budget.lease.as_ref(),
-        crate::store::growth_incoming(n_bases.saturating_mul(std::mem::size_of::<ObjectId>())),
-        "grow:bases",
-    )?;
-    let mut bases: Vec<ObjectId> = crate::try_grow::with_capacity(n_bases)?;
-    bases.extend(entries.iter().filter_map(base_of));
-    bases.sort_unstable();
-    bases.dedup();
+    let bases = collect_bases(&entries, budget.lease.as_ref())?;
     let mut external: HashMap<ObjectId, ObjLoc> = HashMap::new();
     for chunk in bases.chunks(1_000) {
         // one lookup's response (<= 1,000 locs) is deserialized from the
@@ -157,9 +144,7 @@ pub async fn run(
         // reserved before the rows move in
         let found = lookup(stub, repo, chunk, None, budget).await?;
         let lease = budget.lease.clone();
-        add_externals(&mut external, found, |n| {
-            super::ingest::mem_preflight(lease.as_ref(), n, "grow:externals")
-        })?;
+        add_externals(&mut external, found, |n| externals_growth_preflight(lease.as_ref(), n))?;
     }
     let pack = PackId::random()?;
     let mut sink = IndexSink { stub, repo, pack: pack.clone(), push: push.clone(), links: Vec::new(), tags: HashMap::new() };
@@ -205,7 +190,7 @@ pub async fn run(
     // finish grows the part buffer for the trailer and splits one part off
     // it: preflight both while the upload can still abort cleanly (the
     // growth itself is fallible too, and finish aborts on its failure)
-    if let Err(e) = super::ingest::mem_preflight(budget.lease.as_ref(), out.finish_bound(), "grow:writer-finish") {
+    if let Err(e) = writer_finish_preflight(out.finish_bound(), budget.lease.as_ref()) {
         out.abort().await;
         return Err(e);
     }
@@ -230,6 +215,37 @@ pub async fn run(
         }
     }
     Ok((Some(pack), std::mem::take(&mut sink.tags))) // section 3 (3) is the caller's commit
+}
+
+/// The thin-pack base id list: count first (no allocation), preflight
+/// and reserve once, then sort+dedup. Extracted so the "grow:bases"
+/// preflight's call site is native-testable.
+fn collect_bases(entries: &[super::ingest::EntryRec], lease: Option<&Rc<Lease>>) -> Result<Vec<ObjectId>, Error> {
+    let base_of = |r: &super::ingest::EntryRec| match r.kind_or_delta {
+        Header::RefDelta { base_id } => Some(base_id),
+        _ => None,
+    };
+    let n_bases = entries.iter().filter(|r| base_of(r).is_some()).count();
+    super::ingest::mem_preflight(
+        lease,
+        crate::store::growth_incoming(n_bases.saturating_mul(std::mem::size_of::<ObjectId>())),
+        "grow:bases",
+    )?;
+    let mut bases: Vec<ObjectId> = crate::try_grow::with_capacity(n_bases)?;
+    bases.extend(entries.iter().filter_map(base_of));
+    bases.sort_unstable();
+    bases.dedup();
+    Ok(bases)
+}
+
+/// The externals map's growth preflight — the "grow:externals" tag.
+fn externals_growth_preflight(lease: Option<&Rc<Lease>>, n: usize) -> Result<(), Error> {
+    super::ingest::mem_preflight(lease, n, "grow:externals")
+}
+
+/// The writer's finish growth preflight — the "grow:writer-finish" tag.
+fn writer_finish_preflight(bound: usize, lease: Option<&Rc<Lease>>) -> Result<(), Error> {
+    super::ingest::mem_preflight(lease, bound, "grow:writer-finish")
 }
 
 /// Move one lookup's hits into the externals map: `preflight` admits the
@@ -962,6 +978,34 @@ async fn admit_pass_b(env: &Env, budget: &ReqBudget, objects: usize, pack_bytes:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three run()-side growth preflights each record their tag through
+    /// the real helpers run() calls: deleting the mem_preflight inside any
+    /// of them removes the record and fails here.
+    #[test]
+    fn run_side_growth_preflights_record_their_tags() {
+        use gix_pack::data::entry::Header;
+        let id = |n: u32| {
+            let mut b = [0u8; 20];
+            b[..4].copy_from_slice(&n.to_be_bytes());
+            ObjectId::from_bytes_or_panic(&b)
+        };
+        let entries = vec![
+            super::super::ingest::EntryRec { offset: 12, header_len: 5, kind_or_delta: Header::RefDelta { base_id: id(1) }, compressed_len: 10, size: 4 },
+            super::super::ingest::EntryRec { offset: 30, header_len: 5, kind_or_delta: Header::RefDelta { base_id: id(2) }, compressed_len: 10, size: 4 },
+        ];
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 16 << 20)));
+        crate::pack::ingest::clear_preflights();
+        let bases = collect_bases(&entries, None).unwrap();
+        assert_eq!(bases.len(), 2);
+        externals_growth_preflight(None, 1 << 20).unwrap();
+        writer_finish_preflight(1 << 20, None).unwrap();
+        crate::mem::set_live_override(None);
+        let tags: Vec<_> = crate::pack::ingest::preflight_sites().iter().map(|(t, _)| *t).collect();
+        for w in ["grow:bases", "grow:externals", "grow:writer-finish"] {
+            assert!(tags.contains(&w), "missing {w} in {tags:?}");
+        }
+    }
 
     /// Codex r8 #3: the externals map's growth for a lookup's hits is
     /// preflighted (misses cost nothing) and reserved fallibly; a refusal

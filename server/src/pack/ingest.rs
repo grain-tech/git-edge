@@ -3579,7 +3579,97 @@ mod tests {
             "entries:prefetch",
             "decode:prefetch",
             "grow:cache-prefetch",
+            "grow:prefetch-meta",
         ]);
+    }
+
+    /// Fail-hook sweep over the real resolve loop: a pack mixing a plain
+    /// blob, an ofs-delta chain and a ref-delta to an external base, run
+    /// with the fail hook at each threshold. EVERY refusal must be the
+    /// in-band memory Limit — never Internal, never a panic — and at
+    /// least the smallest thresholds must actually refuse (the hook
+    /// engages). A site swapped back to an infallible push/with_capacity
+    /// allocates outside the hook and shows up as an Ok (or a later,
+    /// different failure) at its threshold.
+    #[test]
+    fn resolve_fail_hook_sweep_is_always_the_in_band_limit() {
+        let base = b"sweep base payload".as_slice();
+        let base_id = gix_object::compute_hash(H::Sha1, Kind::Blob, base).unwrap();
+        let d = base.len();
+        // entry 0: the plain base; entry 1: ofs-delta over it; entry 2:
+        // ref-delta to an external base — exercises chain walk + prefetch
+        let (pack, recs) = {
+            let mut p = b"PACK\0\0\0\x02\0\0\0\x00".to_vec();
+            let mut rs = Vec::new();
+            let off = p.len() as u64;
+            let mut enc = Vec::new();
+            codec::encode_entry(Kind::Blob, base, &mut enc).unwrap();
+            let e = PackEntry::from_bytes(&enc, 0, H::Sha1).unwrap();
+            let hlen = e.header_size();
+            rs.push(EntryRec { offset: off, header_len: u8::try_from(hlen).unwrap(), kind_or_delta: e.header, compressed_len: u32::try_from(enc.len() - hlen).unwrap(), size: e.decompressed_size });
+            p.extend_from_slice(&enc);
+            let off1 = p.len() as u64;
+            let dist = off1 - off;
+            let raw_ofs = mk_delta_raw(Header::OfsDelta { base_distance: dist }, d as u64, d as u64, &insert_ops(base));
+            let e = PackEntry::from_bytes(&raw_ofs, 0, H::Sha1).unwrap();
+            let hlen = e.header_size();
+            rs.push(EntryRec { offset: off1, header_len: u8::try_from(hlen).unwrap(), kind_or_delta: Header::OfsDelta { base_distance: dist }, compressed_len: u32::try_from(raw_ofs.len() - hlen).unwrap(), size: e.decompressed_size });
+            p.extend_from_slice(&raw_ofs);
+            let off2 = p.len() as u64;
+            let raw_ref = mk_delta_raw(Header::RefDelta { base_id }, d as u64, d as u64, &insert_ops(base));
+            let e = PackEntry::from_bytes(&raw_ref, 0, H::Sha1).unwrap();
+            let hlen = e.header_size();
+            rs.push(EntryRec { offset: off2, header_len: u8::try_from(hlen).unwrap(), kind_or_delta: Header::RefDelta { base_id }, compressed_len: u32::try_from(raw_ref.len() - hlen).unwrap(), size: e.decompressed_size });
+            p.extend_from_slice(&raw_ref);
+            p[8..12].copy_from_slice(&3u32.to_be_bytes());
+            p.extend_from_slice(&[0u8; 20]);
+            (p, rs)
+        };
+        let mut ext: HashMap<ObjectId, ObjLoc> = HashMap::new();
+        ext.insert(base_id, ObjLoc {
+            pack: crate::store::PackId("extpack".into()),
+            idx: 0,
+            offset: 0,
+            len: 64,
+            kind: Kind::Blob,
+            size: base.len() as u64,
+        });
+        let mut base_enc = Vec::new();
+        codec::encode_entry(Kind::Blob, base, &mut base_enc).unwrap();
+        let key = "pending/sweep.pack";
+        let repo = crate::store::RepoId("o/r".into());
+        let mut mem = MemReads::new(repo.clone());
+        mem.put(key, pack);
+        mem.put(&crate::store::keys::pack(&repo, &crate::store::PackId("extpack".into())), base_enc);
+        let mut refused = 0usize;
+        for t in [
+            1usize << 10,
+            64 << 10,
+            256 << 10,
+            1 << 20,
+            4 << 20,
+            8 << 20,
+            16 << 20,
+            32 << 20,
+            64 << 20,
+        ] {
+            crate::try_grow::fail_above(Some(t));
+            let mut out = MemPackOut { buf: Vec::new() };
+            let mut sink = MemSink::default();
+            let res = block_on(drive(&mem, key, &recs, Externals::Map(&ext), &mut out, &mut sink));
+            crate::try_grow::fail_above(None);
+            match res {
+                Err(e) => {
+                    refused += 1;
+                    assert!(
+                        crate::try_grow::is_retry(&e),
+                        "threshold {t}: refusal must be the in-band Limit, got {e}"
+                    );
+                }
+                Ok(_) => {}
+            }
+        }
+        assert!(refused > 0, "the sweep must exercise refusals");
     }
 
     /// A forward ref-delta (base is a LATER pack entry) exercises the

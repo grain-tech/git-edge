@@ -43,25 +43,32 @@ pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) -> Result<(), E
     Ok(())
 }
 
-/// `resume_tail`'s state transition, factored so the reservation order is
-/// testable natively: the room the CLEARED buffer would need is reserved
-/// BEFORE `part` is cleared, so a refused reservation changes nothing —
-/// the buffered tail bytes and every counter the caller keeps stay as
-/// they were. Returns the writer's new (offset, count, commit_lo,
-/// commit_hi) only on success.
-fn resume_tail_apply(
-    part: &mut Vec<u8>,
-    part_size: usize,
-    bytes: &[u8],
+/// The writer counters `resume_tail` folds — grouped so the helper stays
+/// readable at the call site.
+#[derive(Clone, Copy, Debug)]
+struct TailState {
     offset: u64,
     count: u32,
     commit_lo: u64,
     commit_hi: u64,
+}
+
+/// `resume_tail`'s state transition, factored so the reservation order is
+/// testable natively: the room the CLEARED buffer would need is reserved
+/// BEFORE `part` is cleared, so a refused reservation changes nothing —
+/// the buffered tail bytes and every counter the caller keeps stay as
+/// they were. Returns the writer's new counters only on success.
+fn resume_tail_apply(
+    part: &mut Vec<u8>,
+    part_size: usize,
+    bytes: &[u8],
+    st: TailState,
     extra: u32,
     lo: u64,
     hi: u64,
-) -> Result<(u64, u32, u64, u64), Error> {
-    let new_offset = offset
+) -> Result<TailState, Error> {
+    let new_offset = st
+        .offset
         .saturating_sub(part.len() as u64)
         .saturating_add(bytes.len() as u64);
     // reserve exactly what room() would allocate for the cleared buffer —
@@ -72,12 +79,12 @@ fn resume_tail_apply(
     }
     part.clear();
     part.extend_from_slice(bytes);
-    Ok((
-        new_offset,
-        count.saturating_add(extra),
-        commit_lo.min(lo),
-        commit_hi.max(hi),
-    ))
+    Ok(TailState {
+        offset: new_offset,
+        count: st.count.saturating_add(extra),
+        commit_lo: st.commit_lo.min(lo),
+        commit_hi: st.commit_hi.max(hi),
+    })
 }
 
 /// Per-allocation overhead a growing buffer can add on top of its byte
@@ -875,22 +882,17 @@ impl PackWriter {
     /// the buffer. `extra`/`lo`/`hi` fold the tail's already-completed entries back
     /// into the writer's counters (their `ObjRow`s were posted at the yield).
     pub fn resume_tail(&mut self, bytes: &[u8], extra: u32, lo: u64, hi: u64) -> Result<(), Error> {
-        let (offset, count, commit_lo, commit_hi) = resume_tail_apply(
-            &mut self.part,
-            self.part_size,
-            bytes,
-            self.offset,
-            self.count,
-            self.commit_lo,
-            self.commit_hi,
-            extra,
-            lo,
-            hi,
-        )?;
-        self.offset = offset;
-        self.count = count;
-        self.commit_lo = commit_lo;
-        self.commit_hi = commit_hi;
+        let st = TailState {
+            offset: self.offset,
+            count: self.count,
+            commit_lo: self.commit_lo,
+            commit_hi: self.commit_hi,
+        };
+        let st = resume_tail_apply(&mut self.part, self.part_size, bytes, st, extra, lo, hi)?;
+        self.offset = st.offset;
+        self.count = st.count;
+        self.commit_lo = st.commit_lo;
+        self.commit_hi = st.commit_hi;
         Ok(())
     }
     /// Append raw pack bytes verbatim: any chunk of an entry's `varint header + zlib
@@ -2124,14 +2126,18 @@ mod tests {
         let tail = vec![7u8; 5 * 1024]; // bigger than the 4 KiB capacity -> must reserve
         // the cleared buffer needs one whole 8 KiB part — over capacity —
         // refuse anything under it
+        let st = TailState { offset, count, commit_lo: lo, commit_hi: hi };
         crate::try_grow::fail_above(Some(2 * 1024));
-        let e = resume_tail_apply(&mut part, 8 * 1024, &tail, offset, count, lo, hi, 1, 5, 30).unwrap_err();
+        let e = resume_tail_apply(&mut part, 8 * 1024, &tail, st, 1, 5, 30).unwrap_err();
         crate::try_grow::fail_above(None);
         assert!(crate::try_grow::is_retry(&e), "{e}");
         assert_eq!(part, vec![9u8; 100], "a refused reservation must not clear the part");
         // success: part holds only the tail; counters fold correctly
-        let (o, c, l, h) = resume_tail_apply(&mut part, 8 * 1024, &tail, offset, count, lo, hi, 1, 5, 30).unwrap();
+        let st = resume_tail_apply(&mut part, 8 * 1024, &tail, st, 1, 5, 30).unwrap();
         assert_eq!(part, tail);
-        assert_eq!((o, c, l, h), (offset - 100 + tail.len() as u64, 4, 5, 30));
+        assert_eq!(
+            (st.offset, st.count, st.commit_lo, st.commit_hi),
+            (offset - 100 + tail.len() as u64, 4, 5, 30)
+        );
     }
 }

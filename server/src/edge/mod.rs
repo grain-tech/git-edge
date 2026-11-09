@@ -540,7 +540,7 @@ async fn pack_get(req: &Request, env: &Env, _route: &RepoRoute, name: &str, spen
 /// POST /:owner/:repo/info/lfs/objects/batch — Git LFS batch API (#21, basic
 /// transfer). The operation picks the auth level: download needs read, upload
 /// needs write. The DO does existence checks + mints the signed `/_lfs/` URLs.
-async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+async fn lfs_batch(req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     // a batch spec is small JSON (≤100 objects typical) — cap before buffering
     let too_big = req
         .headers()
@@ -651,7 +651,7 @@ async fn lfs_object(req: Request, env: &Env, _route: &RepoRoute, oid: &str, op: 
 /// POST /:owner/:repo/_admin/tokens {name, level} — mint a per-repo credential.
 /// Global-write-token only (authenticate_admin): a repo-level token must not mint
 /// more credentials. The token value is returned once and only its hash is stored.
-async fn token_create(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
+async fn token_create(req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
     // {name, level} needs a few hundred bytes; cap before buffering the body whole
     let too_big = req
@@ -1087,7 +1087,7 @@ async fn import_status(req: &Request, env: &Env, route: &RepoRoute, push: &str, 
 /// auth even runs; on, the routes take the same global-write-token gate as the
 /// other _admin routes and forward verbatim to the DO's /_do/test/* handlers.
 /// fsck is a GET carrying ?mode= — the DO route reads it from a JSON body.
-async fn test_forward(mut req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
+async fn test_forward(req: Request, env: &Env, route: &RepoRoute, path: &str, spend: &Spend) -> Result<Response, Error> {
     if !crate::testhooks::env_flag(env, "GE_TEST_HOOKS") {
         return Err(Error::NotFound);
     }

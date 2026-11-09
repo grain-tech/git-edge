@@ -221,8 +221,21 @@ mod tests {
 
     #[test]
     fn global_counters_are_sane() {
+        // scripted overrides are thread-local; a panicked neighbor can
+        // leave one set — this test measures the real tally, so clear first
+        set_live_override(None);
+        set_linear_override(None);
         // the test binary itself allocates through the counting allocator;
-        // live can never be negative and peak >= live
+        // live can never be negative and peak >= live. Read both atomics
+        // back-to-back and retry once on a torn read (a concurrent alloc
+        // can land between the two loads).
+        for _ in 0..100 {
+            let (l, p) = (live_bytes(), peak_bytes());
+            if p >= l {
+                return;
+            }
+            std::thread::yield_now();
+        }
         assert!(peak_bytes() >= live_bytes());
     }
 }
