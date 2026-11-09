@@ -44,12 +44,22 @@ fn encoded_bound(n: usize) -> usize {
 }
 
 /// Split `buf` at `n`: the head becomes an owned Vec for upload while `buf`
-/// keeps the tail in a fresh tight allocation — the drain(..).collect()
-/// pattern this replaces held a second full-part copy AND memmoved the tail.
+/// keeps the tail. `split_off` allocates a tail-sized copy while the whole
+/// buffer is still live — the cheaper transient only when the tail is no
+/// bigger than the head. A bigger tail (the common case: one part out of a
+/// ~part-size+ buffer) instead copies the head out exact-size and memmoves
+/// the tail down inside the same allocation, peaking at capacity + n — the
+/// drain(..).collect() pattern's footprint without its second copy.
 /// Caller guarantees `n <= buf.len()`.
 fn split_part(buf: &mut Vec<u8>, n: usize) -> Vec<u8> {
-    let rest = buf.split_off(n);
-    std::mem::replace(buf, rest)
+    if buf.len().saturating_sub(n) <= n {
+        let rest = buf.split_off(n);
+        return std::mem::replace(buf, rest);
+    }
+    let head = buf[..n].to_vec();
+    buf.copy_within(n.., 0);
+    buf.truncate(buf.len() - n);
+    head
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -342,6 +352,17 @@ impl gix_object::Exists for MemFind {
     }
 }
 
+/// Coalesced-read merge rules (7.2): same-pack locs merge across gaps
+/// < READ_GAP while the merged span stays <= READ_SPAN. Shared by
+/// `read_entries` and `read_entries_bound` so the memory preflight cannot
+/// drift from the fetch it prices.
+const READ_GAP: u64 = 256 * 1024;
+const READ_SPAN: u64 = 8 << 20;
+/// Flat slack inside `read_entries_bound`: request/response plumbing and
+/// the JS-side copy bookkeeping the size terms don't name — the same role
+/// FETCH_SCRATCH plays for window fetches.
+const READ_SLACK: usize = 256 << 10;
+
 pub struct Bucket {
     pub inner: worker::Bucket,
     pub repo: RepoId,
@@ -382,8 +403,6 @@ impl Bucket {
         locs: &[(ObjectId, ObjLoc)],
         budget: &mut ReqBudget,
     ) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
-        const GAP: u64 = 256 * 1024;
-        const SPAN: u64 = 8 << 20;
         const MAX_READ: u64 = 48 << 20; // a single call must fit inside the isolate
         let mut sorted: Vec<&(ObjectId, ObjLoc)> = locs.iter().collect();
         sorted.sort_by(|a, b| (&a.1.pack.0, a.1.offset).cmp(&(&b.1.pack.0, b.1.offset)));
@@ -394,8 +413,8 @@ impl Bucket {
             while let Some(n) = sorted.get(j) {
                 let n_end = n.1.offset.saturating_add(u64::from(n.1.len));
                 if n.1.pack.0 != first.1.pack.0
-                    || n.1.offset.saturating_sub(end) >= GAP
-                    || n_end.saturating_sub(start) > SPAN
+                    || n.1.offset.saturating_sub(end) >= READ_GAP
+                    || n_end.saturating_sub(start) > READ_SPAN
                 {
                     break;
                 }
@@ -444,6 +463,46 @@ impl Bucket {
             }
         }
         Ok(out)
+    }
+
+    /// Peak heap `read_entries(locs)` adds, sized BEFORE the call allocates:
+    /// every loc's entry copy (`loc.len` wire bytes) stays alive in the
+    /// returned Vec, and ONE merged-span range buffer is live at a time —
+    /// the largest group's [start, end) under read_entries' own merge rules
+    /// (READ_GAP/READ_SPAN, same pack only). The walk below is that merge
+    /// minus the reads — keep it in step with read_entries. The sorted/out
+    /// vec headers and request plumbing ride in the per-loc term + READ_SLACK.
+    pub fn read_entries_bound(locs: &[(ObjectId, ObjLoc)]) -> usize {
+        let copies = locs.iter().fold(0usize, |n, (_, l)| n.saturating_add(l.len as usize));
+        let vecs = locs.len().saturating_mul(
+            std::mem::size_of::<(ObjectId, Vec<u8>)>()
+                .saturating_add(std::mem::size_of::<&ObjLoc>()),
+        );
+        let mut sorted: Vec<&ObjLoc> = locs.iter().map(|(_, l)| l).collect();
+        sorted.sort_by(|a, b| (&a.pack.0, a.offset).cmp(&(&b.pack.0, b.offset)));
+        let mut max_span = 0u64;
+        let mut i = 0usize;
+        while let Some(first) = sorted.get(i) {
+            let (start, mut end, mut j) =
+                (first.offset, first.offset.saturating_add(u64::from(first.len)), i + 1);
+            while let Some(n) = sorted.get(j) {
+                let n_end = n.offset.saturating_add(u64::from(n.len));
+                if n.pack.0 != first.pack.0
+                    || n.offset.saturating_sub(end) >= READ_GAP
+                    || n_end.saturating_sub(start) > READ_SPAN
+                {
+                    break;
+                }
+                end = end.max(n_end);
+                j += 1;
+            }
+            max_span = max_span.max(end.saturating_sub(start));
+            i = j;
+        }
+        copies
+            .saturating_add(usize::try_from(max_span).unwrap_or(usize::MAX))
+            .saturating_add(vecs)
+            .saturating_add(READ_SLACK)
     }
     /// <= 1000 keys per call (R2 delete_multiple).
     pub async fn delete(&self, keys: &[String]) -> Result<(), Error> {
@@ -1565,6 +1624,81 @@ mod tests {
         flat.extend_from_slice(&buf);
         assert_eq!(flat, (0..41u8).collect::<Vec<_>>(), "bytes and order preserved");
         assert!(buf.capacity() <= buf.len() + 16, "tail must not keep the part buffer");
+    }
+
+    /// The two split_part branches pick the cheaper transient: a tail no
+    /// bigger than the head takes split_off's tail-sized copy (the head
+    /// keeps the donor allocation, the tail arrives tight); a bigger tail
+    /// copies the head out exact-size and memmoves the tail inside the
+    /// same allocation — split_off would hold capacity + tail live.
+    #[test]
+    fn split_part_branches_on_tail_vs_head() {
+        // tail (15) > head (8): the part-buffer case — head comes back
+        // exact-size, the tail stays in the original allocation
+        let mut buf: Vec<u8> = (0..23u8).collect();
+        let cap = buf.capacity();
+        let head = split_part(&mut buf, 8);
+        assert_eq!(head, (0..8u8).collect::<Vec<_>>());
+        assert_eq!(head.len(), head.capacity(), "head copy is exact-size");
+        assert_eq!(buf.as_slice(), &(8..23u8).collect::<Vec<_>>()[..]);
+        assert_eq!(buf.capacity(), cap, "tail keeps the part buffer");
+        // tail (2) <= head (8): split_off — head keeps the donor's whole
+        // allocation, the tail vec is tight
+        let mut buf: Vec<u8> = (0..10u8).collect();
+        let head = split_part(&mut buf, 8);
+        assert_eq!(head, (0..8u8).collect::<Vec<_>>());
+        assert!(head.capacity() > head.len(), "head is the donor allocation's front");
+        assert_eq!(buf.as_slice(), &[8u8, 9]);
+        assert!(buf.capacity() <= buf.len() + 16, "split_off tail stays tight");
+    }
+
+    /// `read_entries_bound` prices the fetch before it allocates: every
+    /// loc's entry copy (`loc.len` each — they all stay alive in the
+    /// result) plus the LARGEST merged-span range buffer under the same
+    /// READ_GAP/READ_SPAN rules read_entries merges by.
+    #[test]
+    fn read_entries_bound_counts_copies_and_max_span() {
+        let id = oid(&"ab".repeat(20)).unwrap();
+        let loc = |pack: &str, off: u64, len: u32| ObjLoc {
+            pack: PackId(pack.into()),
+            idx: 0,
+            offset: off,
+            len,
+            kind: Kind::Blob,
+            size: 1,
+        };
+        // the per-loc vec term: result tuples + the sorted ref vec
+        let per_loc =
+            std::mem::size_of::<(ObjectId, Vec<u8>)>() + std::mem::size_of::<&ObjLoc>();
+        // nothing to read: slack only
+        assert_eq!(Bucket::read_entries_bound(&[]), READ_SLACK);
+        // one loc: its copy + its own span + vec space + slack
+        let one = [(id, loc("p", 100, 1 << 20))];
+        assert_eq!(Bucket::read_entries_bound(&one), (2 << 20) + per_loc + READ_SLACK);
+        // neighbors under READ_GAP merge into ONE span that includes the
+        // gap: 512 KiB + 512 KiB copies, a 1112 KiB range buffer
+        let near = [(id, loc("p", 0, 512 << 10)), (id, loc("p", 600 << 10, 512 << 10))];
+        let far = [(id, loc("p", 0, 512 << 10)), (id, loc("p", 100 << 20, 512 << 10))];
+        assert_eq!(
+            Bucket::read_entries_bound(&near),
+            (1024 << 10) + (1112 << 10) + 2 * per_loc + READ_SLACK
+        );
+        // the same locs far apart never merge: the buffer is one loc's span
+        assert_eq!(
+            Bucket::read_entries_bound(&far),
+            (1024 << 10) + (512 << 10) + 2 * per_loc + READ_SLACK
+        );
+        // a merge candidate whose span would pass READ_SPAN splits: the
+        // buffer stays one <= READ_SPAN span, not the whole 8.1 MiB extent
+        let split = [
+            (id, loc("p", 0, 4 << 20)),
+            (id, loc("p", (4 << 20) + (100 << 10), 4 << 20)),
+        ];
+        assert_eq!(Bucket::read_entries_bound(&split), (12 << 20) + 2 * per_loc + READ_SLACK);
+        // different packs never merge even when their ranges overlap:
+        // two 1 MiB copies, one 1 MiB buffer — a wrong merge would read 1.5 MiB
+        let packs = [(id, loc("a", 0, 1 << 20)), (id, loc("b", 512 << 10, 1 << 20))];
+        assert_eq!(Bucket::read_entries_bound(&packs), (3 << 20) + 2 * per_loc + READ_SLACK);
     }
 
     /// room grows capacity in whole-part steps — never Vec's doubling past

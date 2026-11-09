@@ -811,6 +811,28 @@ impl Cx<'_> {
             MEM_PRESSURE_MSG,
         )
     }
+
+    /// Preflight for `Bucket::read_entries(locs)` — the external-base fetch
+    /// (`external`) and the resolve loop's prefetch batch. The bound counts
+    /// every entry copy plus the largest merged-span range buffer; same
+    /// shed-then-Limit as mem_fetch BEFORE either allocates — a heap that
+    /// cannot hold the fetch fails in-band here instead of inside the range
+    /// read. MEM_PRESSURE_MSG: the push's aggregate heap is what needs
+    /// slicing. No-op off the edge path (`mem` is `None` there).
+    fn mem_entries(&mut self, locs: &[(ObjectId, ObjLoc)]) -> Result<(), Error> {
+        let Some(m) = self.mem.as_mut() else {
+            return Ok(());
+        };
+        mem_guard_peak(
+            &mut self.cache,
+            crate::mem::live_bytes,
+            crate::mem::linear_bytes,
+            receive_packs,
+            m,
+            Bucket::read_entries_bound(locs),
+            MEM_PRESSURE_MSG,
+        )
+    }
 }
 
 /// Bound for decode_mini's level-0 re-deflate of the base: zlib level 0
@@ -997,10 +1019,15 @@ pub async fn external(cx: &mut Cx<'_>, id: ObjectId, budget: &mut ReqBudget) -> 
              (e.g. git -c core.bigFileThreshold=1 push)"
         )));
     }
+    // the coalesced read allocates its range buffer plus the entry copy
+    // before decode_entry's own preflight can run — size the fetch first:
+    // shed the cache, then fail in-band with Limit if it still can't fit
+    let fetch = [(id, loc)];
+    cx.mem_entries(&fetch)?;
     let (_, entry) = cx
         .win
         .bucket
-        .read_entries(&[(id, loc)], budget)
+        .read_entries(&fetch, budget)
         .await?
         .pop()
         .ok_or_else(|| Error::Storage("base read".into()))?;
@@ -1152,9 +1179,9 @@ fn chain_too_large(edge: bool) -> Error {
 /// `cleared_at` is the live_bytes() reading taken AFTER the last
 /// `cache.clear()` — the post-shed level, so hysteresis measures regrowth
 /// from the drained heap. The first crossing always sheds; later sheds
-/// inside the soft band need MEM_HYSTERESIS of growth. Above MEM_HARD the
-/// shed always runs — it is the last relief before the Limit, not
-/// hysteresis fodder.
+/// inside the soft band need MEM_HYSTERESIS of growth. Above MEM_HARD —
+/// and whenever linear memory sits at LINEAR_HARD — the shed always runs:
+/// it is the last relief before the Limit, not hysteresis fodder.
 #[derive(Default)]
 pub struct MemGuard {
     cleared_at: Option<usize>,
@@ -1179,9 +1206,12 @@ const DECODE_SCRATCH: usize = 512 << 10;
 /// (0 on native — the LINEAR_HARD trip is inert there), and `peers` the
 /// isolate's in-progress receive-pack count (pass A included — this push's
 /// own request counts as 1). Clearing the cache is the soft relief
-/// (resolved objects re-resolve lazily), and only a reading still above
-/// MEM_HARD — or a near-wall linear memory with a heap over MEM_SOFT —
-/// after the clear earns the client an in-band Limit. The message is
+/// (resolved objects re-resolve lazily). MEM_HARD — and a linear reading
+/// at LINEAR_HARD — always shed first, hysteresis aside: the clear is the
+/// last relief before the Limit, so no fail verdict may precede it. Only
+/// a reading still above MEM_HARD — or a near-wall linear memory with a
+/// heap over MEM_SOFT — after the clear earns the client an in-band
+/// Limit. The message is
 /// honest about cause: another receive-pack in flight means the isolate
 /// was busy — retry — while an alone push really is too big for one
 /// request and smaller slices will do.
@@ -1224,7 +1254,12 @@ fn mem_guard_peak(
     let grew = state
         .cleared_at
         .is_some_and(|at| live_now.saturating_sub(at) >= MEM_HYSTERESIS);
-    if now > MEM_HARD || state.cleared_at.is_none() || grew {
+    // LINEAR_HARD joins the always-shed conditions: the near-wall linear
+    // trip below is a fail-path verdict, so the shed — the last relief
+    // before the Limit — must run even inside the hysteresis band. Linear
+    // never shrinks, so skipping the clear here would reject every later
+    // push on this heap too.
+    if now > MEM_HARD || linear() >= LINEAR_HARD || state.cleared_at.is_none() || grew {
         cache.clear();
         // the hysteresis baseline is the POST-shed reading: the shed just
         // drained the heap, so recording the pre-shed `now` would measure
@@ -1247,14 +1282,14 @@ fn mem_guard_peak(
 /// The thin-pack bases worth prefetching: each must fit the 16 MiB object
 /// cap — `external()` reports the actionable error for bigger ones, and
 /// `decode_entry` would throw its bare limit first — and the batch's
-/// compressed bytes stay under EDGE_CACHE, the cache they decode into, so
-/// early decodes can't evict entries still queued.
+/// decompressed bytes (`loc.size`, what `Cache` budgets by `capacity()`)
+/// stay under EDGE_CACHE, so early decodes can't evict entries still queued.
 fn prefetch_locs(bases: &HashMap<ObjectId, ObjLoc>) -> Vec<(ObjectId, ObjLoc)> {
     let mut out = Vec::new();
     let mut sum = 0u64;
     for (id, loc) in bases {
         if loc.size <= MAX_OBJ {
-            sum = sum.saturating_add(u64::from(loc.len));
+            sum = sum.saturating_add(loc.size);
             if sum > EDGE_CACHE as u64 {
                 break;
             }
@@ -1300,16 +1335,22 @@ pub async fn resolve_and_normalize(
         Externals::Map(bases) => prefetch_locs(bases),
         Externals::Idx(_) => Vec::new(),
     };
-    // prefetch is opportunistic: `read_entries` bounds *merged span* bytes (gaps
-    // included), which `pre`'s plain size sum can't predict — on Limit just skip the
-    // batch; every base still resolves lazily through `external()`. A failed
-    // preflight or decode inside the loop ends the batch the same way and drops
-    // the unread entries — the base re-reads lazily where it is actually needed.
-    if let Ok(entries) = bucket.read_entries(&pre, budget).await {
-        for (id, entry) in entries {
-            let Ok(()) = cx.mem_decode(decode_entry_bound(&entry)) else { break };
-            let Ok((k, d)) = codec::decode_entry(&entry) else { break };
-            cx.cache.put(Key::Id(id), k, d);
+    // prefetch is opportunistic on both axes: the batch's fetch allocation
+    // (entry copies + largest merged span) is preflighted through the same
+    // guard external() uses and skipped when even the shed can't fit it,
+    // and `read_entries` bounds *merged span* bytes (gaps included) that
+    // the loc sums can't predict — a Limit skips the batch the same way.
+    // Either way every base still resolves lazily through external()'s own
+    // guarded fetch, and a failed decode preflight inside the loop ends the
+    // batch early, dropping the unread entries for lazy re-reads where
+    // they're actually needed.
+    if cx.mem_entries(&pre).is_ok() {
+        if let Ok(entries) = bucket.read_entries(&pre, budget).await {
+            for (id, entry) in entries {
+                let Ok(()) = cx.mem_decode(decode_entry_bound(&entry)) else { break };
+                let Ok((k, d)) = codec::decode_entry(&entry) else { break };
+                cx.cache.put(Key::Id(id), k, d);
+            }
         }
     }
     let need_ids = entries.iter().any(|r| matches!(r.kind_or_delta, Header::RefDelta { .. }));
@@ -1731,6 +1772,44 @@ mod tests {
         assert_eq!(g.cleared_at, Some(84 << 20));
     }
 
+    /// The near-wall linear trip must shed BEFORE it judges: with
+    /// `cleared_at` set and sub-hysteresis growth, LINEAR_HARD forces the
+    /// clear even though hysteresis alone would skip it — otherwise the
+    /// guard fails a push the shed would have saved, and since linear
+    /// never shrinks the unrelieved heap would wedge every later push on
+    /// the isolate too. Injected live() readings: pre-shed 85, post-shed
+    /// 75 — clearing the ~10 MiB cache is what lets the push continue.
+    #[test]
+    fn mem_guard_linear_hard_forces_shed_past_hysteresis() {
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        let mut g = MemGuard::default();
+        g.cleared_at = Some(82 << 20); // 3 MiB of regrowth — sub-hysteresis
+        let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
+            85usize << 20, // now: over MEM_SOFT, under MEM_HARD
+            75 << 20,      // post-shed live -> cleared_at
+            75 << 20,      // post-shed `after` -> under MEM_SOFT: push continues
+        ]));
+        let live = || readings.borrow_mut().pop_front().unwrap_or(75 << 20);
+        mem_guard(&mut c, live, || LINEAR_HARD, || 1, &mut g).unwrap();
+        assert!(c.get(&Key::Off(1)).is_none(), "LINEAR_HARD forced the shed");
+        assert_eq!(g.cleared_at, Some(75 << 20));
+        // the shed ran first there too: a heap still over MEM_SOFT after
+        // the clear fails in-band — but only AFTER the cache was shed
+        let mut c = Cache::default();
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        let mut g = MemGuard::default();
+        g.cleared_at = Some(82 << 20);
+        let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
+            85usize << 20, 84 << 20, 84 << 20,
+        ]));
+        let live = || readings.borrow_mut().pop_front().unwrap_or(84 << 20);
+        let err = mem_guard(&mut c, live, || LINEAR_HARD, || 1, &mut g).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(c.get(&Key::Off(2)).is_none(), "the Limit came after the shed");
+        assert_eq!(g.cleared_at, Some(84 << 20));
+    }
+
     /// Above MEM_HARD the shed is not hysteretic — it is the last relief
     /// before the Limit, so it runs even right after a recent shed.
     #[test]
@@ -2026,9 +2105,11 @@ mod tests {
         assert!(!chain_room(u64::MAX, 0, u64::MAX, EDGE_CHAIN_BYTES));
     }
 
-    /// The prefetch batch is capped at EDGE_CACHE — the cache the entries
-    /// decode into — so early decodes can't evict entries still queued;
-    /// streamed bases over MAX_OBJ are skipped for external() to name.
+    /// The prefetch batch is capped at EDGE_CACHE of DECOMPRESSED bytes —
+    /// `loc.size`, what the cache's capacity() accounting sees — so early
+    /// decodes can't evict entries still queued; streamed bases over
+    /// MAX_OBJ are skipped for external() to name. The compressed `len`
+    /// is irrelevant to the cap: a tiny wire can decode to MAX_OBJ each.
     #[test]
     fn prefetch_locs_caps_at_edge_cache_and_skips_oversized() {
         let oid = |n: u8| ObjectId::from_hex(format!("{n:02x}").repeat(20).as_bytes()).unwrap();
@@ -2040,22 +2121,23 @@ mod tests {
             kind: Kind::Blob,
             size,
         };
-        // three 10 MiB bases: whichever order the map yields, the third
-        // crosses EDGE_CACHE (10+10+10 > 24) -> exactly two are kept
+        // three 10 MiB decompressed bases behind 1 KiB wires: whichever
+        // order the map yields, the third crosses EDGE_CACHE (10+10+10 >
+        // 24) -> exactly two are kept — a len-based sum would keep all
         let mut bases = HashMap::new();
         for n in 0..3u8 {
-            bases.insert(oid(n), loc(10 << 20, 1 << 20));
+            bases.insert(oid(n), loc(1 << 10, 10 << 20));
         }
         // a streamed base over MAX_OBJ never counts toward the sum
         bases.insert(oid(3), loc(1 << 20, MAX_OBJ + 1));
         let got = prefetch_locs(&bases);
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|(_, l)| l.size <= MAX_OBJ));
-        assert!(got.iter().map(|(_, l)| u64::from(l.len)).sum::<u64>() <= EDGE_CACHE as u64);
+        assert!(got.iter().map(|(_, l)| l.size).sum::<u64>() <= EDGE_CACHE as u64);
         // the exact-cap boundary is kept: the check is `>` not `>=`
         let mut bases = HashMap::new();
-        bases.insert(oid(4), loc(12 << 20, 1 << 20));
-        bases.insert(oid(5), loc(12 << 20, 1 << 20));
+        bases.insert(oid(4), loc(1 << 10, 12 << 20));
+        bases.insert(oid(5), loc(1 << 10, 12 << 20));
         assert_eq!(prefetch_locs(&bases).len(), 2);
     }
 }
