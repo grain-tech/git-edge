@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use gix_hash::ObjectId;
 use gix_pack::data::entry::Header;
@@ -404,6 +404,15 @@ const PERMIT_LEASE_MS: i64 = ReqBudget::MAX_MS as i64 + 30_000;
 /// reaches eviction — and it still clears well before the waiters' own
 /// deadlines.
 const TICKET_STALE_MS: i64 = 30_000;
+/// How long an evicted permit fences admission after its eviction. A
+/// live holder learns of its eviction at its next guard call or budget
+/// charge, which come far more often than this, and then frees its
+/// buffers. Past this mark the holder is a leak that will never drain:
+/// the fence lets go, and the per-request memory guard and the fallible
+/// reservations protect the next pass B instead. Without the expiry a
+/// leaked holder above INGEST_LOW_WATER would block every later push
+/// until the isolate recycles.
+const EVICTED_FENCE_MS: i64 = TICKET_STALE_MS;
 /// The in-band busy message, shared by the admit timeout and a peer-contended
 /// MEM_HARD trip: a retry helps, smaller slices would not have.
 pub(crate) const INGEST_BUSY_MSG: &str =
@@ -441,8 +450,9 @@ struct Admission {
     /// heap until its future drops (or forever, if it leaked), so while
     /// this set is non-empty and the heap is busy nobody is admitted. An
     /// id leaves when its holder's release arrives; the whole set clears
-    /// on the first poll that reads a calm heap.
-    evicted: BTreeSet<u64>,
+    /// on the first poll that reads a calm heap, and each id expires
+    /// EVICTED_FENCE_MS after its eviction. Value: the eviction time.
+    evicted: BTreeMap<u64, i64>,
 }
 
 impl Admission {
@@ -453,7 +463,7 @@ impl Admission {
             slots,
             next_ticket: 0,
             waiting: BTreeMap::new(),
-            evicted: BTreeSet::new(),
+            evicted: BTreeMap::new(),
         }
     }
     /// Issue a FIFO ticket and queue the waiter behind every earlier one.
@@ -486,10 +496,23 @@ impl Admission {
             .collect();
         for (id, at) in &stale {
             self.permits.remove(id);
-            self.evicted.insert(*id);
+            self.evicted.insert(*id, now);
             admit_log(format_args!(
                 "git-edge ingest admit: reclaimed leaked permit {id} (held {}ms)",
                 now.saturating_sub(*at)
+            ));
+        }
+        // a fence entry outlives its holder's chance to drain: let go
+        let expired: Vec<u64> = self
+            .evicted
+            .iter()
+            .filter(|(_, at)| now.saturating_sub(**at) > EVICTED_FENCE_MS)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.evicted.remove(&id);
+            admit_log(format_args!(
+                "git-edge ingest admit: evicted permit {id} never drained; fence expired, memory guard takes over"
             ));
         }
         while let Some((&t, &at)) = self.waiting.first_key_value() {
@@ -1615,6 +1638,32 @@ mod tests {
         let err = block_on(admit_wait(100, None, || false, n2, s2)).err().unwrap();
         assert!(matches!(err, Error::Limit(_)), "{err:?}");
         drop(hold);
+    }
+
+    /// Claude r8 #2: a fence entry expires EVICTED_FENCE_MS after its
+    /// eviction. A leaked holder that never drains and keeps the heap busy
+    /// blocks admission inside that window and no longer after it; the
+    /// memory guard takes over from there.
+    #[test]
+    fn eviction_fence_expires_for_a_holder_that_never_drains() {
+        let mut a = Admission::new(1);
+        let t0 = a.enqueue(0);
+        let _leaked = a.try_acquire(t0, false, 0).unwrap(); // never released
+        let w = a.enqueue(0);
+        let evicted_at = PERMIT_LEASE_MS + 1;
+        assert!(a.try_acquire(w, true, evicted_at).is_none(), "the sweep evicts and fences");
+        assert_eq!(a.in_flight(), 0);
+        // busy polls up to the fence's edge stay blocked
+        let mut now = evicted_at;
+        while now + INGEST_POLL_MS as i64 <= evicted_at + EVICTED_FENCE_MS {
+            now += INGEST_POLL_MS as i64;
+            assert!(a.try_acquire(w, true, now).is_none(), "fence lifted early at {now}");
+        }
+        assert!(a.try_acquire(w, true, evicted_at + EVICTED_FENCE_MS).is_none(), "age == limit still fences");
+        // one millisecond past the limit: the fence lets go, heap still busy
+        assert!(a.try_acquire(w, true, evicted_at + EVICTED_FENCE_MS + 1).is_some());
+        assert!(a.evicted.is_empty());
+        assert_eq!(EVICTED_FENCE_MS, TICKET_STALE_MS);
     }
 
     /// The post-eviction fence persists: an evicted-but-undrained holder
