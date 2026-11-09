@@ -1253,7 +1253,7 @@ fn header_push(pr: &mut PktReader, body: &mut BodyReader) -> Result<(), Error> {
         CMD_CAP,
         "receive header > 1 MiB",
     )?;
-    pr.push(&body.buffered().to_vec());
+    pr.push(body.buffered());
     body.consume(usize::MAX);
     Ok(())
 }
