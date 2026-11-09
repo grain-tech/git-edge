@@ -622,6 +622,9 @@ async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend
     match v.get("operation").and_then(|o| o.as_str()) {
         Some("download") => {}
         Some("upload") => {
+            // a second DO call: authenticate_with settles only the
+            // principal, not the resolved grant, so Write is re-checked
+            // against the DO rather than inferred from the Read pass
             auth::authenticate(&req, env, Level::Write, route, spend).await?;
         }
         _ => return Err(Error::Protocol("lfs operation must be download or upload".into())),
