@@ -2381,16 +2381,25 @@ mod tests {
         }
     }
 
-    /// A refused finish preflight aborts the upload and never finishes.
+    /// A refused finish preflight aborts the upload and never finishes;
+    /// the refusal still records the "grow:writer-finish" tag priced at
+    /// the writer's finish_bound — deleting the preflight inside
+    /// finish_writer fails both halves here.
     #[test]
     fn finish_writer_refusal_aborts_the_upload() {
         let _guard = crate::try_grow::HookGuard;
         crate::mem::set_live_override(Some(std::rc::Rc::new(|| 200 << 20)));
+        crate::pack::ingest::clear_preflights();
         let done = std::rc::Rc::new(std::cell::Cell::new(""));
         let mut budget = ReqBudget::paid();
         let res = ready(super::finish_writer(FakeOut { bound: 1 << 20, done: done.clone() }, &mut budget));
         assert!(matches!(res, Err(Error::Limit(_))), "a refused finish preflight is the Limit");
         assert_eq!(done.get(), "abort");
+        assert_eq!(
+            crate::pack::ingest::preflight_sites(),
+            vec![("grow:writer-finish", 1 << 20)],
+            "the finish preflight records its tag and the writer's finish_bound"
+        );
     }
 
     /// The trailer's room check is fallible: without it the append would

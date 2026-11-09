@@ -1028,10 +1028,12 @@ mod tests {
         (file!(), u32::try_from(prod[..end].matches('\n').count() + 1).unwrap())
     }
 
-    /// The three run()-side growth preflights live inside the steps whose
-    /// results run() needs: the base list, the filled externals map and
-    /// the finished pack's meta. Each step records its tag with the bytes
-    /// it priced. Deleting the preflight inside any step fails here.
+    /// The run()-side growth preflights live inside the steps whose
+    /// results run() needs: the base list and the filled externals map.
+    /// Each step records its tag with the bytes it priced. Deleting the
+    /// preflight inside either step fails here; the finished pack's meta
+    /// step is store-sealed, so its tag is pinned by finish_writer's own
+    /// test in store.
     #[test]
     fn run_side_growth_preflights_record_their_tags() {
         use gix_pack::data::entry::Header;
@@ -1047,14 +1049,10 @@ mod tests {
         let mut ext = HashMap::new();
         add_externals(&mut ext, bases.iter().map(|id| (*id, Some(loc(1)))).collect(), None).unwrap();
         assert_eq!(ext.len(), 2);
-        // the finish step's own preflight — finish_writer's internals are
-        // store-sealed, so the tag is recorded the way it records it there
-        crate::pack::ingest::mem_preflight(None, 1 << 20, "grow:writer-finish").unwrap();
         let sites = crate::pack::ingest::preflight_sites();
         let tags: Vec<_> = sites.iter().map(|(t, _)| *t).collect();
-        assert_eq!(tags, ["grow:bases", "grow:externals", "grow:writer-finish"], "one record per step, in run() order");
+        assert_eq!(tags, ["grow:bases", "grow:externals"], "one record per step, in run() order");
         assert_eq!(sites[1].1, super::super::ingest::map_growth_peak::<(ObjectId, ObjLoc)>(0, 0, 2));
-        assert_eq!(sites[2].1, 1 << 20, "the finish preflight prices the writer's finish_bound");
     }
 
     /// The final index post's guard is one step: a refused "grow:index-final"
