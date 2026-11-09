@@ -41,11 +41,55 @@ impl EntryRec {
 // + header_len u8, padded): the record vec alone must leave room for Cache
 // (24 MiB edge budget) + window + part buffer inside a 128 MiB isolate —
 // 750k records ≈ 46 MiB. This table is PASS A: it is built before the
-// admission gate exists, so its growth is PRE-EXISTING and UNGATED — the
-// pass-B guard never sees it. stream_inner pre-sizes it from the header
-// count so the Vec's doubling peak (~2x) never materializes.
+// admission gate exists. Its pre-size trusts evidence, never the client's
+// header count alone (see pass_a_presize), and every growth past it runs
+// through the memory guard first (reserve_entries).
 const _: () = assert!(std::mem::size_of::<EntryRec>() == 64);
 const MAX_ENTRIES: usize = 750_000;
+/// The smallest wire size a pack entry can have: a 1-byte type/size
+/// header plus the shortest zlib stream (2-byte header, 2-byte empty final
+/// block, 4-byte Adler-32). A body of N bytes holds at most N / 9 entries.
+const MIN_ENTRY_WIRE: u64 = 9;
+/// Records the pass-A table reserves up front without further evidence:
+/// 2 MiB of EntryRec. Real entries must arrive before it grows past this.
+const PRESIZE_RECORDS: usize = (2 << 20) / std::mem::size_of::<EntryRec>();
+
+/// The entry table's initial capacity. The pack header's count is the
+/// client's claim, made before any entry exists — a 12-byte header must
+/// not reserve 48 MiB. So the reserve is the smallest of the claim, what
+/// the declared body length can physically hold, and PRESIZE_RECORDS.
+fn pass_a_presize(count: u32, declared_len: Option<u64>) -> usize {
+    let claim = usize::try_from(count).unwrap_or(usize::MAX).min(MAX_ENTRIES);
+    let by_body = declared_len.map_or(usize::MAX, |n| usize::try_from(n / MIN_ENTRY_WIRE).unwrap_or(usize::MAX));
+    claim.min(by_body).min(PRESIZE_RECORDS)
+}
+
+/// The next capacity for a full entry table and the moving peak that
+/// growth holds: double (at least PRESIZE_RECORDS), never past `bound`
+/// (the header's claim, capped at MAX_ENTRIES). None while there is room
+/// or nothing more may be reserved.
+fn entries_growth(len: usize, cap: usize, bound: usize) -> Option<(usize, usize)> {
+    if len < cap || cap >= bound {
+        return None;
+    }
+    let target = cap.saturating_mul(2).max(PRESIZE_RECORDS).min(bound);
+    let elem = std::mem::size_of::<EntryRec>();
+    Some((target, crate::store::moving_peak(cap.saturating_mul(elem), target.saturating_mul(elem))))
+}
+
+/// Grow a full pass-A entry table after `preflight` admits the growth's
+/// moving peak — the doubling is evidenced by entries that really arrived.
+fn reserve_entries(
+    recs: &mut Vec<EntryRec>,
+    bound: usize,
+    preflight: impl FnOnce(usize) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if let Some((target, peak)) = entries_growth(recs.len(), recs.capacity(), bound) {
+        preflight(peak)?;
+        recs.reserve_exact(target - recs.len());
+    }
+    Ok(())
+}
 pub const MAX_OBJ: u64 = 16 << 20; // A7
 /// A8: ceiling on a streamed blob's *decompressed* size, checked from the header in
 /// pass A. Pass A inflates the whole stream to validate and pass B re-inflates it to
@@ -203,12 +247,12 @@ async fn stream_inner(
         return Err(unpack("pack version"));
     }
     take(body, &mut hasher, out, 12, budget).await?;
-    // pre-size the entry table from the header count: the Vec's amortized
-    // doubling would otherwise peak near 2x the table (~92 MiB at the cap)
-    // inside pass A, which runs before the memory guard exists. Capped at
-    // MAX_ENTRIES — the loop still rejects bigger counts.
+    // pre-size the entry table from evidence, not the header's claim (see
+    // pass_a_presize); later growth is preflighted per doubling below.
+    // The loop still rejects counts over MAX_ENTRIES.
+    let bound = usize::try_from(count).unwrap_or(usize::MAX).min(MAX_ENTRIES);
     let (mut recs, mut pos, mut z, mut sink) = (
-        Vec::with_capacity(usize::try_from(count).unwrap_or(0).min(MAX_ENTRIES)),
+        Vec::with_capacity(pass_a_presize(count, body.declared_len)),
         12u64,
         Decompress::new(),
         vec![0u8; 64 << 10],
@@ -258,6 +302,7 @@ async fn stream_inner(
         if clen > MAX_ENTRY_WIRE && !streamable {
             return Err(unpack(format!("entry at {pos}: wire size exceeds 32 MiB")));
         }
+        reserve_entries(&mut recs, bound, |peak| mem_preflight(budget.lease.as_ref(), peak, "grow:pass-a-entries"))?;
         recs.push(EntryRec {
             offset: pos,
             header_len: u8::try_from(hlen).map_err(|_| unpack("header too long"))?,
@@ -1611,10 +1656,10 @@ fn mem_guard_peak(
     Ok(())
 }
 
-/// A one-off preflight outside the resolve loop — the final index post
-/// after `resolve_and_normalize` returned and its Cx (and cache) are gone.
-/// Same guard, same thresholds and wording, the owning request's lease
-/// renewed; there is no cache left to shed.
+/// A one-off preflight outside the resolve loop, where no Cx (and no
+/// cache) exists: pass A's entry-table growth, and the final index post
+/// after `resolve_and_normalize` returned. Same guard, same thresholds and
+/// wording, the owning request's lease renewed; there is no cache to shed.
 pub(crate) fn mem_preflight(
     lease: Option<&Rc<super::run::Lease>>,
     incoming: usize,
@@ -3412,6 +3457,61 @@ mod tests {
         let mut sink = MemSink::default();
         let mut any = AnySink::Mem(&mut sink);
         assert!(any.tags_growth_bound() > 0, "an empty map allocates on first insert");
+    }
+
+    /// Claude #4: the pass-A pre-size trusts evidence. A header claiming
+    /// 750k objects reserves at most PRESIZE_RECORDS (2 MiB), and a small
+    /// declared body caps it at what the body can physically hold.
+    #[test]
+    fn pass_a_presize_is_bounded_by_evidence() {
+        assert_eq!(PRESIZE_RECORDS, 32_768);
+        assert_eq!(pass_a_presize(750_000, None), PRESIZE_RECORDS);
+        assert_eq!(pass_a_presize(u32::MAX, None), PRESIZE_RECORDS);
+        assert!(pass_a_presize(750_000, None) * std::mem::size_of::<EntryRec>() <= 2 << 20);
+        // a 900-byte body can hold at most 100 entries
+        assert_eq!(pass_a_presize(750_000, Some(900)), 100);
+        assert_eq!(pass_a_presize(750_000, Some(899)), 99);
+        // an honest small claim wins
+        assert_eq!(pass_a_presize(10, Some(1 << 30)), 10);
+        assert_eq!(pass_a_presize(0, None), 0);
+    }
+
+    /// Growth past the pre-size doubles only once the table is full, stops
+    /// at the claim, and preflights the moving peak before it reserves.
+    #[test]
+    fn pass_a_entries_grow_through_the_preflight() {
+        let elem = std::mem::size_of::<EntryRec>();
+        assert_eq!(entries_growth(5, 10, 100), None, "room left");
+        assert_eq!(entries_growth(10, 10, 10), None, "the claim is reached");
+        assert_eq!(
+            entries_growth(PRESIZE_RECORDS, PRESIZE_RECORDS, MAX_ENTRIES),
+            Some((2 * PRESIZE_RECORDS, crate::store::moving_peak(PRESIZE_RECORDS * elem, 2 * PRESIZE_RECORDS * elem)))
+        );
+        assert_eq!(entries_growth(600_000, 600_000, MAX_ENTRIES).unwrap().0, MAX_ENTRIES, "never past the bound");
+        assert_eq!(entries_growth(0, 0, 3).unwrap().0, 3, "a tiny claim reserves only itself");
+        // the preflight runs before the reserve, and a refusal reserves nothing
+        let rec = EntryRec { offset: 0, header_len: 1, kind_or_delta: Header::Blob, compressed_len: 0, size: 0 };
+        let mut recs = Vec::with_capacity(4);
+        recs.resize(recs.capacity(), rec);
+        let cap = recs.capacity();
+        let mut seen = None;
+        reserve_entries(&mut recs, 1_000_000, |peak| {
+            seen = Some(peak);
+            Ok(())
+        })
+        .unwrap();
+        assert!(recs.capacity() >= PRESIZE_RECORDS);
+        assert_eq!(seen, Some(crate::store::moving_peak(cap * elem, PRESIZE_RECORDS * elem)));
+        recs.resize(recs.capacity(), rec);
+        let cap = recs.capacity();
+        let err = reserve_entries(&mut recs, 1_000_000, |_| Err(Error::Limit("busy".into())));
+        assert!(err.is_err());
+        assert_eq!(recs.capacity(), cap, "a refused growth reserves nothing");
+        // the production preflight is the guard: it records its site
+        clear_preflights();
+        let mut recs: Vec<EntryRec> = Vec::new();
+        reserve_entries(&mut recs, 5, |peak| mem_preflight(None, peak, "grow:pass-a-entries")).unwrap();
+        assert!(sites_of(&preflight_sites()).contains(&"grow:pass-a-entries"));
     }
 
     #[test]

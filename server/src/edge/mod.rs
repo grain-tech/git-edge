@@ -32,6 +32,11 @@ pub struct BodyReader {
     buf: Vec<u8>,
     eof: bool,
     pub total: u64,
+    /// The identity-encoded body's declared Content-Length — evidence of
+    /// how many bytes (and so how many pack entries) can follow. None for
+    /// gzip, where the wire length says nothing about the decoded size,
+    /// and for chunked uploads that declare no length.
+    pub declared_len: Option<u64>,
 }
 impl BodyReader {
     pub fn new(req: &mut Request) -> Result<Self, Error> {
@@ -60,14 +65,22 @@ impl BodyReader {
                 Ok(b)
             })));
         }
+        let declared_len = req
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<u64>().ok());
         let stream = req.stream().map_err(|e| Error::Protocol(e.to_string()))?;
-        Ok(Self::wrap(stream.map(|item| item.map_err(|e| Error::Storage(e.to_string())))))
+        let mut r = Self::wrap(stream.map(|item| item.map_err(|e| Error::Storage(e.to_string()))));
+        r.declared_len = declared_len;
+        Ok(r)
     }
     fn wrap<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Vec<u8>, Error>> + 'static,
     {
-        Self { stream: Box::pin(stream), buf: Vec::new(), eof: false, total: 0 }
+        Self { stream: Box::pin(stream), buf: Vec::new(), eof: false, total: 0, declared_len: None }
     }
     /// Read until buf.len() >= min or EOF. Ok(false) means EOF before min.
     pub async fn fill(&mut self, min: usize) -> Result<bool, Error> {
