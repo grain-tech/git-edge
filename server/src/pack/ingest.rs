@@ -28,6 +28,14 @@ pub struct EntryRec {
     pub compressed_len: u32,
     pub size: u64,
 }
+impl EntryRec {
+    /// The entry's wire span — header plus compressed body: what
+    /// `Window::entry` copies out, what the chain cap counts, and what
+    /// `entry_fetch_bound` sizes the fetch from.
+    fn wire_len(&self) -> u64 {
+        u64::from(self.header_len).saturating_add(u64::from(self.compressed_len))
+    }
+}
 
 // EntryRec is ~48 B (offset + Header enum + two lengths + u64 size): the record vec
 // alone must leave room for Cache (24 MiB edge budget) + window + part buffer inside
@@ -344,7 +352,7 @@ pub struct Window<'a> {
 impl Window<'_> {
     /// Raw bytes of one entry; slides to [offset, +8 MiB) with one range read when outside.
     async fn entry(&mut self, rec: &EntryRec, budget: &mut ReqBudget) -> Result<Vec<u8>, Error> {
-        let len = u64::from(rec.header_len).saturating_add(u64::from(rec.compressed_len));
+        let len = rec.wire_len();
         // pass A enforces MAX_ENTRY_WIRE; keep the bound explicit here so a huge range
         // read can never be issued even if the invariant is ever broken upstream
         if len > MAX_ENTRY_WIRE.saturating_add(64) {
@@ -357,7 +365,12 @@ impl Window<'_> {
         {
             Some(lo) => lo,
             None => {
-                let n = len.max(WINDOW).min(self.pack_len.saturating_sub(rec.offset));
+                let n = window_fetch_n(self.pack_len, rec.offset, len);
+                // drop the outgoing window BEFORE the replacement read
+                // allocates — the two buffers would otherwise coexist at
+                // the fetch's peak (the guard's preflight counts only the
+                // incoming side)
+                self.buf = Vec::new();
                 self.buf = self.src.read(self.bucket, rec.offset, n, budget).await?;
                 self.start = rec.offset;
                 0
@@ -373,6 +386,43 @@ impl Window<'_> {
     async fn read(&mut self, off: u64, n: u64, budget: &mut ReqBudget) -> Result<Vec<u8>, Error> {
         self.src.read(self.bucket, off, n, budget).await
     }
+}
+
+/// The range span `Window::entry` reads on a miss: the entry's wire length
+/// grown to WINDOW, clipped at the pack's end. Shared by the fetch and the
+/// memory guard's preflight so the two can't drift.
+fn window_fetch_n(pack_len: u64, offset: u64, len: u64) -> u64 {
+    len.max(WINDOW).min(pack_len.saturating_sub(offset))
+}
+
+/// Flat slack inside `entry_fetch_bound`: the range-read plumbing — request
+/// build, response handling, the JS-side copy bookkeeping — that the
+/// buffer + copy terms don't name.
+const FETCH_SCRATCH: usize = 64 << 10;
+
+/// Bytes `Window::entry(rec)` adds to the live heap, sized BEFORE the call
+/// allocates: on a window miss the replacement buffer (`window_fetch_n`)
+/// plus the returned header+body copy; on a hit only the copy. The
+/// outgoing window is dropped before the fetch, so it is not counted — it
+/// is already inside `live()`. `None` when `entry` rejects the wire span
+/// up front — it then reports its own unpack error and nothing was going
+/// to allocate anyway.
+fn entry_fetch_bound(pack_len: u64, start: u64, buf_len: u64, rec: &EntryRec) -> Option<usize> {
+    let len = rec.wire_len();
+    if len > MAX_ENTRY_WIRE.saturating_add(64) {
+        return None;
+    }
+    let hit = rec
+        .offset
+        .checked_sub(start)
+        .is_some_and(|lo| lo.saturating_add(len) <= buf_len);
+    let n = if hit { 0 } else { window_fetch_n(pack_len, rec.offset, len) };
+    Some(
+        usize::try_from(n)
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+            .saturating_add(FETCH_SCRATCH),
+    )
 }
 
 /// Thin-pack base lookup: the edge's prefetched map, or the live objects index
@@ -731,6 +781,36 @@ impl Cx<'_> {
         }
         Ok(())
     }
+
+    /// Preflight for the window fetch `win.entry(rec)` is about to run:
+    /// `entry_fetch_bound` sizes the replacement buffer plus the returned
+    /// copy (or just the copy on a hit), and the same shed-then-Limit as
+    /// mem_decode runs BEFORE either allocates — a heap that cannot hold
+    /// window + entry fails in-band here instead of hanging inside the
+    /// range read. MEM_PRESSURE_MSG: the push's aggregate heap is what
+    /// needs slicing. No-op off the edge path (`mem` is `None` there).
+    fn mem_fetch(&mut self, rec: &EntryRec) -> Result<(), Error> {
+        let Some(m) = self.mem.as_mut() else {
+            return Ok(());
+        };
+        let Some(incoming) = entry_fetch_bound(
+            self.win.pack_len,
+            self.win.start,
+            self.win.buf.len() as u64,
+            rec,
+        ) else {
+            return Ok(());
+        };
+        mem_guard_peak(
+            &mut self.cache,
+            crate::mem::live_bytes,
+            crate::mem::linear_bytes,
+            receive_packs,
+            m,
+            incoming,
+            MEM_PRESSURE_MSG,
+        )
+    }
 }
 
 /// Bound for decode_mini's level-0 re-deflate of the base: zlib level 0
@@ -986,6 +1066,17 @@ pub async fn resolve_at(
         let rec = entries
             .by_off(off)?
             .ok_or_else(|| unpack("delta base is not an entry"))?;
+        // the chain cap is checked BEFORE the fetch: the entry table
+        // already knows header_len + compressed_len, so an over-cap chain
+        // fails without the window read — and the fetch's own allocations
+        // (window replacement + entry copy) are preflighted against the
+        // memory guard, which sheds the cache or fails in-band BEFORE
+        // either buffer exists
+        if !chain_room(chain_bytes, cx.chain_live, rec.wire_len(), chain_cap) {
+            cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
+            return Err(chain_too_large(cx.mem.is_some()));
+        }
+        cx.mem_fetch(&rec)?;
         let raw = cx.win.entry(&rec, budget).await?;
         // the walk can hold ~chain_cap of compressed bodies plus the
         // window, cache, and decode buffers before control returns to the
@@ -997,10 +1088,6 @@ pub async fn resolve_at(
         // the SAME memory summed across every nested resolve_at frame.
         chain_bytes = chain_bytes.saturating_add(raw.len() as u64);
         cx.chain_live = cx.chain_live.saturating_add(raw.len() as u64);
-        if chain_bytes > chain_cap || cx.chain_live > MAX_CHAIN_LIVE {
-            cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
-            return Err(chain_too_large(cx.mem.is_some()));
-        }
         match rec.kind_or_delta {
             Header::OfsDelta { base_distance } => {
                 chain.push((off, raw));
@@ -1041,6 +1128,14 @@ pub async fn resolve_at(
     }
     cx.chain_live = cx.chain_live.saturating_sub(chain_bytes);
     Ok(Base::Ready((kind, data)))
+}
+
+/// Would adding `entry_len` compressed bytes keep both chain bounds?
+/// Runs BEFORE the fetch in `resolve_at`: the entry table already knows
+/// the length, so an over-cap chain fails without the window read.
+fn chain_room(chain_bytes: u64, chain_live: u64, entry_len: u64, chain_cap: u64) -> bool {
+    chain_bytes.saturating_add(entry_len) <= chain_cap
+        && chain_live.saturating_add(entry_len) <= MAX_CHAIN_LIVE
 }
 
 /// Chain-byte-limit failure: the edge path reports an in-band Limit the
@@ -1117,13 +1212,18 @@ fn mem_guard_peak(
     incoming: usize,
     alone_msg: &'static str,
 ) -> Result<(), Error> {
-    let now = live().saturating_add(incoming);
+    let live_now = live();
+    let now = live_now.saturating_add(incoming);
     if now <= MEM_SOFT {
         return Ok(());
     }
+    // hysteresis compares like with like: cleared_at is a plain live()
+    // reading, so growth is measured on live() too — `incoming` projects
+    // only the soft/hard thresholds, never the regrowth baseline (a decode
+    // or fetch bound over MEM_HYSTERESIS on a flat heap must not re-shed)
     let grew = state
         .cleared_at
-        .is_some_and(|at| now.saturating_sub(at) >= MEM_HYSTERESIS);
+        .is_some_and(|at| live_now.saturating_sub(at) >= MEM_HYSTERESIS);
     if now > MEM_HARD || state.cleared_at.is_none() || grew {
         cache.clear();
         // the hysteresis baseline is the POST-shed reading: the shed just
@@ -1142,6 +1242,26 @@ fn mem_guard_peak(
         }));
     }
     Ok(())
+}
+
+/// The thin-pack bases worth prefetching: each must fit the 16 MiB object
+/// cap — `external()` reports the actionable error for bigger ones, and
+/// `decode_entry` would throw its bare limit first — and the batch's
+/// compressed bytes stay under EDGE_CACHE, the cache they decode into, so
+/// early decodes can't evict entries still queued.
+fn prefetch_locs(bases: &HashMap<ObjectId, ObjLoc>) -> Vec<(ObjectId, ObjLoc)> {
+    let mut out = Vec::new();
+    let mut sum = 0u64;
+    for (id, loc) in bases {
+        if loc.size <= MAX_OBJ {
+            sum = sum.saturating_add(u64::from(loc.len));
+            if sum > EDGE_CACHE as u64 {
+                break;
+            }
+            out.push((*id, loc.clone()));
+        }
+    }
+    out
 }
 
 /// `sink` posts `/_do/push/index` in 10,000-row batches and collects links (2.5).
@@ -1176,28 +1296,19 @@ pub async fn resolve_and_normalize(
         chain_live: 0,
         mem: Some(MemGuard::default()),
     };
-    let (mut pre, mut sum) = (Vec::new(), 0u64);
-    if let Externals::Map(bases) = &cx.externals {
-    for (id, loc) in *bases {
-        // oversized streamed bases must not be decoded here — external() reports the
-        // actionable "delta base too large" error; decode_entry would throw its bare
-        // object-too-large limit first
-        if loc.size <= MAX_OBJ {
-            sum = sum.saturating_add(u64::from(loc.len));
-            if sum > 32 << 20 {
-                break;
-            }
-            pre.push((*id, loc.clone()));
-        }
-    }
-    }
+    let pre = match &cx.externals {
+        Externals::Map(bases) => prefetch_locs(bases),
+        Externals::Idx(_) => Vec::new(),
+    };
     // prefetch is opportunistic: `read_entries` bounds *merged span* bytes (gaps
     // included), which `pre`'s plain size sum can't predict — on Limit just skip the
-    // batch; every base still resolves lazily through `external()`
+    // batch; every base still resolves lazily through `external()`. A failed
+    // preflight or decode inside the loop ends the batch the same way and drops
+    // the unread entries — the base re-reads lazily where it is actually needed.
     if let Ok(entries) = bucket.read_entries(&pre, budget).await {
         for (id, entry) in entries {
-            cx.mem_decode(decode_entry_bound(&entry))?;
-            let (k, d) = codec::decode_entry(&entry)?;
+            let Ok(()) = cx.mem_decode(decode_entry_bound(&entry)) else { break };
+            let Ok((k, d)) = codec::decode_entry(&entry) else { break };
             cx.cache.put(Key::Id(id), k, d);
         }
     }
@@ -1282,6 +1393,9 @@ pub async fn one_entry(
         Some(Base::Await(id)) => return Ok(Step::Await(id)),
         None => None,
     };
+    // preflight the window fetch before it allocates — the same guard the
+    // chain walk runs per hop (a no-op on the DO path, `mem` is `None`)
+    cx.mem_fetch(&rec)?;
     let raw = cx.win.entry(&rec, budget).await?;
     // C7 pause point: an R2 read just awaited and this entry's JobSink writes
     // (mark/seal/post) come next — a slice stranded here is already past
@@ -1774,5 +1888,174 @@ mod tests {
         let mut g = MemGuard::default();
         mem_guard_peak(&mut c, live, || 0, || 1, &mut g, 30 << 20, DECODE_TOO_BIG_MSG).unwrap();
         assert!(c.get(&Key::Off(2)).is_none(), "shed still ran on projected pressure");
+    }
+
+    /// Hysteresis compares like with like: `cleared_at` is a plain live()
+    /// reading, so `incoming` projects only the soft/hard thresholds — a
+    /// bound over MEM_HYSTERESIS on a flat heap must not re-shed (the
+    /// unlike-quantities bug: now - cleared_at mixed live+incoming
+    /// against live).
+    #[test]
+    fn mem_guard_peak_incoming_is_not_growth() {
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        let mut g = MemGuard::default();
+        g.cleared_at = Some(70 << 20);
+        // flat heap + incoming > MEM_HYSTERESIS: projected pressure is real
+        // (86 MiB > MEM_SOFT) but the heap did not grow -> cache stays
+        mem_guard_peak(&mut c, || 70 << 20, || 0, || 1, &mut g, 16 << 20, DECODE_TOO_BIG_MSG).unwrap();
+        assert!(c.get(&Key::Off(1)).is_some(), "flat heap + big incoming must not shed");
+        assert_eq!(g.cleared_at, Some(70 << 20));
+        // genuine regrowth >= MEM_HYSTERESIS still sheds with incoming present
+        let mut c = Cache::default();
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        let mut g = MemGuard::default();
+        g.cleared_at = Some(70 << 20);
+        mem_guard_peak(&mut c, || 79 << 20, || 0, || 1, &mut g, 2 << 20, DECODE_TOO_BIG_MSG).unwrap();
+        assert!(c.get(&Key::Off(2)).is_none(), "real growth sheds");
+        assert_eq!(g.cleared_at, Some(79 << 20));
+    }
+
+    /// The fetch preflight counts what win.entry allocates: a miss pays
+    /// the replacement window (wire length grown to WINDOW, clipped at
+    /// the pack's end) plus the returned copy; a hit pays only the copy;
+    /// a wire span entry() rejects up front allocates nothing -> None.
+    #[test]
+    fn entry_fetch_bound_counts_miss_hit_and_reject() {
+        let rec = |clen: u32, hlen: u8, off: u64| EntryRec {
+            offset: off,
+            header_len: hlen,
+            kind_or_delta: Header::Blob,
+            compressed_len: clen,
+            size: 1,
+        };
+        let pack_len = 1u64 << 30;
+        // miss, small entry: WINDOW buffer + header+body copy + slack
+        let r = rec(1 << 20, 3, 100);
+        assert_eq!(
+            entry_fetch_bound(pack_len, 0, 0, &r),
+            Some(WINDOW as usize + (1 << 20) as usize + 3 + FETCH_SCRATCH)
+        );
+        // the same entry inside the live window: the copy only
+        assert_eq!(
+            entry_fetch_bound(pack_len, 0, WINDOW as u64, &r),
+            Some((1 << 20) as usize + 3 + FETCH_SCRATCH)
+        );
+        // miss, big entry: the window grows to the wire length -> 2x len
+        let r = rec(20 << 20, 3, WINDOW as u64 + 1);
+        let len = (20usize << 20) + 3;
+        assert_eq!(
+            entry_fetch_bound(pack_len, 0, WINDOW as u64, &r),
+            Some(2 * len + FETCH_SCRATCH)
+        );
+        // the window clips at the pack's end
+        let r = rec(20 << 20, 3, pack_len - (5 << 20));
+        assert_eq!(
+            entry_fetch_bound(pack_len, 0, 0, &r),
+            Some((5 << 20) as usize + len + FETCH_SCRATCH)
+        );
+        // a wire span entry() rejects allocates nothing -> None
+        let r = rec((MAX_ENTRY_WIRE + 128) as u32, 3, 100);
+        assert_eq!(entry_fetch_bound(pack_len, 0, 0, &r), None);
+    }
+
+    /// The fetch bound drives the same guard as a decode bound: projected
+    /// live + window/copy sheds the cache, then fails in-band over
+    /// MEM_HARD — with the PRESSURE wording, since the push's heap is the
+    /// cause — while a fitting fetch passes untouched. (mem_fetch needs a
+    /// Bucket; this runs its bound through mem_guard_peak, the decision it
+    /// delegates to.)
+    #[test]
+    fn fetch_bound_drives_guard_with_pressure_wording() {
+        // a near-wire-limit entry on a miss: ~2x wire length incoming
+        let r = EntryRec {
+            offset: 1 << 20,
+            header_len: 4,
+            kind_or_delta: Header::Blob,
+            compressed_len: (30 << 20) as u32,
+            size: 1,
+        };
+        let incoming = entry_fetch_bound(1u64 << 30, 0, 0, &r).unwrap();
+        assert!(incoming > (55 << 20), "{incoming}");
+        // heap + fetch can't fit even after the shed -> Limit, cache shed
+        let mut c = Cache::default();
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
+            50usize << 20, // now = live + incoming -> over hard, shed runs
+            40 << 20,      // post-shed live for cleared_at
+            40 << 20,      // after = post-shed live + incoming -> still over
+        ]));
+        let live = || readings.borrow_mut().pop_front().unwrap_or(40 << 20);
+        let mut g = MemGuard::default();
+        let err =
+            mem_guard_peak(&mut c, live, || 0, || 1, &mut g, incoming, MEM_PRESSURE_MSG).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(err.message().contains("smaller slices"), "{err}");
+        assert!(!err.message().contains("object too large"), "{err}");
+        assert!(c.get(&Key::Off(1)).is_none(), "the shed ran before the Limit");
+        // a window-hit fetch on a calm heap passes untouched
+        let r = EntryRec {
+            offset: 100,
+            header_len: 3,
+            kind_or_delta: Header::Blob,
+            compressed_len: 1 << 20,
+            size: 1,
+        };
+        let incoming = entry_fetch_bound(1u64 << 30, 0, WINDOW as u64, &r).unwrap();
+        assert!(incoming < (2 << 20), "{incoming}");
+        let mut c = Cache::default();
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        let mut g = MemGuard::default();
+        mem_guard_peak(&mut c, || MEM_SOFT - (4 << 20), || 0, || 1, &mut g, incoming, MEM_PRESSURE_MSG)
+            .unwrap();
+        assert!(c.get(&Key::Off(2)).is_some());
+    }
+
+    /// The chain cap is checked BEFORE the fetch from the entry table's
+    /// known lengths: adding entry_len must keep both the per-chain and
+    /// the shared live bounds.
+    #[test]
+    fn chain_room_checks_both_bounds_before_fetch() {
+        // exactly at the cap fits; one byte over fails
+        assert!(chain_room(EDGE_CHAIN_BYTES - 100, 0, 100, EDGE_CHAIN_BYTES));
+        assert!(!chain_room(EDGE_CHAIN_BYTES - 99, 0, 100, EDGE_CHAIN_BYTES));
+        // the shared live bound applies across nested frames the same way
+        assert!(chain_room(0, MAX_CHAIN_LIVE - 100, 100, EDGE_CHAIN_BYTES));
+        assert!(!chain_room(0, MAX_CHAIN_LIVE - 99, 100, EDGE_CHAIN_BYTES));
+        // saturating adds: absurd lengths fail, never wrap
+        assert!(!chain_room(u64::MAX, 0, u64::MAX, EDGE_CHAIN_BYTES));
+    }
+
+    /// The prefetch batch is capped at EDGE_CACHE — the cache the entries
+    /// decode into — so early decodes can't evict entries still queued;
+    /// streamed bases over MAX_OBJ are skipped for external() to name.
+    #[test]
+    fn prefetch_locs_caps_at_edge_cache_and_skips_oversized() {
+        let oid = |n: u8| ObjectId::from_hex(format!("{n:02x}").repeat(20).as_bytes()).unwrap();
+        let loc = |len: u32, size: u64| ObjLoc {
+            pack: crate::store::PackId("p".into()),
+            idx: 0,
+            offset: 0,
+            len,
+            kind: Kind::Blob,
+            size,
+        };
+        // three 10 MiB bases: whichever order the map yields, the third
+        // crosses EDGE_CACHE (10+10+10 > 24) -> exactly two are kept
+        let mut bases = HashMap::new();
+        for n in 0..3u8 {
+            bases.insert(oid(n), loc(10 << 20, 1 << 20));
+        }
+        // a streamed base over MAX_OBJ never counts toward the sum
+        bases.insert(oid(3), loc(1 << 20, MAX_OBJ + 1));
+        let got = prefetch_locs(&bases);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|(_, l)| l.size <= MAX_OBJ));
+        assert!(got.iter().map(|(_, l)| u64::from(l.len)).sum::<u64>() <= EDGE_CACHE as u64);
+        // the exact-cap boundary is kept: the check is `>` not `>=`
+        let mut bases = HashMap::new();
+        bases.insert(oid(4), loc(12 << 20, 1 << 20));
+        bases.insert(oid(5), loc(12 << 20, 1 << 20));
+        assert_eq!(prefetch_locs(&bases).len(), 2);
     }
 }

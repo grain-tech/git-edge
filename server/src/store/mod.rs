@@ -31,11 +31,16 @@ fn room(buf: &mut Vec<u8>, part: usize, extra: usize) {
 }
 
 /// Upper bound on `codec::encode_entry`'s appended bytes for `n` input bytes:
-/// the varint header, the zlib wrapper, and deflate's stored-block worst case
-/// (~n/4096 expansion) — used to pre-size `part` so the encoder's own growth
-/// never doubles past the reserved whole parts.
+/// zlib's deflateBound shape (n + n/4096 + n/16384 + n/33M + 13) covers
+/// deflate's worst case, and the flat slack covers the varint header and
+/// rounding — used to pre-size `part` so the encoder's own growth never
+/// doubles past the reserved whole parts.
 fn encoded_bound(n: usize) -> usize {
-    n.saturating_add(n >> 12).saturating_add(320)
+    n.saturating_add(n >> 12)
+        .saturating_add(n >> 14)
+        .saturating_add(n >> 25)
+        .saturating_add(13)
+        .saturating_add(320)
 }
 
 /// Split `buf` at `n`: the head becomes an owned Vec for upload while `buf`
@@ -1574,5 +1579,30 @@ mod tests {
         assert!(buf.capacity() >= 3 && buf.capacity() <= 16, "cap={}", buf.capacity());
         room(&mut buf, 8, 5); // need 5 still fits the reserved part -> no regrow
         assert!(buf.capacity() <= 16, "cap={}", buf.capacity());
+    }
+
+    /// encoded_bound stays above the encoder's real output at the object
+    /// cap: 16 MiB of incompressible bytes is deflate's worst case, and a
+    /// bound that lands short lets `room` under-reserve so `extend` falls
+    /// back to Vec's doubling — a part-buffer spike the guard can't see.
+    #[test]
+    fn encoded_bound_covers_incompressible_max_obj() {
+        let mut data = vec![0u8; MAX_OBJECT as usize];
+        // xorshift64* — deterministic and incompressible to deflate
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for b in &mut data {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *b = (x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as u8;
+        }
+        let mut enc = Vec::new();
+        codec::encode_entry(Kind::Blob, &data, &mut enc).unwrap();
+        assert!(
+            encoded_bound(data.len()) >= enc.len(),
+            "bound {} < encoded {}",
+            encoded_bound(data.len()),
+            enc.len()
+        );
     }
 }
