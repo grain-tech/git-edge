@@ -63,14 +63,7 @@ async fn request_body_bytes(req: &mut Request, cap: usize, too_big: &'static str
     use wasm_bindgen::JsCast as _;
     let chunks = wasm_streams::ReadableStream::from_raw(raw.unchecked_into())
         .into_stream()
-        .map(|item| {
-            let v = item.map_err(|e| Error::Storage(format!("body stream: {e:?}")))?;
-            Ok(match v.dyn_into::<js_sys::Uint8Array>() {
-                Ok(a) => a,
-                Err(v) if v.is_instance_of::<js_sys::ArrayBuffer>() => js_sys::Uint8Array::new(&v),
-                Err(v) => return Err(Error::Storage(format!("body chunk is not bytes: {v:?}"))),
-            })
-        });
+        .map(body_chunk);
     fill_capped(cap, too_big, chunks).await
 }
 
@@ -97,6 +90,35 @@ where
         chunk.copy_into(&mut body[start..]);
     }
     Ok(body)
+}
+
+/// One stream chunk as its own Vec — the copy `BodyReader`'s stream
+/// performs per item. The reservation is fallible BEFORE the copy, so a
+/// refused allocation is the in-band retry Limit and the chunk is never
+/// copied.
+fn chunk_vec<C: BodyChunk>(c: &C) -> Result<Vec<u8>, Error> {
+    let mut v = crate::try_grow::zeroed(c.len())?;
+    c.copy_into(&mut v);
+    Ok(v)
+}
+
+/// One item off a request-body ReadableStream as a Uint8Array — the
+/// acceptance rule `request_body_bytes` and the R2 reader share: bytes
+/// arrive as a Uint8Array or an ArrayBuffer; anything else is a Storage
+/// error.
+fn body_chunk(item: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>) -> Result<js_sys::Uint8Array, Error> {
+    use wasm_bindgen::JsCast as _;
+    let v = item.map_err(|e| Error::Storage(format!("body stream: {e:?}")))?;
+    Ok(match v.dyn_into::<js_sys::Uint8Array>() {
+        Ok(a) => a,
+        Err(v) if v.is_instance_of::<js_sys::ArrayBuffer>() => js_sys::Uint8Array::new(&v),
+        Err(v) => return Err(Error::Storage(format!("body chunk is not bytes: {v:?}"))),
+    })
+}
+
+/// One stream item as the chunk Vec `BodyReader` buffers.
+fn body_vec(item: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>) -> Result<Vec<u8>, Error> {
+    chunk_vec(&body_chunk(item)?)
 }
 
 /// The request body as a chunked byte stream (section 6). gzip is decoded through a
@@ -130,14 +152,8 @@ impl BodyReader {
             let ds = web_sys::DecompressionStream::new(web_sys::CompressionFormat::Gzip)
                 .map_err(|e| Error::Internal(format!("DecompressionStream: {e:?}")))?;
             let body = raw.pipe_through(wasm_bindgen::JsCast::unchecked_ref::<web_sys::ReadableWritablePair>(&ds));
-            let stream = wasm_streams::ReadableStream::from_raw(body).into_stream();
-            return Ok(Self::wrap(stream.map(|item| {
-                let v = item.map_err(|e| Error::Storage(format!("body stream: {e:?}")))?;
-                let a = js_sys::Uint8Array::new(&v);
-                let mut b = vec![0u8; a.length() as usize];
-                a.copy_to(&mut b);
-                Ok(b)
-            })));
+            let stream = wasm_streams::ReadableStream::from_raw(body).into_stream().map(body_vec);
+            return Ok(Self::wrap(stream));
         }
         let declared_len = req
             .headers()
@@ -145,8 +161,12 @@ impl BodyReader {
             .ok()
             .flatten()
             .and_then(|v| v.trim().parse::<u64>().ok());
-        let stream = req.stream().map_err(|e| Error::Protocol(e.to_string()))?;
-        let mut r = Self::wrap(stream.map(|item| item.map_err(|e| Error::Storage(e.to_string()))));
+        let raw = req
+            .inner()
+            .body()
+            .ok_or_else(|| Error::Protocol("no body for request".into()))?;
+        let stream = wasm_streams::ReadableStream::from_raw(raw).into_stream().map(body_vec);
+        let mut r = Self::wrap(stream);
         r.declared_len = declared_len;
         Ok(r)
     }
@@ -169,6 +189,7 @@ impl BodyReader {
             match self.stream.next().await {
                 Some(Ok(chunk)) => {
                     self.total = self.total.saturating_add(chunk.len() as u64);
+                    crate::try_grow::vec(&mut self.buf, chunk.len())?;
                     self.buf.extend_from_slice(&chunk);
                 }
                 Some(Err(e)) => return Err(e),
@@ -1646,5 +1667,51 @@ mod tests {
         assert!(crate::try_grow::is_retry(&err), "{err}");
         assert_eq!(copies.get(), 0, "a refused reservation must not copy the chunk");
         assert_eq!(polls.get(), 1);
+    }
+
+    /// chunk_vec copies the chunk exactly once into a fresh Vec.
+    #[test]
+    fn chunk_vec_copies_the_chunk_exactly_once() {
+        let copies = Rc::new(Cell::new(0));
+        let c = Counted(vec![1, 2, 3], copies.clone());
+        assert_eq!(chunk_vec(&c).unwrap(), vec![1, 2, 3]);
+        assert_eq!(copies.get(), 1);
+    }
+
+    /// A refused reservation is the in-band retry Limit and the chunk is
+    /// never copied.
+    #[test]
+    fn chunk_vec_refused_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let copies = Rc::new(Cell::new(0));
+        let c = Counted(vec![7u8; 100], copies.clone());
+        crate::try_grow::fail_above(Some(50));
+        let err = chunk_vec(&c).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert_eq!(copies.get(), 0, "a refused reservation must not copy the chunk");
+    }
+
+    /// A zero-length chunk yields an empty Vec without asking the gate.
+    #[test]
+    fn chunk_vec_zero_length_asks_nothing() {
+        let _guard = crate::try_grow::HookGuard;
+        crate::try_grow::log_asks();
+        crate::try_grow::fail_above(Some(0));
+        let c = Counted(Vec::new(), Rc::new(Cell::new(0)));
+        assert!(chunk_vec(&c).unwrap().is_empty());
+        assert!(crate::try_grow::take_asks().is_empty(), "an empty chunk must not reach the gate");
+    }
+
+    /// The reader's own buffer grows through the same fallible
+    /// reservation: a refused growth is the in-band retry Limit and
+    /// buffers nothing.
+    #[test]
+    fn body_reader_fill_refused_buf_growth_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let mut body = BodyReader::from_chunks(vec![vec![7u8; 100]], None);
+        crate::try_grow::fail_above(Some(50));
+        let err = block_on(body.fill(1)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert!(body.buffered().is_empty(), "a refused growth buffers nothing");
     }
 }
