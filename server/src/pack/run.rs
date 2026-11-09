@@ -237,9 +237,16 @@ pub async fn lookup(
 /// Concurrent pass-B ingests per isolate. The resolve/normalize/finish span
 /// is the request's memory-heavy phase; pass A (stream_to_pending) already
 /// finished by the time this gate runs, so waiting never holds the upload.
-const INGEST_SLOTS_DEFAULT: i64 = 2;
+/// Default 1: two concurrent unsliced real-repo pushes in one isolate reached
+/// 89 MiB live heap / 131 MiB wasm linear memory — over the documented 128 MB
+/// limit — while one slot measured 66 MiB / 98 MiB.
+const INGEST_SLOTS_DEFAULT: i64 = 1;
 /// How long a push waits for a slot or a calm heap before answering busy.
-const INGEST_WAIT_MS_DEFAULT: i64 = 60_000;
+/// Default 240 s: a large unsliced pass B can run ~90 s, and an HTTP request
+/// has no wall-clock limit while the client stays connected, so outwaiting
+/// the queue beats rejecting the push busy — at 60 s a queued push was
+/// refused behind one ~90 s pass B.
+const INGEST_WAIT_MS_DEFAULT: i64 = 240_000;
 /// Poll cadence while waiting — short enough that a freed slot is picked up
 /// quickly, long enough that a queued push costs ~nothing.
 const INGEST_POLL_MS: u64 = 100;
@@ -446,7 +453,7 @@ mod tests {
     /// rule), <= 0 slots disables, <= 0 wait fails fast instead of waiting.
     #[test]
     fn ingest_gate_defaults_and_clamps() {
-        assert_eq!(ingest_gate(None, None), (2, 60_000));
+        assert_eq!(ingest_gate(None, None), (1, 240_000));
         assert_eq!(ingest_gate(Some(4), Some(1_234)), (4, 1_234));
         assert_eq!(ingest_gate(Some(0), None).0, 0, "slots <= 0 disables the gate");
         assert_eq!(ingest_gate(Some(-3), None).0, 0);
