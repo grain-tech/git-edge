@@ -253,8 +253,10 @@ impl IndexSink<'_> {
     }
     /// Serialize one post at its exact length — no String growth — and
     /// send it. The caller preflighted `post_alloc(post.json_len)`.
+    /// The body is one exact, fallible block; the request copy the stub
+    /// call makes lives on the JS side and stays inside the preflight.
     async fn post_rows(&self, post: &IndexPost<'_>, budget: &mut ReqBudget) -> Result<(), Error> {
-        let mut body = Vec::with_capacity(post.json_len);
+        let mut body = crate::try_grow::with_capacity(post.json_len)?;
         serde_json::to_writer(&mut body, post).map_err(|e| Error::Internal(e.to_string()))?;
         let _: serde_json::Value =
             stub_json_body(self.stub, self.repo, "/_do/push/index", body, budget).await?;

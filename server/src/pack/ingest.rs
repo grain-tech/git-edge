@@ -86,7 +86,9 @@ fn reserve_entries(
 ) -> Result<(), Error> {
     if let Some((target, peak)) = entries_growth(recs.len(), recs.capacity(), bound) {
         preflight(peak)?;
-        recs.reserve_exact(target - recs.len());
+        // the guard's headroom is a heuristic; the reservation itself is
+        // fallible, so a block the allocator cannot place answers in-band
+        crate::try_grow::vec_exact(recs, target - recs.len())?;
     }
     Ok(())
 }
@@ -253,10 +255,10 @@ async fn stream_inner(
     // The loop still rejects counts over MAX_ENTRIES.
     let bound = usize::try_from(count).unwrap_or(usize::MAX).min(MAX_ENTRIES);
     let (mut recs, mut pos, mut z, mut sink) = (
-        Vec::with_capacity(pass_a_presize(count, body.declared_len)),
+        crate::try_grow::with_capacity(pass_a_presize(count, body.declared_len))?,
         12u64,
         Decompress::new(),
-        vec![0u8; 64 << 10],
+        crate::try_grow::zeroed(64 << 10)?,
     );
     for _ in 0..count {
         if recs.len() >= MAX_ENTRIES {
@@ -390,7 +392,11 @@ impl Cache {
     /// capacity stops doubling past the payload, and `bytes` accounts
     /// `capacity()` — the allocator's real footprint, not just `len()` —
     /// plus CACHE_ENTRY_OVERHEAD per queued key.
-    fn put(&mut self, k: Key, kind: Kind, mut d: Vec<u8>) -> Obj {
+    fn put(&mut self, k: Key, kind: Kind, mut d: Vec<u8>) -> Result<Obj, Error> {
+        // both bookkeeping tables reserve fallibly BEFORE anything changes,
+        // so a refused block answers in-band and leaves the cache as it was
+        crate::try_grow::map(&mut self.map, 1)?;
+        crate::try_grow::deque(&mut self.order, 1)?;
         d.shrink_to_fit();
         let d = Rc::new(d);
         self.bytes = self.bytes.saturating_add(d.capacity()).saturating_add(CACHE_ENTRY_OVERHEAD);
@@ -409,7 +415,7 @@ impl Cache {
                 self.bytes = self.bytes.saturating_sub(v.capacity());
             }
         }
-        (kind, d)
+        Ok((kind, d))
     }
     /// Drop every cached object — resolved entries re-resolve lazily from the
     /// pending pack, so this is always safe, only slower.
@@ -478,9 +484,10 @@ impl MemReads {
             usize::try_from(off).map_err(internal)?,
             usize::try_from(off.saturating_add(n)).map_err(internal)?,
         );
-        obj.get(a..b)
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| Error::Storage(format!("mem read {key}@{off}+{n} past end")))
+        let bytes = obj
+            .get(a..b)
+            .ok_or_else(|| Error::Storage(format!("mem read {key}@{off}+{n} past end")))?;
+        crate::try_grow::copy(bytes)
     }
     async fn read_entries(&self, locs: &[(ObjectId, ObjLoc)], budget: &mut ReqBudget) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
         let mut out = Vec::with_capacity(locs.len());
@@ -498,14 +505,17 @@ impl Source<'_> {
         match self {
             Source::Key(k) => reads.read_range(k, off, n, budget).await,
             Source::Parts(parts) => {
-                let mut out = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
+                // one exact, fallible block; each part's read lands inside it
+                let mut out = crate::try_grow::with_capacity(usize::try_from(n).unwrap_or(0))?;
                 let want_end = off.saturating_add(n);
                 let mut base = 0u64;
                 for (key, len) in *parts {
                     let end = base.saturating_add(*len);
                     let (a, b) = (off.max(base), want_end.min(end));
                     if a < b {
-                        out.extend_from_slice(&reads.read_range(key, a - base, b - a, budget).await?);
+                        let part = reads.read_range(key, a - base, b - a, budget).await?;
+                        crate::try_grow::vec_exact(&mut out, part.len())?;
+                        out.extend_from_slice(&part);
                     }
                     if b >= want_end {
                         break;
@@ -559,7 +569,10 @@ impl Window<'_> {
             usize::try_from(lo).map_err(internal)?,
             usize::try_from(lo.saturating_add(len)).map_err(internal)?,
         );
-        self.buf.get(a..b).map(<[u8]>::to_vec).ok_or_else(|| Error::Storage("entry outside window".into()))
+        // the window's own buffer comes from the range read (an R2 body,
+        // preflighted by mem_fetch); the entry copy is ours and fallible
+        let bytes = self.buf.get(a..b).ok_or_else(|| Error::Storage("entry outside window".into()))?;
+        crate::try_grow::copy(bytes)
     }
     /// Raw range read for the verbatim blob path — same source abstraction.
     async fn read(&mut self, off: u64, n: u64, budget: &mut ReqBudget) -> Result<Vec<u8>, Error> {
@@ -639,15 +652,14 @@ impl IdMap<'_> {
             }
         }
     }
-    fn insert(&mut self, id: ObjectId, i: usize) {
-        match self {
-            IdMap::Map(m) => {
-                m.insert(id, i);
-            }
-            IdMap::Sql { mem, .. } => {
-                mem.insert(id, i);
-            }
-        }
+    fn insert(&mut self, id: ObjectId, i: usize) -> Result<(), Error> {
+        let m = match self {
+            IdMap::Map(m) => m,
+            IdMap::Sql { mem, .. } => mem,
+        };
+        crate::try_grow::map(m, 1)?;
+        m.insert(id, i);
+        Ok(())
     }
 }
 
@@ -783,6 +795,7 @@ impl AnySink<'_, '_> {
     pub fn push_links(&mut self, links: Vec<ObjectId>) -> Result<(), Error> {
         match self {
             AnySink::Edge(s) => {
+                crate::try_grow::vec(&mut s.links, links.len())?;
                 s.links.extend(links);
                 if s.links.len() > super::run::MAX_LINKS {
                     return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
@@ -792,6 +805,7 @@ impl AnySink<'_, '_> {
             AnySink::Job(s) => s.push_links(links),
             #[cfg(test)]
             AnySink::Mem(s) => {
+                crate::try_grow::vec(&mut s.links, links.len())?;
                 s.links.extend(links);
                 if s.links.len() > super::run::MAX_LINKS {
                     return Err(Error::Limit("push references too many objects (1,000,000 max)".into()));
@@ -924,6 +938,7 @@ impl JobSink<'_> {
         if self.links_total > super::run::MAX_LINKS * 8 {
             return Err(Error::Limit("push references too many objects (8,000,000 max)".into()));
         }
+        crate::try_grow::vec(&mut self.links_buf, links.len())?;
         self.links_buf.extend(links);
         if self.links_buf.len() >= 10_000 {
             self.flush_links()?;
@@ -1076,7 +1091,7 @@ impl Cx<'_> {
             let bound = self.cache.put_growth_bound();
             self.mem_grow(bound, None, site)?;
         }
-        Ok(self.cache.put(k, kind, d))
+        self.cache.put(k, kind, d)
     }
 
     /// Preflight for `Bucket::read_entries(locs)` — the external-base fetch
@@ -1875,7 +1890,9 @@ pub async fn resolve_and_normalize<O: PackOut>(
     // paying an unguarded doubling per insert
     if need_ids {
         cx.mem_grow(id_map_bound(entries.len()), None, "grow:by_id")?;
-        cx.by_id = IdMap::Map(HashMap::with_capacity(entries.len()));
+        let mut ids = HashMap::new();
+        crate::try_grow::map(&mut ids, entries.len())?;
+        cx.by_id = IdMap::Map(ids);
     }
     let toc = Toc::Mem(entries);
     let mut rows = Vec::new();
@@ -1896,7 +1913,7 @@ pub async fn resolve_and_normalize<O: PackOut>(
         "grow:order",
     )?;
     let mut pending: HashMap<ObjectId, Vec<usize>> = HashMap::new();
-    let mut order: Vec<usize> = Vec::with_capacity(entries.len());
+    let mut order: Vec<usize> = crate::try_grow::with_capacity(entries.len())?;
     order.extend(0..entries.len());
     let mut i = 0;
     while i < order.len() {
@@ -1906,11 +1923,15 @@ pub async fn resolve_and_normalize<O: PackOut>(
         match one_entry(&mut cx, &toc, at, need_ids, out, sink, &mut rows, budget, 0).await? {
             Step::Done(id) => {
                 if let Some(ws) = pending.remove(&id) {
+                    crate::try_grow::vec(&mut order, ws.len())?;
                     order.extend(ws);
                 }
             }
             Step::Await(base) => {
-                pending.entry(base).or_default().push(at);
+                crate::try_grow::map(&mut pending, 1)?;
+                let waiters = pending.entry(base).or_default();
+                crate::try_grow::vec(waiters, 1)?;
+                waiters.push(at);
             }
         }
     }
@@ -1991,11 +2012,18 @@ pub async fn one_entry<O: PackOut>(
     cx.mem_grow(links_bound(kind, data.len(), cx.obj_kind), None, "grow:links-extract")?;
     let links = extract_links(kind, &data, cx.obj_kind)?;
     // protected refs: extract_links puts a commit's tree first, then parents
-    let parents = (kind == Kind::Commit).then(|| links.iter().skip(1).copied().collect::<Vec<_>>());
+    let parents = if kind == Kind::Commit {
+        let mut p = crate::try_grow::with_capacity(links.len().saturating_sub(1))?;
+        p.extend(links.iter().skip(1).copied());
+        Some(p)
+    } else {
+        None
+    };
     if kind == Kind::Tag {
         if let Some(&t) = links.first() {
             // the tag map doubles as tags accumulate — preflight its resize
             cx.mem_grow(sink.tags_growth_bound(), None, "grow:tags")?;
+            crate::try_grow::map(sink.tags_mut(), 1)?;
             sink.tags_mut().insert(id, t);
         }
     }
@@ -2028,6 +2056,7 @@ pub async fn one_entry<O: PackOut>(
     // preflight it (plus slack) before the split can allocate
     cx.mem_grow(out.chunk_bound() + STREAM_SLACK, None, "grow:writer-flush")?;
     out.flush_if_full(budget).await?;
+    crate::try_grow::vec(rows, 1)?;
     rows.push(ObjRow {
         sha: id,
         idx: u32::try_from(i).map_err(|_| unpack("too many objects"))?,
@@ -2039,7 +2068,7 @@ pub async fn one_entry<O: PackOut>(
     });
     sink.seal(i, offset.saturating_add(u64::from(len)), id)?;
     if need_ids {
-        cx.by_id.insert(id, i);
+        cx.by_id.insert(id, i)?;
     }
     cx.cache_put(Key::Off(rec.offset), kind, data, "grow:cache-entry")?;
     if rows.len() >= sink.row_batch() {
@@ -2131,6 +2160,7 @@ async fn stream_blob<O: PackOut>(
     }
     let id = h.try_finalize().map_err(|_| unpack("sha1 collision"))?;
     let (offset, len) = out.raw_entry_done(Kind::Blob, start)?;
+    crate::try_grow::vec(rows, 1)?;
     rows.push(ObjRow {
         sha: id,
         idx: u32::try_from(i).map_err(|_| unpack("too many objects"))?,
@@ -2142,7 +2172,7 @@ async fn stream_blob<O: PackOut>(
     });
     sink.seal(i, offset.saturating_add(u64::from(len)), id)?;
     if need_ids {
-        cx.by_id.insert(id, i);
+        cx.by_id.insert(id, i)?;
     }
     if rows.len() >= sink.row_batch() {
         cx.mem_grow(sink.post_bound(rows)?, None, "grow:index-blob")?;
@@ -2162,13 +2192,19 @@ pub fn extract_links(kind: Kind, data: &[u8], obj_kind: H) -> Result<Vec<ObjectI
             let mut it = gix_object::CommitRefIter::from_bytes(data, obj_kind);
             // strict: a commit whose tree header doesn't parse is not a valid commit —
             // storing it would hard-fail every later fetch that walks it
-            out.push(it.tree_id().map_err(|e| Error::Unpack(e.to_string()))?);
-            out.extend(it.parent_ids());
+            let tree = it.tree_id().map_err(|e| Error::Unpack(e.to_string()))?;
+            crate::try_grow::vec(&mut out, 1)?;
+            out.push(tree);
+            for p in it.parent_ids() {
+                crate::try_grow::vec(&mut out, 1)?;
+                out.push(p);
+            }
         }
         Kind::Tree => {
             for e in gix_object::TreeRefIter::from_bytes(data, obj_kind) {
                 let e = e.map_err(|e| Error::Unpack(e.to_string()))?;
                 if !e.mode.is_commit() {
+                    crate::try_grow::vec(&mut out, 1)?;
                     out.push(e.oid.to_owned());
                 }
             }
@@ -2176,6 +2212,7 @@ pub fn extract_links(kind: Kind, data: &[u8], obj_kind: H) -> Result<Vec<ObjectI
         Kind::Tag => {
             let t = gix_object::TagRef::from_bytes(data, obj_kind)
                 .map_err(|e| Error::Unpack(e.to_string()))?;
+            crate::try_grow::vec(&mut out, 1)?;
             out.push(t.target());
         }
         Kind::Blob => {}
@@ -2198,8 +2235,8 @@ mod tests {
     #[test]
     fn cache_accounts_capacity_and_evicts_lru() {
         let mut c = Cache::with_budget(100 + 2 * CACHE_ENTRY_OVERHEAD);
-        c.put(Key::Off(1), Kind::Blob, vec![7u8; 60]);
-        c.put(Key::Off(2), Kind::Blob, vec![9u8; 60]);
+        c.put(Key::Off(1), Kind::Blob, vec![7u8; 60]).unwrap();
+        c.put(Key::Off(2), Kind::Blob, vec![9u8; 60]).unwrap();
         // second put overflowed the budget: the oldest entry was evicted
         assert!(c.get(&Key::Off(1)).is_none());
         assert!(c.get(&Key::Off(2)).is_some());
@@ -2215,7 +2252,7 @@ mod tests {
     fn mem_guard_soft_clears_hard_limits() {
         // under the soft ceiling: untouched
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         mem_guard(&mut c, || MEM_SOFT, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_some());
@@ -2254,7 +2291,7 @@ mod tests {
         // live high enough that the allocation cannot reuse free pages
         let live = LINEAR_CAP - 8 * MIB;
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         let err = mem_guard_peak(&mut c, || live, || LINEAR_CAP, || 1, &mut g, MIB, None, "test:lin").unwrap_err();
         assert!(matches!(err, Error::Limit(_)));
@@ -2268,7 +2305,7 @@ mod tests {
         assert_eq!(err.message(), LINEAR_PRESSURE_MSG);
         // relief calls (incoming 0) never trip, even far over the cap
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         mem_guard(&mut c, || 10 * MIB, || LINEAR_CAP + 64 * MIB, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_some(), "no forced clear when the check passes");
@@ -2282,7 +2319,7 @@ mod tests {
     fn mem_guard_sticky_high_linear_with_low_live_admits_reuse() {
         const MIB: usize = 1 << 20;
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         // 120 MiB linear (over the cap), 20 MiB live, a 16 MiB window fetch
         mem_guard_peak(&mut c, || 20 * MIB, || 120 * MIB, || 1, &mut g, 16 * MIB, None, "test:lin").unwrap();
@@ -2364,7 +2401,7 @@ mod tests {
         assert_eq!(err.message(), LINEAR_PRESSURE_MSG);
         // and the first check's cap boundary: exactly at the cap never sheds
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         mem_guard_peak(&mut c, || 60 * MIB, || LINEAR_CAP - incoming, || 1, &mut g, incoming, None, "test:lin").unwrap();
         assert!(c.get(&Key::Off(1)).is_some(), "at the cap exactly: no trip, no forced clear");
@@ -2377,7 +2414,7 @@ mod tests {
     #[test]
     fn mem_guard_hysteresis_sheds_once_per_growth() {
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         // first crossing sheds and records the reading
         mem_guard(&mut c, || MEM_SOFT + 1, || 0, || 1, &mut g).unwrap();
@@ -2385,7 +2422,7 @@ mod tests {
         assert_eq!(g.cleared_at, Some(MEM_SOFT + 1));
         // the cache refills; heap grew < MEM_HYSTERESIS since the shed and
         // stays under MEM_HARD: no shed — the whole point of the hysteresis
-        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]).unwrap();
         let live = MEM_SOFT + 1 + MEM_HYSTERESIS - 1;
         mem_guard(&mut c, || live, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(2)).is_some(), "sub-hysteresis growth keeps the cache");
@@ -2404,7 +2441,7 @@ mod tests {
     #[test]
     fn mem_guard_hysteresis_baseline_is_post_shed() {
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         // live() call order inside mem_guard: pre-shed `now`, the
         // post-clear `cleared_at` write, then the post-shed hard check.
         // The shed drains 90 -> 82 MiB here.
@@ -2428,7 +2465,7 @@ mod tests {
         assert_eq!(g.cleared_at, Some(82 << 20), "baseline is the post-shed reading");
         assert!(c.get(&Key::Off(1)).is_none());
         // regrowth measured from 82, not 90: 85 - 82 = 3 < MEM_HYSTERESIS
-        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]).unwrap();
         mem_guard(&mut c, live, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(2)).is_some(), "sub-hysteresis growth keeps the cache");
         // 90 - 82 = 8 >= MEM_HYSTERESIS: sheds — with the buggy pre-shed
@@ -2445,7 +2482,7 @@ mod tests {
     #[test]
     fn mem_guard_linear_trip_sheds_before_judging() {
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         g.cleared_at = Some(82 << 20); // sub-hysteresis regrowth — hysteresis alone would skip
         let err = mem_guard_peak(&mut c, || 85 << 20, || LINEAR_CAP, || 1, &mut g, 12 << 20, None, "test:lin").unwrap_err();
@@ -2460,7 +2497,7 @@ mod tests {
     #[test]
     fn mem_guard_hard_band_always_sheds() {
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         g.cleared_at = Some(MEM_HARD); // a shed just happened — still sheds
         let err = mem_guard(&mut c, || MEM_HARD + 1, || 0, || 1, &mut g).unwrap_err();
@@ -2647,7 +2684,7 @@ mod tests {
         // alone + too big even after shed: Limit, cache shed. A decode
         // bound under PER_OBJECT_DECODE gets the whole-push wording —
         // smaller slices CAN shrink it.
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
             90usize << 20, // now = live + incoming -> over hard, shed runs
             60 << 20,      // post-shed live for cleared_at
@@ -2676,7 +2713,7 @@ mod tests {
         assert!(err.message().contains(INGEST_BUSY_MSG), "{err}");
         // shed makes it fit: post-shed live + incoming stays under MEM_HARD
         let mut c = Cache::default();
-        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]).unwrap();
         let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
             90usize << 20, 50 << 20, 50 << 20,
         ]));
@@ -2694,7 +2731,7 @@ mod tests {
     #[test]
     fn mem_guard_peak_incoming_is_not_growth() {
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         g.cleared_at = Some(70 << 20);
         // flat heap + incoming > MEM_HYSTERESIS: projected pressure is real
@@ -2704,7 +2741,7 @@ mod tests {
         assert_eq!(g.cleared_at, Some(70 << 20));
         // genuine regrowth >= MEM_HYSTERESIS still sheds with incoming present
         let mut c = Cache::default();
-        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]).unwrap();
         let mut g = MemGuard::default();
         g.cleared_at = Some(70 << 20);
         mem_guard_peak(&mut c, || 79 << 20, || 0, || 1, &mut g, 2 << 20, None, "test:decode").unwrap();
@@ -2775,7 +2812,7 @@ mod tests {
         assert!(incoming > (55 << 20), "{incoming}");
         // heap + fetch can't fit even after the shed -> Limit, cache shed
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let readings = std::cell::RefCell::new(std::collections::VecDeque::from([
             50usize << 20, // now = live + incoming -> over hard, shed runs
             40 << 20,      // post-shed live for cleared_at
@@ -2800,7 +2837,7 @@ mod tests {
         let incoming = entry_fetch_bound(1u64 << 30, 0, WINDOW as u64, &r).unwrap();
         assert!(incoming < (2 << 20), "{incoming}");
         let mut c = Cache::default();
-        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]).unwrap();
         let mut g = MemGuard::default();
         mem_guard_peak(&mut c, || MEM_SOFT - (4 << 20), || 0, || 1, &mut g, incoming, None, "test:fetch")
             .unwrap();
@@ -3375,7 +3412,7 @@ mod tests {
     fn mem_guard_hard_boundary_is_strict() {
         // exactly MEM_HARD after shed: passes, cache already shed by soft path
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         // now = MEM_HARD -> over soft, sheds (cleared_at none), after = MEM_HARD -> not > -> Ok
         mem_guard(&mut c, || MEM_HARD, || 0, || 1, &mut g).unwrap();
@@ -3395,13 +3432,13 @@ mod tests {
         // first crossing (cleared_at None) in the soft band sheds even
         // though grew can't be true yet — proves the is_none arm fires alone
         let mut c = Cache::default();
-        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]);
+        c.put(Key::Off(1), Kind::Blob, vec![1u8; 8]).unwrap();
         let mut g = MemGuard::default();
         mem_guard(&mut c, || MEM_SOFT + 1, || 0, || 1, &mut g).unwrap();
         assert!(c.get(&Key::Off(1)).is_none(), "first crossing sheds via is_none arm");
         // hysteresis arm alone: cleared_at set, grew >= MEM_HYSTERESIS, under hard
         let mut c = Cache::default();
-        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]);
+        c.put(Key::Off(2), Kind::Blob, vec![2u8; 8]).unwrap();
         let mut g = MemGuard::default();
         g.cleared_at = Some(MEM_SOFT);
         let live = MEM_SOFT + MEM_HYSTERESIS; // grew exactly MEM_HYSTERESIS
@@ -3422,7 +3459,7 @@ mod tests {
         let mut v = Vec::with_capacity(60);
         v.extend_from_slice(&[7u8; 10]);
         assert!(v.capacity() >= 60 && v.len() == 10);
-        c.put(Key::Off(1), Kind::Blob, v);
+        c.put(Key::Off(1), Kind::Blob, v).unwrap();
         let stored = c.map.get(&Key::Off(1)).unwrap().1.clone();
         // after shrink_to_fit capacity may equal len — the point is bytes
         // equals the STORED vec's capacity(), whatever it is, plus overhead
@@ -3438,7 +3475,7 @@ mod tests {
         let mut v = Vec::with_capacity(1 << 20);
         v.extend_from_slice(&[3u8; 100]);
         assert!(v.capacity() > 100);
-        c.put(Key::Off(9), Kind::Blob, v);
+        c.put(Key::Off(9), Kind::Blob, v).unwrap();
         let stored = c.map.get(&Key::Off(9)).unwrap().1.clone();
         assert_eq!(stored.capacity(), stored.len(), "shrink_to_fit ran");
     }
@@ -3614,13 +3651,13 @@ mod tests {
     fn cache_budget_bounds_tiny_entries_by_overhead() {
         let mut c = Cache::with_budget(100 * CACHE_ENTRY_OVERHEAD);
         for i in 0..10_000u64 {
-            c.put(Key::Off(i), Kind::Blob, Vec::new());
+            c.put(Key::Off(i), Kind::Blob, Vec::new()).unwrap();
         }
         assert_eq!(c.map.len(), 100);
         assert_eq!(c.order.len(), 100);
         assert!(c.bytes <= c.budget);
         for _ in 0..10_000 {
-            c.put(Key::Off(7), Kind::Blob, vec![1]);
+            c.put(Key::Off(7), Kind::Blob, vec![1]).unwrap();
         }
         assert!(c.order.len() <= 100, "re-puts grew the queue to {}", c.order.len());
         assert!(c.bytes <= c.budget);
@@ -3655,7 +3692,7 @@ mod tests {
         }
         let mut c = Cache::with_budget(usize::MAX);
         assert!(c.put_growth_bound() > 0, "the first put allocates both tables");
-        c.put(Key::Off(0), Kind::Blob, vec![1]);
+        c.put(Key::Off(0), Kind::Blob, vec![1]).unwrap();
         if c.map.len() < c.map.capacity() && c.order.len() < c.order.capacity() {
             assert_eq!(c.put_growth_bound(), 0);
         }
@@ -3748,6 +3785,57 @@ mod tests {
         res.unwrap();
         assert_eq!(recs.capacity(), MAX_ENTRIES);
         assert_eq!(preflight_sites(), vec![("grow:pass-a-entries", incoming)]);
+    }
+
+    /// The bookkeeping sites reserve fallibly: a refused block is the
+    /// in-band memory Limit, never a panic, and the state stays as it was.
+    #[test]
+    fn links_and_cache_failed_reservation_is_in_band() {
+        let ids = vec![ObjectId::null(H::Sha1); 1_000];
+        let mut sink = MemSink::default();
+        let mut c = Cache::with_budget(usize::MAX);
+        let mut tree = Vec::new();
+        for n in 0..2_000u32 {
+            tree.extend_from_slice(format!("100644 f{n}\0").as_bytes());
+            tree.extend_from_slice(&[1u8; 20]);
+        }
+        crate::try_grow::fail_above(Some(1_024));
+        let links = AnySink::Mem(&mut sink).push_links(ids.clone());
+        let extract = extract_links(Kind::Tree, &tree, H::Sha1);
+        crate::try_grow::fail_above(Some(0));
+        let put = c.put(Key::Off(1), Kind::Blob, vec![1]);
+        crate::try_grow::fail_above(None);
+        assert!(crate::try_grow::is_retry(&links.unwrap_err()));
+        assert!(sink.links.is_empty(), "a refused growth adds no links");
+        assert!(crate::try_grow::is_retry(&extract.unwrap_err()));
+        assert!(crate::try_grow::is_retry(&put.unwrap_err()));
+        assert_eq!((c.map.len(), c.order.len(), c.bytes), (0, 0, 0), "a refused put leaves the cache as it was");
+        // the hook off: the same calls succeed
+        AnySink::Mem(&mut sink).push_links(ids).unwrap();
+        assert_eq!(extract_links(Kind::Tree, &tree, H::Sha1).unwrap().len(), 2_000);
+        c.put(Key::Off(1), Kind::Blob, vec![1]).unwrap();
+    }
+
+    /// The real resolve loop under a refused reservation: a 1 MiB blob's
+    /// decode work Vec cannot be placed, and the push answers with the
+    /// in-band retry Limit instead of trapping.
+    #[test]
+    fn resolve_loop_failed_reservation_is_in_band() {
+        let big = vec![3u8; 1 << 20];
+        let (pack, recs) = mk_pack(&[(Kind::Blob, b"small"), (Kind::Blob, &big)]);
+        let empty: HashMap<ObjectId, ObjLoc> = HashMap::new();
+        let key = "pending/p-oom.pack";
+        let mut mem = MemReads::new(crate::store::RepoId("o/r".into()));
+        mem.put(key, pack);
+        let mut out = MemPackOut { buf: Vec::with_capacity(crate::store::PART) };
+        let mut sink = MemSink::default();
+        crate::try_grow::fail_above(Some(256 << 10));
+        let res = block_on(drive(&mem, key, &recs, Externals::Map(&empty), &mut out, &mut sink));
+        crate::try_grow::fail_above(None);
+        match res {
+            Err(e) => assert!(crate::try_grow::is_retry(&e), "{e}"),
+            Ok(_) => panic!("the 1 MiB decode must be refused"),
+        }
     }
 
     #[test]
