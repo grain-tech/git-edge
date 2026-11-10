@@ -13,7 +13,7 @@ GC must never delete an object row or the R2 bytes of a pack that a live ref, an
 bash verification/tla/verify.sh
 ```
 
-The script needs bash, curl, sha256sum and tar. It uses `java` 11 or later from PATH. Otherwise, on Linux x86_64, it downloads Temurin JRE 21.0.13+9 and checks the tarball's sha256 `a535a1df9c6284d9618872984e026ae0352d1f7e9e0605425c0e6114f47351dd`. It downloads `tla2tools.jar` v1.7.4 and refuses any jar whose sha256 is not `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`. Both live in `${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}`. TLC state files go to a temp dir, so the script writes nothing into the repo. A run takes about one and a half minutes.
+The script needs bash, curl, sha256sum and tar. It uses `java` 11 or later from PATH. Otherwise, on Linux x86_64, it downloads Temurin JRE 21.0.13+9 and checks the tarball's sha256 `a535a1df9c6284d9618872984e026ae0352d1f7e9e0605425c0e6114f47351dd`. It downloads `tla2tools.jar` v1.7.4 and refuses any jar whose sha256 is not `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`. Both live in `${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}`. TLC state files go to a temp dir, so the script writes nothing into the repo. Each TLC run takes one to two seconds. A full run takes under two minutes, most of it JVM start-up.
 
 The script runs four kinds of check:
 
