@@ -96,8 +96,8 @@ run_case() { # cfg invariant: TLC exits 12 (safety violation) on that invariant
 
 run_reach() { # barrier world pushes guard: the clean model reaches the guarded state
   local cfg="$META/reach-$1-$2-$4.cfg"
-  printf 'SPECIFICATION Spec\nCONSTANTS\n  Barrier = %s\n  Bug = "none"\n  MaxChains = 2\n  DeltaCap = 1\n  MaxErrs = 1\n  Scope = "full"\n  World = "%s"\n  MaxPushes = %s\nINVARIANT\n  %s\n' \
-    "$1" "$2" "$3" "$4" >"$cfg"
+  printf 'SPECIFICATION Spec\nCONSTANTS\n  Barrier = %s\n  Bug = "none"\n  MaxChains = 2\n  DeltaCap = 1\n  MaxErrs = 1\n  Scope = "full"\n  World = "%s"\n  Garbage = %s\n  MaxPushes = %s\nINVARIANT\n  %s\n' \
+    "$1" "$2" "$([ "$2" = kept ] && echo FALSE || echo TRUE)" "$3" "$4" >"$cfg"
   run_tlc GcBarrierReach.tla "$cfg"
   local got mode
   got="$(violated_invariant "$OUT")"
@@ -126,6 +126,8 @@ run_finding() { # cfg invariant: a known finding in the real design. TLC
 run_clean GcBarrier_barrier.cfg
 run_clean GcBarrier_legacy.cfg
 run_clean GcBarrier_split_legacy.cfg
+run_clean GcBarrier_kept_barrier.cfg
+run_clean GcBarrier_kept_legacy.cfg
 run_clean statechart/ThinPushRace.cfg
 
 for g in Reach_LandThenRetire Reach_LoserThenRetire Reach_BareLandsMidChain \
@@ -136,6 +138,8 @@ done
 run_reach TRUE single 1 Reach_DrainMarksNew
 run_reach TRUE single 1 Reach_DeltaHandoff
 run_reach TRUE split 2 Reach_PartialRetire
+run_reach TRUE kept 2 Reach_FallbackRetire
+run_reach TRUE kept 2 Reach_NonLossySwap
 
 run_case GcBarrier_bug_noBarrierPending.cfg        YoungPacksClosed
 run_case GcBarrier_bug_noLandingFeed.cfg           RefsResolvable
@@ -143,6 +147,7 @@ run_case GcBarrier_bug_noEpochCheck.cfg            YoungPacksClosed
 run_case GcBarrier_bug_sweepIgnoresRefsVersion.cfg RefsResolvable
 run_case GcBarrier_bug_abortDropsSurvivor.cfg      RefsResolvable
 run_case GcBarrier_bug_janitorNoGrace.cfg          FetchReadsSucceed
+run_case GcBarrier_bug_fallbackUsesBitmap.cfg      RefsResolvable
 
 run_finding GcBarrier_finding_split.cfg      LiveClosed
 run_finding GcBarrier_finding_split_refs.cfg RefsResolvable

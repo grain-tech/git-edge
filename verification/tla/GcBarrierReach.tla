@@ -51,4 +51,12 @@ Reach_PartialRetire ==
   ~(refs["gc"] = "c" /\ packs["P0"] = "dead" /\ packs["P1"] = "live"
     /\ phase = "idle")
 
+(* kept world: fallback_span retired P0 with no gc_epoch bump *)
+Reach_FallbackRetire ==
+  ~(packs["P0"] = "dead" /\ diedBy["P0"] = "fallback" /\ epoch = 0)
+
+(* kept world: fenced_swap retired P0 losslessly, with no gc_epoch bump *)
+Reach_NonLossySwap ==
+  ~(packs["P0"] = "dead" /\ diedBy["P0"] = "swap" /\ epoch = 0)
+
 =============================================================================

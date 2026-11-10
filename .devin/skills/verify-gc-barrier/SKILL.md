@@ -29,6 +29,8 @@ Expected output at the sync commit:
 ok  GcBarrier_barrier.cfg                        clean, 8461 distinct states
 ok  GcBarrier_legacy.cfg                         clean, 3418 distinct states
 ok  GcBarrier_split_legacy.cfg                   clean, 20371 distinct states
+ok  GcBarrier_kept_barrier.cfg                   clean, 61846 distinct states
+ok  GcBarrier_kept_legacy.cfg                    clean, 19891 distinct states
 ok  statechart/ThinPushRace.cfg                  clean, 138 distinct states
 ok  reach barrier Reach_LandThenRetire           reached
 ok  reach legacy Reach_LandThenRetire            reached
@@ -45,12 +47,15 @@ ok  reach legacy Reach_FetchOutlivesPack         reached
 ok  reach barrier Reach_DrainMarksNew            reached
 ok  reach barrier Reach_DeltaHandoff             reached
 ok  reach barrier split Reach_PartialRetire      reached
+ok  reach barrier kept Reach_FallbackRetire      reached
+ok  reach barrier kept Reach_NonLossySwap        reached
 ok  GcBarrier_bug_noBarrierPending.cfg           violated YoungPacksClosed, 1049 distinct states
 ok  GcBarrier_bug_noLandingFeed.cfg              violated RefsResolvable, 523 distinct states
 ok  GcBarrier_bug_noEpochCheck.cfg               violated YoungPacksClosed, 1116 distinct states
 ok  GcBarrier_bug_sweepIgnoresRefsVersion.cfg    violated RefsResolvable, 434 distinct states
 ok  GcBarrier_bug_abortDropsSurvivor.cfg         violated RefsResolvable, 373 distinct states
 ok  GcBarrier_bug_janitorNoGrace.cfg             violated FetchReadsSucceed, 565 distinct states
+ok  GcBarrier_bug_fallbackUsesBitmap.cfg         violated RefsResolvable, 2837 distinct states
 FINDING GcBarrier_finding_split.cfg              violated LiveClosed, 2872 distinct states
 FINDING GcBarrier_finding_split_refs.cfg         violated RefsResolvable, 6515 distinct states
 verify: all checks passed, with 2 known findings
@@ -73,6 +78,42 @@ A different state count with the same verdicts means the model or a config chang
 
 `YoungPacksClosed` is the model's form of the `U ⊆ P` oracle in `testhooks.rs` `mark_check`. GC treats every live non-candidate pack as a root, through the young-pack seed in `gc_mark` and the pending page. `LiveClosed` also covers old packs. An old pack that a sweep keeps is not a root, so only `LiveClosed` sees the finding below.
 
+## What each check means
+
+Clean configs. Each one checks every invariant in every reachable state.
+
+| Config | World and mode |
+| --- | --- |
+| `GcBarrier_barrier.cfg`, `GcBarrier_legacy.cfg` | Single world: one candidate, one thin or bare push, both modes. |
+| `GcBarrier_split_legacy.cfg` | Split world, legacy mode. `pr5_sweep` retires the whole cohort, so the finding does not apply. |
+| `GcBarrier_kept_barrier.cfg`, `GcBarrier_kept_legacy.cfg` | Kept world without garbage, both modes. Covers the fallback retirement and the swap with no epoch bump. |
+| `statechart/ThinPushRace.cfg` | The chart scope of the single world. |
+
+Vacuity guards. Each one names a state that the clean model must reach.
+
+| Guard | The state it reaches |
+| --- | --- |
+| `Reach_LandThenRetire` | The thin push landed `main` at `c2`, and a later sweep still retired P0. |
+| `Reach_LoserThenRetire` | A push lost its CAS, its pack went live, and P0 still retired. |
+| `Reach_BareLandsMidChain` | The bare push created ref `g` while a chain stood. |
+| `Reach_ErrThenSurvivor` | A sweep hit an Err after its dead-mark, and the chain ended with a live build pack. |
+| `Reach_EpochReject` | The `gc_epoch` check rejected the push. |
+| `Reach_FetchOutlivesPack` | A fetch planned a pack that died before the fetch read it. |
+| `Reach_DrainMarksNew` | The barrier drain marked `b` after the built snapshot. |
+| `Reach_DeltaHandoff` | The barrier delta arm handed off to build with a non-empty frontier. |
+| `Reach_PartialRetire` | Split world: the swap kept P1 and retired P0 after a ref landed at `c`. This is the schedule of Finding 1. |
+| `Reach_FallbackRetire` | Kept world: `fallback_span` retired P0 with no `gc_epoch` bump. |
+| `Reach_NonLossySwap` | Kept world: `fenced_swap` retired P0 with no `gc_epoch` bump. |
+
+Bug variants. Each one is in the table above and must fail on its named invariant.
+
+Known findings. Each one must still fail on its named invariant.
+
+| Config | Fails | Meaning |
+| --- | --- | --- |
+| `GcBarrier_finding_split.cfg` | `LiveClosed` | Finding 1. A partial retirement leaves a live object that links to a deleted object. |
+| `GcBarrier_finding_split_refs.cfg` | `RefsResolvable` | Finding 1, the harm. The config leaves `LiveClosed` out, so the run goes on until a later push lands a ref on that object. |
+
 ## Bug variants
 
 Each variant is a one-site break of the real code:
@@ -85,6 +126,9 @@ Each variant is a one-site break of the real code:
 | `sweepIgnoresRefsVersion` | `jobs/gc.rs` `pr5_sweep` skips its `refs_moved` abort. Legacy mode. | `RefsResolvable` |
 | `abortDropsSurvivor` | `jobs/gc.rs` `wipe_all` always takes the kill arm for `gc.new_pack`, even when a cohort pack already died. | `RefsResolvable` |
 | `janitorNoGrace` | `jobs/janitor.rs` `run_slice` deletes dead-pack R2 keys without the `dead_at < now - GRACE_MS` filter. | `FetchReadsSucceed` |
+| `fallbackUsesBitmap` | `jobs/gc.rs` `fallback_span` calls `bm_all_set(&r.bitmap, &need)` in place of `bm_all_set(&r.built, &need)`. An entry marked after the built snapshot then counts as copied. This is the C11 mistake. Kept world. | `RefsResolvable` |
+
+`fallbackUsesBitmap` needs a mark after the built snapshot while the drain is still not empty. A push lands ref `gc` at `c` during the build. The drain marks `c` in P1 and feeds `b`. The fallback fires with `b` still in the frontier. The bug counts `c` as copied, so P1 retires and ref `gc` loses `c`. The real rule keeps P1, because `c` is not built and has no live copy outside the cohort.
 
 `noBarrierPending` needs a non-atomic push whose ref update loses the CAS. A landed tip is already fed by `barrier_feed_landing`, so only the loser's live pack depends on the pending row. `noEpochCheck` reports the loser's pack because BFS meets the loser shape first. With `YoungPacksClosed` left out of the config, a trace of the same length lands `main` at `c2` and breaks `RefsResolvable`.
 
@@ -180,6 +224,8 @@ Not covered:
 
 - One candidate pack P0 holds `c1`, `b` and `z`. Ref `main` points at `c1`. `b` is unreachable at the mark snapshot. `z` is garbage, so every repack runs and every retirement of P0 is lossy.
 - The single world has one push. At begin it takes one of two shapes. A thin push uploads pack Q with `c2`, which links to `c1` and `b` and omits both. Its update of `main` to `c2` lands or loses the CAS. A bare push has no pack and creates ref `g` at `b`.
+- `Garbage` puts the unreachable object `z` in P0. The single and split worlds set it to `TRUE`. The kept world sets it to `FALSE`, so every P0 entry can be built.
+- The kept world adds old pack P1 with `c`, which links to `b`. Two bare pushes run one after the other. Each one creates ref `g` at `b` or ref `gc` at `c`. This world reaches the fallback retirement and a swap with no `gc_epoch` bump. The single world cannot reach either path. A single fully marked candidate makes `begin_build` wipe, and an unmarked entry makes every retirement lossy.
 - The split world adds old pack P1 with `a` and `c`. Object `a` links to `b`. Two bare pushes run one after the other. Each one creates ref `gc` at `c` or ref `ga` at `a`. A second push begins only after the first one ends.
 - No sha has rows in two candidate packs, so the model keeps marks as a set of shas.
 - One fetch of `main`. Up to two mark inits. At most one Err after a dead-mark. At most one rebuild a run, because one build id always stays free for a later chain.
