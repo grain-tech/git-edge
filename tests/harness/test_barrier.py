@@ -81,6 +81,20 @@ def barrier_on(r):
     ge.knob(r.name, "gc_barrier", 1)
 
 
+def cohort_ids(r):
+    """Pack ids in the candidate bitmap. Read before the sweep: marked
+    wipes with the chain."""
+    return {p["id"] for p in ge.jobs(r.name)["packs"] if p["marked"]}
+
+
+def assert_cohort_live(tc, r, cohort):
+    """A sweep that aborted retired nothing: every cohort pack is still live."""
+    tc.assertTrue(cohort, "no cohort to check")
+    packs = {p["id"]: p for p in ge.jobs(r.name)["packs"]}
+    tc.assertTrue(all(packs[c]["state"] == "live" for c in cohort),
+                  "the sweep retired the cohort instead of aborting: %r" % packs)
+
+
 def barrier_active(r):
     m = meta(r)
     return (
@@ -462,9 +476,10 @@ class Barrier(unittest.TestCase):
                 if barrier:
                     barrier_on(r)
                 else:
-                    ge.knob(r.name, "gc_barrier", 0)
+                    th.barrier_off(r)
                 seed(r, 2)
                 step_until(r, "gc_mark", {"done"})
+                th.assert_barrier(self, r, barrier)
                 step_until(r, "gc_consolidate", {"done"}, limit=10)
                 # phase=sweep now, sweep queued — stray mark must not wedge it
                 before = tables(r)
@@ -490,16 +505,19 @@ class Barrier(unittest.TestCase):
         # legacy arm: refs moved between build and sweep -> the sweep fence
         # aborts the chain and wipes gc.*
         r = repo("phase-legacy-moved")
-        ge.knob(r.name, "gc_barrier", 0)
+        th.barrier_off(r)
         seed(r, 2)
         step_until(r, "gc_mark", {"done"})
+        th.assert_barrier(self, r, False)
         step_until(r, "gc_consolidate", {"done"}, limit=10)
+        cohort = cohort_ids(r)
         new_commit(r, "mv")
         r.push()
         s = ge.step(r.name, "gc_sweep")
         self.assertTrue(s["ran"], "%r" % s)
         self.assertNotIn("gc.started_at", meta(r),
                          "legacy sweep survived moved refs: %r" % meta(r))
+        assert_cohort_live(self, r, cohort)
         tgs.gc_drain(r, limit=120)
         assert_pack_ok(self, r)
 
@@ -617,15 +635,18 @@ class Barrier(unittest.TestCase):
         GE_GC_BARRIER=1 runs a barrier chain, which has no walk fence
         and does not abort the sweep on moved refs."""
         r = repo("keep-flagoff")
-        ge.knob(r.name, "gc_barrier", 0)
+        th.barrier_off(r)
         seed(r, 2)
         step_until(r, "gc_mark", {"done"})
+        th.assert_barrier(self, r, False)
         step_until(r, "gc_consolidate", {"done"}, limit=10)
+        cohort = cohort_ids(r)
         # move refs between build and sweep so the sweep fence aborts
         r.commit_file("f", "mv\n", "mv")
         r.push()
         s = ge.step(r.name, "gc_sweep")
         self.assertTrue(s["ran"], "%r" % s)
+        assert_cohort_live(self, r, cohort)
         v = ge.jobs(r.name)
         self.assertNotIn("gc.new_pack", v["gc_meta"], "%r" % v["gc_meta"])
         # the build pack was dead-marked
@@ -857,11 +878,12 @@ class Barrier(unittest.TestCase):
         GE_GC_BARRIER=1 runs a barrier chain, whose pending and gen-1
         rows are the opposite of this contract."""
         r = repo("flagoff")
-        ge.knob(r.name, "gc_barrier", 0)
+        th.barrier_off(r)
         seed(r, 2)
         ge.knob(r.name, "slice_subreqs", 1)
         s = ge.step(r.name, "gc_mark")
         self.assertIn(s["outcome"], ("continue", "done"), "%r" % s)
+        th.assert_barrier(self, r, False)
         # mid-mark snapshot: no pending rows, no gen-1 frontier rows
         t = tables(r)
         self.assertEqual(t["gc_pending"]["n"], 0, "%r" % t["gc_pending"])

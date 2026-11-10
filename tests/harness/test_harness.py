@@ -37,6 +37,21 @@ def seed_gc_repo(r):
     return tip
 
 
+def barrier_off(r):
+    """Pin the next mark init to flag-off. The knob beats GE_GC_BARRIER, so
+    the chain is legacy whatever the server was started with."""
+    ge.knob(r.name, "gc_barrier", 0)
+
+
+def assert_barrier(tc, r, on):
+    """The live chain captured the mode its test pinned. Mark init persists
+    gc.barrier=1 only when on, so call this while gc.started_at stands."""
+    m = ge.jobs(r.name)["gc_meta"]
+    tc.assertIn("gc.started_at", m, "no live GC chain to check: %r" % m)
+    tc.assertEqual(m.get("gc.barrier"), "1" if on else None,
+                   "chain captured the wrong barrier mode: %r" % m)
+
+
 def drive_until_sweep(r, limit=12):
     """Step (kind-agnostic) until gc_sweep reports done; returns the step dict."""
     for _ in range(limit):
