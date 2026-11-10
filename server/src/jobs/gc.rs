@@ -2098,14 +2098,21 @@ fn fenced_swap(d: &RepoDo, sql: &SqlStorage, sm: &SwapMeta) -> Result<(), Error>
         vec![],
     )?
     .to_array::<Row>()?;
-    let mut ids: Vec<String> = Vec::new();
-    let mut lossy = false;
-    for r in &rows {
-        if r.built_null == 0 && bm_bitmap_subset(&r.bitmap, &r.built) {
-            lossy |= bm_lossy(&r.built, r.count);
-            ids.push(r.pack_id.clone());
-        }
-    }
+    let retirable: Vec<(&Row, bool)> = rows
+        .iter()
+        .filter(|r| r.built_null == 0 && bm_bitmap_subset(&r.bitmap, &r.built))
+        .map(|r| (r, bm_lossy(&r.built, r.count)))
+        .collect();
+    // §2.5: a kept cohort pack's unmarked objects may link to a retirable
+    // pack's unmarked ones, so a lossy retire is closure-safe only when the
+    // whole cohort goes; otherwise only packs fully copied into the build
+    let whole = retirable.len() == rows.len();
+    let ids: Vec<String> = retirable
+        .iter()
+        .filter(|(_, l)| whole || !l)
+        .map(|(r, _)| r.pack_id.clone())
+        .collect();
+    let lossy = whole && retirable.iter().any(|(_, l)| *l);
     // step 6a: nothing is duplicated — cohort intact, so wipe_all dead-marks
     // the build pack; steps 9–11 still land the record
     if ids.is_empty() {
