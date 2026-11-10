@@ -13,7 +13,7 @@ GC must never delete an object row or the R2 bytes of a pack that a live ref, an
 bash verification/tla/verify.sh
 ```
 
-The script needs bash, curl, sha256sum and tar. It uses `java` 11 or later from PATH. Otherwise, on Linux x86_64, it downloads Temurin JRE 21.0.13+9 and checks the tarball's sha256 `a535a1df9c6284d9618872984e026ae0352d1f7e9e0605425c0e6114f47351dd`. It downloads `tla2tools.jar` v1.7.4 and refuses any jar whose sha256 is not `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`. Both live in `${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}`. TLC state files go to a temp dir, so the script writes nothing into the repo. Each TLC run takes one to two seconds. A full run takes under two minutes, most of it JVM start-up.
+The script needs bash, curl, sha256sum and tar. It uses `java` 11 or later from PATH. Otherwise, on Linux x86_64, it downloads Temurin JRE 21.0.13+9 and checks the tarball's sha256 `a535a1df9c6284d9618872984e026ae0352d1f7e9e0605425c0e6114f47351dd`. It downloads `tla2tools.jar` v1.7.4 and refuses any jar whose sha256 is not `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`. Both live in `${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}`. TLC state files go to a temp dir, so the script writes nothing into the repo. Most TLC runs take one to two seconds. `GcBarrier_kept_barrier.cfg` takes about 15 seconds. A full run took 53 seconds on the reference machine.
 
 The script runs five kinds of check:
 
@@ -113,7 +113,7 @@ Vacuity guards. Each one names a state that the clean model must reach.
 | `Reach_NonLossySwap` | Kept world: `fenced_swap` retired P0 with no `gc_epoch` bump. |
 | `Reach_ThinOverLosslessRetire` | Kept world: a thin push's lookup resolved a base to P0, and P0 retired with no `gc_epoch` bump before the commit. Barrier only, because `pr5_sweep` always bumps. |
 
-Bug variants. Each one is in the table above and must fail on its named invariant.
+Bug variants. Each one is in the Bug variants table below and must fail on its named invariant.
 
 Known findings. Each one must still fail on its named invariant.
 
@@ -231,7 +231,8 @@ Not covered:
 
 ## Bounds and assumptions
 
-- One candidate pack P0 holds `c1`, `b` and `z`. Ref `main` points at `c1`. `b` is unreachable at the mark snapshot. `z` is garbage, so every repack runs and every retirement of P0 is lossy.
+- In every world, old pack P0 holds `c1` and `b`, and also `z` when `Garbage` is `TRUE`. Ref `main` points at `c1`. `b` is unreachable at the mark snapshot.
+- The single world has P0 as its only candidate, with `z`. Every repack runs and every retirement of P0 is lossy.
 - The single world has one push. At begin it takes one of two shapes. A thin push uploads pack Q with `c2`, which links to `c1` and `b` and omits both. Its update of `main` to `c2` lands or loses the CAS. A bare push has no pack and creates ref `g` at `b`.
 - `Garbage` puts the unreachable object `z` in P0. The single and split worlds set it to `TRUE`. The kept world sets it to `FALSE`, so every P0 entry can be built.
 - The kept world adds old pack P1 with `c`, which links to `b`. Two pushes run one after the other. The first push is bare and creates ref `g` at `b` or ref `gc` at `c`. The second push is bare or thin. A thin second push can have its bases retired with no `gc_epoch` bump, after the first push made every P0 entry reachable. This world reaches the fallback retirement and a swap with no `gc_epoch` bump. The single world cannot reach either path. A single fully marked candidate makes `begin_build` wipe, and an unmarked entry makes every retirement lossy.
@@ -249,7 +250,7 @@ Not covered:
 - Candidates are the old packs. Every pack created during the run is young and never a candidate.
 - The push timeout is a free janitor expiry of an open push. The swap tries and drain slice bounds are a free fallback trigger at any non-empty swap check. The net-positive byte rule in `fallback_span` is a free choice.
 - `refs_version` is a flag that says the version moved since this chain's init. Every read of `refs_version` in the code compares it with the init capture.
-- A frontier batch is one sha. The pending page covers a whole pack in one span. `gc.delta_rounds` saturates at `DeltaCap`, which is 1 in the configs.
+- A frontier batch is one sha. The pending page covers a whole pack in one action. `gc.delta_rounds` saturates at `DeltaCap`, which is 1 in the configs.
 - Most actions are one synchronous span of the code. They split at an `.await`, a slice boundary or a separate request. `GcPop` and `GcCommit` are finer than the code. A finer split adds interleavings, so it can only add counterexamples.
 - Five actions merge code that can interleave. Each one is harmless for these invariants, for the reason given:
 
@@ -265,7 +266,7 @@ Not covered:
 
 ## Read a result
 
-- A clean run, every guard reached and every variant failing as expected mean the change keeps the promises within the bounds above.
+- A clean run, every guard reached, every variant failing as expected and every finding still reproducing mean that the change keeps the promises within the bounds above. The promise that Finding 1 breaks stays broken.
 - If a clean config fails, read the trace. Each state names its action and shows `packs`, `rows`, `bytes`, `refs`, `push`, `phase`, `marked`, `built`, `fr` and `pending`. Replay the trace against the code at the sync commit, one action for each span in the coverage record. A real reproduction needs the harness in `tests/harness/test_barrier.py` or `test_gc_safety.py`. If the code breaks the same way, it is a real bug. Report it and keep the invariant. If the code does not break, the model has drifted from the code, so fix the model.
 - If a guard holds, the clean run no longer reaches that state. Fix the model before you trust a clean run.
 - If a variant passes, or fails a different invariant, the model can no longer see that bug. Fix the model before you trust a clean run.
