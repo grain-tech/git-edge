@@ -84,7 +84,7 @@ Each variant is a one-site break of the real code:
 
 ## Coverage record
 
-Sync commit: `11a52051d8b0d1f7687ead8202f24913249ba82a`. This branch was cut from that commit, and `server/`, `tests/`, `CONTRACTS.md` and `SETUP.md` were unchanged on the branch when the model was confirmed. After a rebase onto a newer main, reread every function in this table at the new commit. Move the sync commit forward only after you confirm the model still describes the code.
+Sync commit: `5f4938c5bd5c3c544d745db46f533c11dfc8d6ef`. The model was first confirmed at `11a52051d8b0d1f7687ead8202f24913249ba82a`. Between the two commits, `server/`, `CONTRACTS.md` and `SETUP.md` are byte-identical, and only `tests/worker/` changed, which this model does not cover. After a rebase onto a newer main, reread every function in this table at the new commit. Move the sync commit forward only after you confirm the model still describes the code.
 
 | Model action | Code |
 | --- | --- |
