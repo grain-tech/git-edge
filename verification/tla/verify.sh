@@ -131,7 +131,8 @@ run_clean GcBarrier_kept_legacy.cfg
 run_clean statechart/ThinPushRace.cfg
 
 for g in Reach_LandThenRetire Reach_LoserThenRetire Reach_BareLandsMidChain \
-         Reach_ErrThenSurvivor Reach_EpochReject Reach_FetchOutlivesPack; do
+         Reach_ErrThenSurvivor Reach_EpochReject Reach_FetchOutlivesPack \
+         Reach_FetchRebuild Reach_PlanNamesDead; do
   run_reach TRUE single 1 "$g"
   run_reach FALSE single 1 "$g"
 done
@@ -140,6 +141,7 @@ run_reach TRUE single 1 Reach_DeltaHandoff
 run_reach TRUE split 2 Reach_PartialRetire
 run_reach TRUE kept 2 Reach_FallbackRetire
 run_reach TRUE kept 2 Reach_NonLossySwap
+run_reach TRUE kept 2 Reach_ThinOverLosslessRetire
 
 run_case GcBarrier_bug_noBarrierPending.cfg        YoungPacksClosed
 run_case GcBarrier_bug_noLandingFeed.cfg           RefsResolvable

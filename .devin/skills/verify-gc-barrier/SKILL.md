@@ -26,11 +26,11 @@ The script runs five kinds of check:
 Expected output at the sync commit:
 
 ```
-ok  GcBarrier_barrier.cfg                        clean, 8461 distinct states
-ok  GcBarrier_legacy.cfg                         clean, 3418 distinct states
-ok  GcBarrier_split_legacy.cfg                   clean, 20371 distinct states
-ok  GcBarrier_kept_barrier.cfg                   clean, 61846 distinct states
-ok  GcBarrier_kept_legacy.cfg                    clean, 19891 distinct states
+ok  GcBarrier_barrier.cfg                        clean, 16744 distinct states
+ok  GcBarrier_legacy.cfg                         clean, 6554 distinct states
+ok  GcBarrier_split_legacy.cfg                   clean, 39596 distinct states
+ok  GcBarrier_kept_barrier.cfg                   clean, 310306 distinct states
+ok  GcBarrier_kept_legacy.cfg                    clean, 92250 distinct states
 ok  statechart/ThinPushRace.cfg                  clean, 138 distinct states
 ok  reach barrier Reach_LandThenRetire           reached
 ok  reach legacy Reach_LandThenRetire            reached
@@ -44,20 +44,25 @@ ok  reach barrier Reach_EpochReject              reached
 ok  reach legacy Reach_EpochReject               reached
 ok  reach barrier Reach_FetchOutlivesPack        reached
 ok  reach legacy Reach_FetchOutlivesPack         reached
+ok  reach barrier Reach_FetchRebuild             reached
+ok  reach legacy Reach_FetchRebuild              reached
+ok  reach barrier Reach_PlanNamesDead            reached
+ok  reach legacy Reach_PlanNamesDead             reached
 ok  reach barrier Reach_DrainMarksNew            reached
 ok  reach barrier Reach_DeltaHandoff             reached
 ok  reach barrier split Reach_PartialRetire      reached
 ok  reach barrier kept Reach_FallbackRetire      reached
 ok  reach barrier kept Reach_NonLossySwap        reached
-ok  GcBarrier_bug_noBarrierPending.cfg           violated YoungPacksClosed, 1049 distinct states
-ok  GcBarrier_bug_noLandingFeed.cfg              violated RefsResolvable, 523 distinct states
-ok  GcBarrier_bug_noEpochCheck.cfg               violated YoungPacksClosed, 1116 distinct states
-ok  GcBarrier_bug_sweepIgnoresRefsVersion.cfg    violated RefsResolvable, 434 distinct states
-ok  GcBarrier_bug_abortDropsSurvivor.cfg         violated RefsResolvable, 373 distinct states
-ok  GcBarrier_bug_janitorNoGrace.cfg             violated FetchReadsSucceed, 565 distinct states
-ok  GcBarrier_bug_fallbackUsesBitmap.cfg         violated RefsResolvable, 2837 distinct states
-FINDING GcBarrier_finding_split.cfg              violated LiveClosed, 2872 distinct states
-FINDING GcBarrier_finding_split_refs.cfg         violated RefsResolvable, 6515 distinct states
+ok  reach barrier kept Reach_ThinOverLosslessRetire reached
+ok  GcBarrier_bug_noBarrierPending.cfg           violated YoungPacksClosed, 1230 distinct states
+ok  GcBarrier_bug_noLandingFeed.cfg              violated RefsResolvable, 605 distinct states
+ok  GcBarrier_bug_noEpochCheck.cfg               violated YoungPacksClosed, 1309 distinct states
+ok  GcBarrier_bug_sweepIgnoresRefsVersion.cfg    violated RefsResolvable, 517 distinct states
+ok  GcBarrier_bug_abortDropsSurvivor.cfg         violated RefsResolvable, 430 distinct states
+ok  GcBarrier_bug_janitorNoGrace.cfg             violated FetchReadsSucceed, 654 distinct states
+ok  GcBarrier_bug_fallbackUsesBitmap.cfg         violated RefsResolvable, 5237 distinct states
+FINDING GcBarrier_finding_split.cfg              violated LiveClosed, 3360 distinct states
+FINDING GcBarrier_finding_split_refs.cfg         violated RefsResolvable, 8219 distinct states
 verify: all checks passed, with 2 known findings
 ```
 
@@ -99,11 +104,14 @@ Vacuity guards. Each one names a state that the clean model must reach.
 | `Reach_ErrThenSurvivor` | A sweep hit an Err after its dead-mark, and the chain ended with a live build pack. |
 | `Reach_EpochReject` | The `gc_epoch` check rejected the push. |
 | `Reach_FetchOutlivesPack` | A fetch planned a pack that died before the fetch read it. |
+| `Reach_FetchRebuild` | `plan_reads` found rows of a walked pack gone and rebuilt the plan. |
+| `Reach_PlanNamesDead` | `plan_reads` kept a pack that was dead but still had its rows. That is the window of an Err after a dead-mark. |
 | `Reach_DrainMarksNew` | The barrier drain marked `b` after the built snapshot. |
 | `Reach_DeltaHandoff` | The barrier delta arm handed off to build with a non-empty frontier. |
 | `Reach_PartialRetire` | Split world: the swap kept P1 and retired P0 after a ref landed at `c`. This is the schedule of Finding 1. |
 | `Reach_FallbackRetire` | Kept world: `fallback_span` retired P0 with no `gc_epoch` bump. |
 | `Reach_NonLossySwap` | Kept world: `fenced_swap` retired P0 with no `gc_epoch` bump. |
+| `Reach_ThinOverLosslessRetire` | Kept world: a thin push's lookup resolved a base to P0, and P0 retired with no `gc_epoch` bump before the commit. Barrier only, because `pr5_sweep` always bumps. |
 
 Bug variants. Each one is in the table above and must fail on its named invariant.
 
@@ -188,7 +196,8 @@ Sync commit: `5f4938c5bd5c3c544d745db46f533c11dfc8d6ef`. The model was first con
 | `PushLookup` | `repo_do/mod.rs` `push_lookup`, a separate sync request |
 | `PushUpload` | `pack/ingest.rs` pass B with its external base read, then `repo_do/mod.rs` `push_index` |
 | `PushCommit` | `repo_do/mod.rs` `commit_push` steps 1 to 5, one sync span: the epoch check, `jobs::gc::barrier_active`, `barrier_write_pending_before_promote`, the promote, `apply_one` with `ref_cas_ok`, `barrier_feed_landing` and the bumps |
-| `FetchPlan` | `pack/generate.rs` `send_set` and `plan_reads`, including the one-time `rebuild` |
+| `FetchWalk` | `pack/generate.rs` `send_set`, with its `load` and `load_commits` rounds |
+| `FetchPlan` | `pack/generate.rs` `plan_reads`: `store` `entries_of` with no live filter, then the one-time `rebuild` |
 | `FetchRead` | `pack/generate.rs` `pack_chunk` |
 | `JanitorExpire`, `JanitorReap`, `JanitorDelete` | `jobs/janitor.rs` `run_slice`: stale pushes, ingesting packs of expired or rejected pushes, dead-pack R2 keys after `GRACE_MS` |
 | `GcMarkInit` | `jobs/gc.rs` `gc_mark` first slice: wipe, `gc.chain`, `gc.refs_version`, the candidate set, ref roots, the young-pack seed, `gc.started_at`, `gc.barrier` |
@@ -211,7 +220,7 @@ Not covered:
 
 - Compaction: `gc_compact`, `compact::swap`, compact-mode chains and their quarantine. Only `cohort_live` is modelled.
 - `--atomic` pushes and their demote of the promoted pack.
-- Concurrent pushes. The split world runs two pushes, one after the other. The single world runs one push.
+- Concurrent pushes. The split and kept worlds run two pushes, one after the other. The single world runs one push.
 - Pushes to the same ref, ref deletes, tags with peeled targets, pins and protected refs.
 - Import jobs, `import_start` and `import_pack`.
 - Boot repair and its resurrection of chain-less job rows, the `stray` and `legacy_chain` guards, and pre-PR6 chains with `built IS NULL`.
@@ -225,7 +234,7 @@ Not covered:
 - One candidate pack P0 holds `c1`, `b` and `z`. Ref `main` points at `c1`. `b` is unreachable at the mark snapshot. `z` is garbage, so every repack runs and every retirement of P0 is lossy.
 - The single world has one push. At begin it takes one of two shapes. A thin push uploads pack Q with `c2`, which links to `c1` and `b` and omits both. Its update of `main` to `c2` lands or loses the CAS. A bare push has no pack and creates ref `g` at `b`.
 - `Garbage` puts the unreachable object `z` in P0. The single and split worlds set it to `TRUE`. The kept world sets it to `FALSE`, so every P0 entry can be built.
-- The kept world adds old pack P1 with `c`, which links to `b`. Two bare pushes run one after the other. Each one creates ref `g` at `b` or ref `gc` at `c`. This world reaches the fallback retirement and a swap with no `gc_epoch` bump. The single world cannot reach either path. A single fully marked candidate makes `begin_build` wipe, and an unmarked entry makes every retirement lossy.
+- The kept world adds old pack P1 with `c`, which links to `b`. Two pushes run one after the other. The first push is bare and creates ref `g` at `b` or ref `gc` at `c`. The second push is bare or thin. A thin second push can have its bases retired with no `gc_epoch` bump, after the first push made every P0 entry reachable. This world reaches the fallback retirement and a swap with no `gc_epoch` bump. The single world cannot reach either path. A single fully marked candidate makes `begin_build` wipe, and an unmarked entry makes every retirement lossy.
 - The split world adds old pack P1 with `a` and `c`. Object `a` links to `b`. Two bare pushes run one after the other. Each one creates ref `gc` at `c` or ref `ga` at `a`. A second push begins only after the first one ends.
 - No sha has rows in two candidate packs, so the model keeps marks as a set of shas.
 - One fetch of `main`. Up to two mark inits. At most one Err after a dead-mark. At most one rebuild a run, because one build id always stays free for a later chain.
@@ -234,7 +243,18 @@ Not covered:
 - The push timeout is a free janitor expiry of an open push. The swap tries and drain slice bounds are a free fallback trigger at any non-empty swap check. The net-positive byte rule in `fallback_span` is a free choice.
 - `refs_version` is a flag that says the version moved since this chain's init. Every read of `refs_version` in the code compares it with the init capture.
 - A frontier batch is one sha. The pending page covers a whole pack in one span. `gc.delta_rounds` saturates at `DeltaCap`, which is 1 in the configs.
-- An action splits only at an `.await`, a slice boundary or a separate request. Some actions are finer than the code, such as the pending page and the pop. A finer split adds interleavings, so it can only add counterexamples, never hide one.
+- Most actions are one synchronous span of the code. They split at an `.await`, a slice boundary or a separate request. `GcPop` and `GcCommit` are finer than the code. A finer split adds interleavings, so it can only add counterexamples.
+- Five actions merge code that can interleave. Each one is harmless for these invariants, for the reason given:
+
+| Action | Code it merges | Why the merge hides no counterexample |
+| --- | --- | --- |
+| `FetchWalk` | The lookup and R2 read rounds of `send_set`, through `load` and `load_commits`. | Each lookup filters on live packs and runs after the request began, so the GRACE hold keeps every pack the walk names. A row that goes away mid-walk makes `load` fail the fetch closed. A pack that dies before its mark flags the set stale, and `plan_reads` rebuilds as `FetchPlan` does. |
+| `PushUpload` | The external base reads, the R2 upload and the `push_index` batches. | Pack Q stays `ingesting`. No lookup, mark or swap reads an `ingesting` pack. The base packs are held by GRACE. An expiry mid-upload ends like an expiry before the upload, because `push_index` refuses a push that is not open. |
+| `GcBuildFinish` | The build slices, the `finish_pack` await and `finish_build`. | The build pack stays `ingesting` with `push_id` NULL. No lookup reads such a pack and the janitor skips the pack. `built` is frozen at `begin_build`, so a mark during the slices cannot change what the build copies. |
+| `GcRebuild` | The HEAD await in `mpu_err`, then `wipe_build` and `begin_build`. | The HEAD reads only the chain's own upload. No other actor touches that upload, so the await only moves the span later. |
+| `GcPage` | One `pending_page` window per span in the code. The model feeds the whole pack in one action. | A window only feeds `gc_frontier`. The `gc_pending` row stays until the last window, so no swap lands mid-page. A sha is marked only when a pop takes it. Any split of a page across the snapshot or a swap check is reachable as a whole page and then single pops. |
+
+- The fetch limit. `FetchWalk` wants the closure of the current target of `main`. A real client names its wants from an earlier advertisement, so a want can be an older tip. The model does not cover a want that no ref reaches any more.
 
 ## Read a result
 

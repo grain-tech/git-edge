@@ -38,7 +38,17 @@ Reach_EpochReject ==
 
 (* an in-flight fetch planned a pack that has since died *)
 Reach_FetchOutlivesPack ==
-  ~(fetch.st = "planned" /\ \E p \in fetch.plan : packs[p] = "dead")
+  ~(fetch.st = "planned" /\ \E p \in PlanPacks(fetch.picks) : packs[p] = "dead")
+
+(* plan_reads found a walked pack's rows gone and rebuilt the plan *)
+Reach_FetchRebuild ==
+  ~(fetch.st = "planned" /\ fetch.rb)
+
+(* plan_reads kept a pack that was already dead but still had its rows:
+   the Err-after-dead-mark window *)
+Reach_PlanNamesDead ==
+  ~(fetch.st = "planned" /\ ~fetch.rb
+    /\ \E p \in PlanPacks(fetch.picks) : packs[p] = "dead" /\ rows[p] # {})
 
 (* the barrier delta arm handed off to build with the frontier not empty *)
 Reach_DeltaHandoff ==
@@ -58,5 +68,12 @@ Reach_FallbackRetire ==
 (* kept world: fenced_swap retired P0 losslessly, with no gc_epoch bump *)
 Reach_NonLossySwap ==
   ~(packs["P0"] = "dead" /\ diedBy["P0"] = "swap" /\ epoch = 0)
+
+(* kept world: a thin push's lookup resolved a base to P0, and P0 has
+   since retired with no gc_epoch bump, so step 2 will not reject the
+   push *)
+Reach_ThinOverLosslessRetire ==
+  ~(push.st = "looked" /\ push.shape = "thin" /\ "P0" \in push.base
+    /\ packs["P0"] = "dead" /\ epoch = push.epoch)
 
 =============================================================================

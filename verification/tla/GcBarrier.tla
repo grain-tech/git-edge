@@ -22,10 +22,30 @@
 (*   server/src/pack/generate.rs send_set, plan_reads, pack_chunk          *)
 (*   server/src/pack/ingest.rs   the external thin-pack base read          *)
 (*                                                                         *)
-(* One action is one synchronous span of the code. Actions split only at  *)
-(* an .await, a slice boundary or a separate request. Splitting a span     *)
-(* more finely than the code only adds interleavings, so it is sound for   *)
-(* the safety invariants below; no action merges code that can interleave. *)
+(* Most actions are one synchronous span of the code, split at an        *)
+(* .await, a slice boundary or a separate request. GcPop/GcCommit split    *)
+(* finer than the code, which only adds interleavings. Five actions merge  *)
+(* code that can interleave; each is harmless for these invariants:       *)
+(*  - FetchWalk: send_set's lookup/read rounds. Each lookup is live-       *)
+(*    filtered and runs after the request began, so GRACE keeps every     *)
+(*    pack it names; a row gone mid-walk fails the fetch closed; a pack    *)
+(*    that dies before its mark flags the set stale, and plan_reads        *)
+(*    rebuilds as FetchPlan does.                                          *)
+(*  - PushUpload: base reads, R2 upload and push_index batches. Q stays    *)
+(*    'ingesting', which no lookup, mark or swap reads; the base packs     *)
+(*    are held by GRACE; an expiry mid-upload ends like an expiry before   *)
+(*    it, because push_index refuses a push that is not open.              *)
+(*  - GcBuildFinish: the build slices and the finish_pack await. N stays   *)
+(*    'ingesting' with push_id NULL, which no lookup reads and the janitor *)
+(*    skips; built is frozen at begin_build, so a mark that lands during   *)
+(*    the slices cannot change what is copied.                             *)
+(*  - GcRebuild: mpu_err's HEAD await reads only the chain's own upload,   *)
+(*    which no other actor touches, so it moves the span later and         *)
+(*    nothing else.                                                        *)
+(*  - GcPage: one window per span in the code. A window only feeds the    *)
+(*    frontier and the gc_pending row stays until the last window, so no   *)
+(*    swap lands mid-page; any split of a page's shas across the snapshot  *)
+(*    or a pop is reachable here as a whole page and then single pops.     *)
 (*                                                                         *)
 (* World "single". Objects c1, b, z, c2 with links c2 -> {c1, b}. The     *)
 (* old pack P0 holds c1, b and z and is the only GC candidate. Ref main ->  *)
@@ -45,8 +65,9 @@
 (* fenced_swap keep one pack and retire the other.                         *)
 (*                                                                         *)
 (* World "kept". Two old candidates. P0 holds c1 and b, and z only when    *)
-(* Garbage. P1 holds c, which links to b. Two bare pushes each create ref  *)
-(* g -> b or gc -> c. Without z every P0 entry can be built, so the        *)
+(* Garbage. P1 holds c, which links to b. Two pushes run one after the    *)
+(* other: a bare push that creates g -> b or gc -> c, then a bare or thin  *)
+(* push. Without z every P0 entry can be built, so the                     *)
 (* lossless arms are reachable: fallback_span retiring a pack, and a       *)
 (* fenced_swap with no gc_epoch bump. The single world cannot reach them:  *)
 (* a single fully marked candidate makes begin_build wipe instead.         *)
@@ -166,6 +187,7 @@ Holders(o)       == {p \in Packs : Live(p) /\ o \in rows[p]}
 HasLive(o)       == Holders(o) # {}
 Resolves(o)      == \E p \in Holders(o) : bytes[p]
 ClosureOk(o)     == \A x \in Closure[o] : Resolves(x)
+PlanPacks(pk)    == {pr[2] : pr \in pk}   \* the packs a fetch's picks name
 
 (* compact.rs cohort_live: marked is non-empty and every marked pack is
    live *)
@@ -192,7 +214,7 @@ Fresh   == BuildIds[CHOOSE i \in FreeIds : \A j \in FreeIds : i <= j]
 (* the janitor's GRACE, as a hold: a request that is still in flight and
    planned reads from p *)
 Held(p) ==
-  \/ fetch.st = "planned" /\ p \in fetch.plan
+  \/ fetch.st \in {"walked", "planned"} /\ p \in PlanPacks(fetch.picks)
   \/ push.st = "looked" /\ p \in push.base
 
 (* ---- chain exits --------------------------------------------------- *)
@@ -245,8 +267,12 @@ WipePath ==
 (* push: repo_do/mod.rs                                                *)
 (* ================================================================== *)
 
+(* the kept world lets the second push be thin: after a first push made
+   every P0 entry reachable, a lossless retirement can land between the
+   thin push's lookup and its commit with no gc_epoch bump *)
 Shapes == CASE Scope = "chart"   -> {"thin"}
           [] World = "single" -> {"thin", "bare"}
+          [] World = "kept" /\ npush = 1 -> {"thin", "bare"}
           [] OTHER            -> {"bare"}
 
 (* push_begin: the pushes row records the gc_epoch the push validates
@@ -328,26 +354,51 @@ PushCommit ==
 (* fetch: pack/generate.rs                                             *)
 (* ================================================================== *)
 
-(* send_set walk plus plan_reads, one resolve against the live index:
-   each wanted sha maps to one live row (the GROUP BY picks any). The
-   code's one-time rebuild of a stale plan is this resolve happening late.
-   A sha with no live row fails the fetch closed. *)
-FetchPlan ==
+(* send_set: the walk resolves every sha it sends through idx.lookup,
+   which returns one live row per sha (the GROUP BY picks any), and reads
+   the bytes it needs from those packs. A sha with no live row fails the
+   fetch closed. The walk's many lookup/read rounds are one action here;
+   the skill argues why. picks records the (sha, pack) bit the walk
+   marked. *)
+FetchWalk ==
   /\ fetch.st = "idle" /\ Scope = "full"
   /\ LET want == Closure[refs["main"]]
      IN  IF \A o \in want : HasLive(o)
          THEN \E pick \in [want -> Packs] :
                 /\ \A o \in want : pick[o] \in Holders(o)
+                /\ fetch' = [st |-> "walked",
+                             picks |-> {<<o, pick[o]>> : o \in want},
+                             rb |-> FALSE]
+         ELSE fetch' = [st |-> "error", picks |-> {}, rb |-> FALSE]
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
+                 chains, errs, diedBy>> /\ UNCHANGED gcVars
+
+(* plan_reads, one sync span after the walk's last await: entries_of reads
+   each planned pack's rows with no live filter, so a pack that died but
+   still has its rows (an Err after a dead-mark) stays in the plan. A row
+   count that no longer matches the walk's bits triggers ONE rebuild
+   against the live index; a sha with no live row then fails closed. *)
+FetchPlan ==
+  /\ fetch.st = "walked"
+  /\ LET pk   == fetch.picks
+         same == \A pr \in pk : pr[1] \in rows[pr[2]]
+         shas == {pr[1] : pr \in pk}
+     IN  IF same
+         THEN fetch' = [fetch EXCEPT !.st = "planned"]
+         ELSE IF \A o \in shas : HasLive(o)
+         THEN \E pick \in [shas -> Packs] :
+                /\ \A o \in shas : pick[o] \in Holders(o)
                 /\ fetch' = [st |-> "planned",
-                             plan |-> {pick[o] : o \in want}]
-         ELSE fetch' = [st |-> "error", plan |-> {}]
+                             picks |-> {<<o, pick[o]>> : o \in shas},
+                             rb |-> TRUE]
+         ELSE fetch' = [st |-> "error", picks |-> {}, rb |-> TRUE]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
                  chains, errs, diedBy>> /\ UNCHANGED gcVars
 
 (* pack_chunk: the planned range reads, after the await *)
 FetchRead ==
   /\ fetch.st = "planned"
-  /\ fetch' = [st |-> "done", plan |-> {}]
+  /\ fetch' = [fetch EXCEPT !.st = "done", !.picks = {}]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
                  chains, errs, diedBy>> /\ UNCHANGED gcVars
 
@@ -673,7 +724,7 @@ Init ==
              base |-> {}, cas |-> FALSE]
   /\ npush = 0
   /\ landed = [r \in RefNames |-> None]
-  /\ fetch = [st |-> "idle", plan |-> {}]
+  /\ fetch = [st |-> "idle", picks |-> {}, rb |-> FALSE]
   /\ phase = "idle" /\ bar = FALSE /\ cohort = {} /\ marked = {}
   /\ built = {} /\ fr = [o \in Objs |-> NoGen] /\ seen = {}
   /\ pending = {} /\ rounds = 0 /\ newPack = None /\ retire = {}
@@ -697,7 +748,7 @@ Done == Quiesced /\ UNCHANGED vars
 
 Next ==
   \/ PushBegin \/ PushLookup \/ PushUpload \/ PushCommit
-  \/ FetchPlan \/ FetchRead
+  \/ FetchWalk \/ FetchPlan \/ FetchRead
   \/ JanitorExpire \/ JanitorReap \/ \E p \in Packs : JanitorDelete(p)
   \/ GcMarkInit \/ GcPop \/ GcCommit \/ GcPage \/ GcHandoff
   \/ GcHandoffLegacy \/ GcAbortLegacy \/ GcOrphanAbort
@@ -723,8 +774,8 @@ TypeOK ==
   /\ push.epoch \in 0..4 /\ push.base \subseteq Packs
   /\ push.cas \in BOOLEAN
   /\ landed \in [RefNames -> Objs \cup {None}]
-  /\ fetch.st \in {"idle", "planned", "done", "error"}
-  /\ fetch.plan \subseteq Packs
+  /\ fetch.st \in {"idle", "walked", "planned", "done", "error"}
+  /\ fetch.picks \subseteq Objs \X Packs /\ fetch.rb \in BOOLEAN
   /\ phase \in Phases /\ bar \in BOOLEAN /\ cohort \subseteq OldPacks
   /\ marked \subseteq Objs /\ built \subseteq Objs
   /\ fr \in [Objs -> {0, 1, NoGen}] /\ seen \subseteq Objs
@@ -767,10 +818,11 @@ LiveClosed ==
   \A p \in Packs : Live(p) =>
     \A o \in rows[p] : \A x \in Links[o] : Resolves(x)
 
-(* FetchReadsSucceed: every pack an in-flight fetch planned to read still
-   has its R2 bytes (GRACE > request lifetime). *)
+(* FetchReadsSucceed: every pack an in-flight fetch walked or planned to
+   read still has its R2 bytes (GRACE > request lifetime). *)
 FetchReadsSucceed ==
-  fetch.st = "planned" => \A p \in fetch.plan : bytes[p]
+  fetch.st \in {"walked", "planned"} =>
+    \A p \in PlanPacks(fetch.picks) : bytes[p]
 
 (* PushBaseReadsSucceed: every pack an in-flight push's lookup resolved a
    thin-pack base to still has its R2 bytes (GRACE > request lifetime). *)
