@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs TLC on GcBarrier: every clean config must check clean, every vacuity
 # guard in GcBarrierReach must be reachable, the statechart config must
-# check clean, and each Bug variant must violate its named invariant.
-# Caches the JRE and tla2tools.jar under
+# check clean, and each Bug variant must violate its named invariant. No
+# clean run counts unless the lossless paths (Reach_FallbackRetire and
+# Reach_NonLossySwap) are reached. Caches the JRE and tla2tools.jar under
 # ${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}; TLC state goes to a temp dir.
 set -euo pipefail
 
@@ -94,6 +95,7 @@ run_case() { # cfg invariant: TLC exits 12 (safety violation) on that invariant
   printf 'ok  %-44s violated %s, %s distinct states\n' "$1" "$got" "$(distinct_states "$OUT")"
 }
 
+REACHED=" "
 run_reach() { # barrier world pushes guard: the clean model reaches the guarded state
   local cfg="$META/reach-$1-$2-$4.cfg"
   printf 'SPECIFICATION Spec\nCONSTANTS\n  Barrier = %s\n  Bug = "none"\n  MaxChains = 2\n  DeltaCap = 1\n  MaxErrs = 1\n  Scope = "full"\n  World = "%s"\n  Garbage = %s\n  MaxPushes = %s\nINVARIANT\n  %s\n' \
@@ -106,6 +108,7 @@ run_reach() { # barrier world pushes guard: the clean model reaches the guarded 
   [ "$RC" -eq 12 ] && [ "$got" = "$4" ] \
     || { grep -E '^Error' "$OUT" >&2 || true; fail "$4 ($mode): guarded state unreachable (exit $RC) -- the clean run is vacuous"; }
   printf 'ok  %-44s reached\n' "reach $mode $4"
+  REACHED="$REACHED$4 "
 }
 
 run_clean GcBarrier_barrier.cfg
@@ -124,6 +127,7 @@ for g in Reach_LandThenRetire Reach_LoserThenRetire Reach_BareLandsMidChain \
 done
 run_reach TRUE single 1 Reach_DrainMarksNew
 run_reach TRUE single 1 Reach_DeltaHandoff
+run_reach TRUE split 2 Reach_LossyHeldBack
 run_reach TRUE kept 2 Reach_FallbackRetire
 run_reach TRUE kept 2 Reach_NonLossySwap
 run_reach TRUE kept 2 Reach_ThinOverLosslessRetire
@@ -138,4 +142,13 @@ run_case GcBarrier_bug_fallbackUsesBitmap.cfg      RefsResolvable
 run_case GcBarrier_bug_partialLossyRetire.cfg      LiveClosed
 run_case GcBarrier_bug_partialLossyRetire_refs.cfg RefsResolvable
 
+# the rule: a clean run claims nothing unless the lossless retirement
+# paths ran: the fix in fenced_swap step 6 rests on them
+for g in Reach_FallbackRetire Reach_NonLossySwap; do
+  case "$REACHED" in
+    *" $g "*) ;;
+    *) fail "$g was not reached, so no clean run may be claimed" ;;
+  esac
+done
+echo "verify: lossless paths reached (Reach_FallbackRetire, Reach_NonLossySwap), so the clean runs count"
 echo "verify: all checks passed"

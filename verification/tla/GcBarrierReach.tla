@@ -54,12 +54,13 @@ Reach_PlanNamesDead ==
 Reach_DeltaHandoff ==
   ~(phase = "build" /\ ~FrontierEmpty)
 
-(* split world, the partial-retirement schedule: a ref landed at c during
-   the chain, the drain marked c in P1 after the built snapshot, and the
-   swap kept P1 but retired P0 *)
-Reach_PartialRetire ==
-  ~(refs["gc"] = "c" /\ packs["P0"] = "dead" /\ packs["P1"] = "live"
-    /\ phase = "idle")
+(* split world, the schedule of the partial-retirement finding
+   under the fixed fenced_swap: a ref landed at c during the chain, the
+   drain marked c in P1 after the built snapshot, so the swap kept P1 and
+   held the lossy retirable P0 live; the chain ended with no gc_epoch bump *)
+Reach_LossyHeldBack ==
+  ~("P0" \in held /\ refs["gc"] = "c" /\ packs["P0"] = "live"
+    /\ packs["P1"] = "live" /\ epoch = 0 /\ phase = "idle")
 
 (* kept world: fallback_span retired P0 with no gc_epoch bump *)
 Reach_FallbackRetire ==
