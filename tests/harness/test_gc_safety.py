@@ -372,7 +372,7 @@ class GcSafety(unittest.TestCase):
         GE_GC_BARRIER=1 runs a barrier chain, which has no refs_version
         fence mid-walk."""
         r = repo("c2-loser")
-        ge.knob(r.name, "gc_barrier", 0)
+        th.barrier_off(r)
         a = r.commit_file("f", "x\n", "a")
         tree_x = ge.git("rev-parse", "HEAD^{tree}", cwd=r.dir).stdout.strip()
         r.push()  # P = {A, treeX, blob}
@@ -386,6 +386,7 @@ class GcSafety(unittest.TestCase):
         cutoff = int(time.time() * 1000) + 1
         ge.knob(r.name, "gc_candidate_before_ms", cutoff)
         step_until(r, "gc_mark", {"done"})  # mid-chain: consolidate is queued
+        th.assert_barrier(self, r, False)
         packs = {x["id"]: x for x in ge.jobs(r.name)["packs"]}
         self.assertTrue(packs[p["id"]]["marked"], "P was not a GC candidate")
         # the loser push: a real pack (commit C, reusing tree X) whose only
@@ -443,8 +444,13 @@ class GcSafety(unittest.TestCase):
         exist but there is no phase or chain id. The guards used to Done its
         row and strand that state; now the next GC slice aborts it — gc.*
         wiped, the build pack dead, a fresh gc_mark queued — and a full
-        clean cycle then completes."""
+        clean cycle then completes.
+
+        A pre-PR1 chain predates barrier mode, so the test pins the mode
+        off. Without the pin, a server started with GE_GC_BARRIER=1 gives
+        the simulated chain gc.barrier=1, which no pre-PR1 chain can have."""
         r = repo("gc-legacy-chain")
+        th.barrier_off(r)
         # same multi-part build recipe as the C3 wedge test: the consolidate
         # must yield 'continue' mid-build so gc.pos stands
         ge.knob(r.name, "gc_part_bytes", 5 << 20)
@@ -457,6 +463,7 @@ class GcSafety(unittest.TestCase):
         r.commit_file("f", "two\n", "two")
         r.push()
         step_until(r, "gc_mark", {"done"})
+        th.assert_barrier(self, r, False)
         s = ge.step(r.name, "gc_consolidate")
         self.assertTrue(s["ran"])
         self.assertEqual(s["outcome"], "continue",
@@ -491,13 +498,19 @@ class GcSafety(unittest.TestCase):
         stamping gc.phase=build over the refs-only marks, then build/sweep ran
         the C2-vulnerable chain on an accepted "{}" payload. Now the mark's own
         legacy_chain guard aborts it first — gc.* wiped, a fresh gc_mark
-        queued — and a full clean cycle then completes."""
+        queued — and a full clean cycle then completes.
+
+        A pre-PR1 chain predates barrier mode, so the test pins the mode
+        off. Without the pin, a server started with GE_GC_BARRIER=1 gives
+        the simulated chain gc.barrier=1, which no pre-PR1 chain can have."""
         r = repo("gc-legacy-mark")
+        th.barrier_off(r)
         th.seed_gc_repo(r)
         ge.knob(r.name, "slice_subreqs", 1)  # mark yields mid-walk
         s = ge.step(r.name, "gc_mark")
         self.assertTrue(s["ran"])
         self.assertEqual(s["outcome"], "continue", "mark was not mid-run: %r" % s)
+        th.assert_barrier(self, r, False)
         v = ge.jobs(r.name)
         self.assertIn("gc.started_at", v["gc_meta"], "%r" % v["gc_meta"])
         self.assertGreater(v["gc_tables"]["gc_frontier"]["n"], 0,
@@ -531,10 +544,10 @@ class GcSafety(unittest.TestCase):
 
         The knob pins the mode to off. Without it the chain takes the
         server's GE_GC_BARRIER default, and a server started with
-        GE_GC_BARRIER=1 runs a barrier chain, whose mid-walk abort
-        behaviour is not the flag-off contract this test pins."""
+        GE_GC_BARRIER=1 runs a barrier chain, whose mark never aborts on
+        moved refs, so the abort-then-consolidate race never happens."""
         r = repo("c3-wedge")
-        ge.knob(r.name, "gc_barrier", 0)
+        th.barrier_off(r)
         ge.knob(r.name, "gc_part_bytes", 5 << 20)
         # pull the yield point all the way forward: the first build slice must
         # yield 'continue' mid-build, not race to done inside one budget
@@ -549,6 +562,7 @@ class GcSafety(unittest.TestCase):
         r.commit_file("f", "two\n", "two")
         r.push()  # pack 2: two candidate packs, all reachable
         step_until(r, "gc_mark", {"done"})
+        th.assert_barrier(self, r, False)
         s = ge.step(r.name, "gc_consolidate")
         self.assertTrue(s["ran"])
         self.assertEqual(s["outcome"], "continue",
@@ -556,7 +570,9 @@ class GcSafety(unittest.TestCase):
         r.commit_file("f", "three\n", "three")
         r.push()  # refs_version++ and a gc_mark is queued
         s = ge.step(r.name, "gc_mark")
-        self.assertTrue(s["ran"])  # today: it abort()s and wipes gc.* mid-build
+        self.assertTrue(s["ran"])
+        self.assertNotIn("gc.started_at", ge.jobs(r.name)["gc_meta"],
+                         "the mark did not abort the chain mid-build")
         # drive the chain: prefer the in-flight consolidate, then sweep, then
         # mark — bounded at 60 steps, tracking attempts/dead/errors as we go
         max_attempts, dead, errs, swept = 0, [], [], False

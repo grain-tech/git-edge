@@ -42,11 +42,6 @@ def packs_by_id(r):
     return {p["id"]: p for p in ge.jobs(r.name)["packs"]}
 
 
-def cohort_ids(r):
-    """Pack ids in the candidate bitmap (packs.marked flag in the jobs view)."""
-    return {p["id"] for p in ge.jobs(r.name)["packs"] if p["marked"]}
-
-
 def live_ids(r):
     return {p["id"] for p in tgs.live_packs(r)}
 
@@ -199,7 +194,7 @@ class Swap(unittest.TestCase):
         _, g_pack = push_garbage(r, "g")
         cutoff_now(r)
         tb.to_stage(r, "presweep")
-        cohort = cohort_ids(r)  # the marked flag wipes with the chain
+        cohort = tb.cohort_ids(r)  # the marked flag wipes with the chain
         epoch0 = epoch(r)
         gone = False
         for i in range(40):
@@ -436,7 +431,7 @@ class Swap(unittest.TestCase):
                     tb.seed(r, 2)
                 cutoff_now(r)
                 tb.to_stage(r, "presweep")
-                cohort = cohort_ids(r)
+                cohort = tb.cohort_ids(r)
                 new_pack = tb.meta(r).get("gc.new_pack")
                 epoch0 = epoch(r)
                 ge.knob(r.name, "swap_tries", 1)
@@ -702,12 +697,13 @@ class Swap(unittest.TestCase):
         server's GE_GC_BARRIER default, and a server started with
         GE_GC_BARRIER=1 runs a barrier chain whose swap is correct."""
         r = repo("flag-off")
-        ge.knob(r.name, "gc_barrier", 0)
+        th.barrier_off(r)
         th.seed_gc_repo(r)
         cutoff_now(r)
         tb.step_until(r, "gc_mark", {"done"})
+        th.assert_barrier(self, r, False)
         tb.step_until(r, "gc_consolidate", {"done"})
-        cohort = cohort_ids(r)  # captured now — marked wipes with the chain
+        cohort = tb.cohort_ids(r)  # captured now — marked wipes with the chain
         epoch0 = epoch(r)
         push_commit(r, "mv")
         s = ge.step(r.name, "gc_sweep")
@@ -719,9 +715,7 @@ class Swap(unittest.TestCase):
                           "a flag-off swap was recorded")
         self.assertEqual(epoch(r), epoch0,
                          "the abort moved gc_epoch")
-        packs = packs_by_id(r)
-        self.assertTrue(all(packs[c]["state"] == "live" for c in cohort),
-                        "cohort pack retired on the flag-off abort: %r" % packs)
+        tb.assert_cohort_live(self, r, cohort)
         tgs.gc_drain(r, limit=120)
         tb.assert_pack_ok(self, r)
 
@@ -743,7 +737,7 @@ class Swap(unittest.TestCase):
                 th.seed_gc_repo(r)
                 cutoff_now(r)
                 tb.to_stage(r, "presweep")
-                cohort = cohort_ids(r)  # marked wipes with the chain end
+                cohort = tb.cohort_ids(r)  # marked wipes with the chain end
                 ge.marked_built_null(r.name)  # 500s until the column ships
                 epoch0 = epoch(r)
                 if moved:
@@ -1091,7 +1085,7 @@ class Swap(unittest.TestCase):
         ge.git("push", "-q", r.url, ":refs/heads/g2", cwd=r.dir)
         cutoff_now(r)
         tb.to_stage(r, "presweep")
-        cohort = cohort_ids(r)
+        cohort = tb.cohort_ids(r)
         new_pack = tb.meta(r).get("gc.new_pack")
         # resurrect one unbuilt object per cohort pack → none retirable
         st, body = ge.receive_pack(
