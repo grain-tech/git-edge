@@ -235,7 +235,10 @@ impl BodyReader {
                 self.pending = Some(p);
                 break;
             }
-            crate::try_grow::vec(&mut self.buf, n)?;
+            if let Err(e) = crate::try_grow::vec(&mut self.buf, n) {
+                self.pending = Some(p);
+                return Err(e);
+            }
             let start = self.buf.len();
             self.buf.resize(start + n, 0);
             p.0.copy_range_into(&mut self.buf[start..], p.1);
