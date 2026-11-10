@@ -70,6 +70,14 @@ Reach_FallbackRetire ==
 Reach_NonLossySwap ==
   ~(packs["P0"] = "dead" /\ diedBy["P0"] = "swap" /\ epoch = 0)
 
+(* fenced_swap step 6's partial arm: a swap retired one candidate
+   losslessly while another candidate stays live, with no gc_epoch bump.
+   The live candidate was in that swap's cohort and was kept, so whole was
+   FALSE and ids was not empty *)
+Reach_PartialLosslessSwap ==
+  ~(\E p, q \in OldPacks : p # q /\ packs[p] = "dead" /\ diedBy[p] = "swap"
+      /\ packs[q] = "live" /\ epoch = 0)
+
 (* kept world: a thin push's lookup resolved a base to P0, and P0 has
    since retired with no gc_epoch bump, so step 2 will not reject the
    push *)

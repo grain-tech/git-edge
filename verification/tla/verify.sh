@@ -2,9 +2,10 @@
 # Runs TLC on GcBarrier: every clean config must check clean, every vacuity
 # guard in GcBarrierReach must be reachable, the statechart config must
 # check clean, and each Bug variant must violate its named invariant. No
-# clean run counts unless the lossless paths (Reach_FallbackRetire and
-# Reach_NonLossySwap) are reached. Caches the JRE and tla2tools.jar under
-# ${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}; TLC state goes to a temp dir.
+# clean run counts unless the lossless paths (Reach_FallbackRetire,
+# Reach_NonLossySwap and Reach_PartialLosslessSwap) are reached. Caches
+# the JRE and tla2tools.jar under ${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla};
+# TLC state goes to a temp dir.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -130,6 +131,7 @@ run_reach TRUE single 1 Reach_DeltaHandoff
 run_reach TRUE split 2 Reach_LossyHeldBack
 run_reach TRUE kept 2 Reach_FallbackRetire
 run_reach TRUE kept 2 Reach_NonLossySwap
+run_reach TRUE kept 2 Reach_PartialLosslessSwap
 run_reach TRUE kept 2 Reach_ThinOverLosslessRetire
 
 run_case GcBarrier_bug_noBarrierPending.cfg        YoungPacksClosed
@@ -144,11 +146,11 @@ run_case GcBarrier_bug_partialLossyRetire_refs.cfg RefsResolvable
 
 # the rule: a clean run claims nothing unless the lossless retirement
 # paths ran: the fix in fenced_swap step 6 rests on them
-for g in Reach_FallbackRetire Reach_NonLossySwap; do
+for g in Reach_FallbackRetire Reach_NonLossySwap Reach_PartialLosslessSwap; do
   case "$REACHED" in
     *" $g "*) ;;
     *) fail "$g was not reached, so no clean run may be claimed" ;;
   esac
 done
-echo "verify: lossless paths reached (Reach_FallbackRetire, Reach_NonLossySwap), so the clean runs count"
+echo "verify: lossless paths reached (Reach_FallbackRetire, Reach_NonLossySwap, Reach_PartialLosslessSwap), so the clean runs count"
 echo "verify: all checks passed"
