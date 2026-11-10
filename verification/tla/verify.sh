@@ -76,6 +76,25 @@ run_tlc() { # spec cfg-path -> sets OUT and RC
   RC=0
   (cd "$HERE" && "$JAVA" -XX:+UseParallelGC -jar "$TOOLS" -workers 1 \
      -metadir "$META/run$N.states" -config "$2" "$1") >"$OUT" 2>&1 || RC=$?
+  case "$RC" in
+    0|1[0-4]) ;;
+    *) cat "$OUT" >&2
+       fail "$2: TLC tool error, exit $RC ($(tlc_exit_name "$RC")), not a model result" ;;
+  esac
+}
+
+tlc_exit_name() { # tla2tools v1.7.4 tlc2.output.EC.ExitStatus
+  case "$1" in
+    75) echo "spec evaluation failure" ;;
+    76) echo "safety evaluation failure" ;;
+    77) echo "liveness evaluation failure" ;;
+    150) echo "spec parse error" ;;
+    151) echo "config parse error" ;;
+    152) echo "state space too large" ;;
+    153) echo "system error" ;;
+    255) echo "error" ;;
+    *) echo "unknown" ;;
+  esac
 }
 
 fail() { echo "verify: FAIL: $*" >&2; exit 1; }

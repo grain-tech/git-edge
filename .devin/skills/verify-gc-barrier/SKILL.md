@@ -22,6 +22,8 @@ The script runs four kinds of check:
 - `statechart/ThinPushRace.cfg` must check clean.
 - A Bug variant must exit 12 on its named invariant.
 
+Any other TLC exit is a tool error, not a model result. In tla2tools v1.7.4, 75 to 77 are evaluation failures, 150 is a spec parse error, 151 a config parse error, 152 a state space too large, 153 a system error and 255 a general error. The script prints the TLC log and fails with the exit code and its name, so a tool error never reads as an unreachable guard or a missed invariant.
+
 No clean run counts unless the clean model retires a pack with no data loss. So the script checks at the end that `Reach_FallbackRetire`, `Reach_NonLossySwap` and `Reach_PartialLosslessSwap` were reached. It prints a line that says so before `all checks passed`, and it fails if any of them was not reached. The single world cannot reach a lossless retirement. Without these guards, a clean run would say nothing about the lossless paths that the fix in `fenced_swap` relies on.
 
 Expected output at the sync commit:
