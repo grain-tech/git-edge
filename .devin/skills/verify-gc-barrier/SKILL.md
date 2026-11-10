@@ -74,7 +74,7 @@ verify: all checks passed
 
 A different state count with the same verdicts means the model or a config changed. Confirm that the change was intended before you update this block.
 
-The move to `2e8b92d` changed two counts. `GcBarrier_kept_barrier.cfg` went from 310306 to 265190 and `GcBarrier_bug_fallbackUsesBitmap.cfg` from 5237 to 5236. In the kept world the fixed rule now holds back lossy packs that the old rule retired next to a kept pack, so fewer states follow. The single world and the chart did not change. The two `partialLossyRetire` runs match the old finding runs state for state.
+The move to the fix, now `4c4d22a` on `main`, changed two counts. `GcBarrier_kept_barrier.cfg` went from 310306 to 265190 and `GcBarrier_bug_fallbackUsesBitmap.cfg` from 5237 to 5236. In the kept world the fixed rule now holds back lossy packs that the old rule retired next to a kept pack, so fewer states follow. The single world and the chart did not change. The two `partialLossyRetire` runs match the old finding runs state for state.
 
 ## What each invariant means
 
@@ -138,7 +138,7 @@ Each variant is a one-site break of the real code:
 | `abortDropsSurvivor` | `jobs/gc.rs` `wipe_all` always takes the kill arm for `gc.new_pack`, even when a cohort pack already died. | `RefsResolvable` |
 | `janitorNoGrace` | `jobs/janitor.rs` `run_slice` deletes dead-pack R2 keys without the `dead_at < now - GRACE_MS` filter. | `FetchReadsSucceed` |
 | `fallbackUsesBitmap` | `jobs/gc.rs` `fallback_span` calls `bm_all_set(&r.bitmap, &need)` in place of `bm_all_set(&r.built, &need)`. An entry marked after the built snapshot then counts as copied. This is the C11 mistake. Kept world. | `RefsResolvable` |
-| `partialLossyRetire` | `jobs/gc.rs` `fenced_swap` step 6 as it was before `2e8b92d`: `ids` is every retirable pack, and `lossy` is set when any retirable pack is lossy, whether or not the whole cohort retires. Split world. `GcBarrier_bug_partialLossyRetire.cfg`. | `LiveClosed` |
+| `partialLossyRetire` | `jobs/gc.rs` `fenced_swap` step 6 as it was before `4c4d22a`: `ids` is every retirable pack, and `lossy` is set when any retirable pack is lossy, whether or not the whole cohort retires. Split world. `GcBarrier_bug_partialLossyRetire.cfg`. | `LiveClosed` |
 | `partialLossyRetire`, the harm | The same break. `GcBarrier_bug_partialLossyRetire_refs.cfg` leaves `LiveClosed` out, so the run goes on until a later push lands a ref on the broken object. | `RefsResolvable` |
 
 `fallbackUsesBitmap` needs a mark after the built snapshot while the drain is still not empty. A push lands ref `gc` at `c` during the build. The drain marks `c` in P1 and feeds `b`. The fallback fires with `b` still in the frontier. The bug counts `c` as copied, so P1 retires and ref `gc` loses `c`. The real rule keeps P1, because `c` is not built and has no live copy outside the cohort.
@@ -149,7 +149,7 @@ Each variant is a one-site break of the real code:
 
 ### Finding 1: a partial retirement broke the connectivity rule
 
-**Status.** Fixed in `2e8b92d` ("gc: retire lossy packs only when the whole cohort retires") on the local branch `fix/gc-partial-retirement`. The harness test `tests/harness/test_swap.py` `Swap.test_partial_retire_keeps_live_closure`, added in `26dc4ca`, failed before the fix and passes after it. The fix is not on `main` yet. The model keeps the old rule as the Bug variant `partialLossyRetire`, which must still break `LiveClosed` and `RefsResolvable`.
+**Status.** Fixed on `main` in `4c4d22a` ("gc: retire lossy packs only when the whole cohort retires (#3)"), the squash merge of the fix and its test. The harness test `tests/harness/test_swap.py` `Swap.test_partial_retire_keeps_live_closure` failed before the fix and passes after it. The model keeps the old rule as the Bug variant `partialLossyRetire`, which must still break `LiveClosed` and `RefsResolvable`.
 
 **What went wrong.** In barrier mode, `fenced_swap` decided each candidate pack on its own. A pack whose marked entries were all built retired. A pack that gained a mark after the built snapshot stayed live. The kept pack could hold an unreachable object that links into a retired pack. The build did not copy the link target, because nothing reached the target either. The swap deleted the row of the target. The kept object then linked to an object with no row. That broke the connectivity rule in `CONTRACTS.md` section 2.5.
 
@@ -180,7 +180,7 @@ The steps:
 
 The TLC output of the 12-state run is in the evidence file `fv/tlc-bug-partialLossyRetire.txt` of the review. The first report of the finding is in `tlc-finding-partial-retirement.txt` of the review that found it.
 
-**The fix.** `fenced_swap` step 6 at `2e8b92d`:
+**The fix.** `fenced_swap` step 6 at `4c4d22a`:
 
 - `retirable`: the cohort rows with `built` not null and `bm_bitmap_subset(&r.bitmap, &r.built)`. This rule did not change.
 - `whole`: every cohort row is retirable.
@@ -201,9 +201,9 @@ A pack that is not lossy has every entry in the build pack, so a partial swap re
 
 ## Coverage record
 
-Sync commit: `2e8b92da8a7c70d850b5e5119826405636393377`, the head of the local branch `fix/gc-partial-retirement`. That branch is not on `main` yet. It sits on `main` at `88e90b2e794ddc239c6427ad96cf865f398ba668`. Between `88e90b2` and `2e8b92d`, `server/` differs only in `jobs/gc.rs` `fenced_swap` step 6, which is the fix. `tests/harness/test_swap.py` gains `Swap.test_partial_retire_keeps_live_closure`. `CONTRACTS.md` and `SETUP.md` are byte-identical. If `main` takes a different fix, or none, move the sync commit and check `GcSwap` again.
+Sync commit: `4c4d22a4dc844f8f065a0d0aa6d97d84a9f32456` on `main`, the squash merge of the partial-retirement fix. Its tree is identical to the reviewed fix head `2e8b92da8a7c70d850b5e5119826405636393377`. Its parent is `88e90b2e794ddc239c6427ad96cf865f398ba668`. Between `88e90b2` and `4c4d22a`, `server/` differs only in `jobs/gc.rs` `fenced_swap` step 6, which is the fix. `tests/harness/test_swap.py` gains `Swap.test_partial_retire_keeps_live_closure`. `CONTRACTS.md` and `SETUP.md` are byte-identical. If a later change on `main` touches `fenced_swap`, move the sync commit and check `GcSwap` again.
 
-The previous sync commit was `5f4938c5bd5c3c544d745db46f533c11dfc8d6ef`. Between `5f4938c` and `88e90b2`, `server/` changed only in how the edge reads a request body: `edge/mod.rs` `BodyReader` and the body cap, and the `BodyChunk` trait in `store/mod.rs`. No function in the table below changed. The model was first confirmed at `11a52051d8b0d1f7687ead8202f24913249ba82a`. After a rebase onto a newer main, reread every function in this table at the new commit. Move the sync commit forward only after you confirm the model still describes the code.
+Before the fix the sync commit was `88e90b2`, and before that `5f4938c5bd5c3c544d745db46f533c11dfc8d6ef`. Between `5f4938c` and `88e90b2`, `server/` changed only in how the edge reads a request body: `edge/mod.rs` `BodyReader` and the body cap, and the `BodyChunk` trait in `store/mod.rs`. No function in the table below changed. The model was first confirmed at `11a52051d8b0d1f7687ead8202f24913249ba82a`. After a rebase onto a newer main, reread every function in this table at the new commit. Move the sync commit forward only after you confirm the model still describes the code.
 
 | Model action | Code |
 | --- | --- |
@@ -226,7 +226,7 @@ The previous sync commit was `5f4938c5bd5c3c544d745db46f533c11dfc8d6ef`. Between
 | `GcBuildFinish` | `jobs/gc.rs` `build`, `finish_pack` or the HEAD hit in `mpu_err`, then `finish_build` |
 | `GcRebuild` | `jobs/gc.rs` `mpu_err` returning `Flow::Rebuild`, `wipe_build`, then `begin_build` in the same span |
 | `GcSweepLegacy` | `jobs/gc.rs` `pr5_sweep`, with an optional Err at `gc.sweep.after_deadmark` |
-| `GcSwap` | `jobs/gc.rs` `swap_check`, `fenced_swap`, `retire_span`, `retire_finish`, `wipe_path`, `end_of_chain`, one sync span, with an optional Err at `gc.swap.after_deadmark`. Step 6 follows `2e8b92d`: `retirable`, `whole`, `ids` and `lossy` as in Fixed findings. The ghost `held` records each lossy retirable pack that a partial swap keeps live. |
+| `GcSwap` | `jobs/gc.rs` `swap_check`, `fenced_swap`, `retire_span`, `retire_finish`, `wipe_path`, `end_of_chain`, one sync span, with an optional Err at `gc.swap.after_deadmark`. Step 6 follows `4c4d22a`: `retirable`, `whole`, `ids` and `lossy` as in Fixed findings. The ghost `held` records each lossy retirable pack that a partial swap keeps live. |
 | `GcFallback` | `jobs/gc.rs` `swap_check` past its tries or slices bound, then `fallback_span` |
 | `GcRetireResume` | `jobs/gc.rs` `retire_resume`, the all-dead arm |
 | `WipeAll`, `WipePath` | `jobs/gc.rs` `wipe_all` with the gc.retire arm and the keep rule, and `wipe_path` |
@@ -241,7 +241,7 @@ Not covered:
 - Boot repair and its resurrection of chain-less job rows, the `stray` and `legacy_chain` guards, and pre-PR6 chains with `built IS NULL`.
 - An Err before a dead-mark, the mixed and all-live arms of `retire_resume`, and crashes that roll a span back. A rolled-back span is the same as a span that never ran.
 - A partial swap with three or more candidates, where one pack is kept, a lossy pack is held back and a pack that is not lossy retires in the same swap. The model has at most two candidates. It reaches each half on its own: a held-back lossy pack (`Reach_LossyHeldBack`, where `ids` is empty and the swap takes `wipe_path`) and a lossless retirement beside a kept pack (`Reach_PartialLosslessSwap`). It does not reach both in one swap. The argument for more candidates is in the code, not the model: a pack that is not lossy has every entry in the build pack, so its retirement removes no object.
-- A `gc.retire` intent written by a binary from before `2e8b92d` and resumed by a binary after it. `retire_resume` re-runs the recorded ids and does not apply step 6 again. Damage from swaps that ran before the fix is also out of scope: the fix stops new damage and does not repair a repo where a lossy partial swap already ran.
+- A `gc.retire` intent written by a binary from before `4c4d22a` and resumed by a binary after it. `retire_resume` re-runs the recorded ids and does not apply step 6 again. Damage from swaps that ran before the fix is also out of scope: the fix stops new damage and does not repair a repo where a lossy partial swap already ran.
 - A fetch that runs GRACE or longer after its first lookup. The code has no fetch timeout. The model's hold assumes every fetch is shorter, as stated in Bounds and assumptions.
 - A GC slice's own R2 reads after the janitor deleted bytes.
 - The checkpoint, tail and part layout inside `build`, and the multipart upload's byte content.

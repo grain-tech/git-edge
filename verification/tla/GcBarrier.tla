@@ -649,7 +649,7 @@ GcSweepLegacy ==
 (* barrier gc_sweep: swap_check finds frontier and gc_pending empty and
    runs fenced_swap -> retire_span -> retire_finish -> end_of_chain in the
    same span. cohort_live / build pack live guards -> wipe_path. Step 6,
-   as fixed in 2e8b92d (fix/gc-partial-retirement):
+   as fixed in 4c4d22a on main:
      retirable  P's bitmap is a subset of built (bm_bitmap_subset)
      lossy(P)   the build missed entries, popcount(built) < count (bm_lossy)
      whole      every cohort pack is retirable
@@ -659,7 +659,7 @@ GcSweepLegacy ==
    drops nothing and does not bump gc_epoch. ids = {} -> wipe_path (6a). A
    lossy swap bumps gc_epoch before any destructive write. An Err at
    gc.swap.after_deadmark keeps the intent, the bump and the dead-mark.
-   Bug partialLossyRetire restores the rule before 2e8b92d: ids =
+   Bug partialLossyRetire restores the rule before 4c4d22a: ids =
    retirable, lossy = some retirable pack is lossy. held records each lossy
    retirable pack a partial swap kept live. *)
 GcSwap ==
