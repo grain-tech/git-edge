@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs TLC on GcBarrier: every clean config must check clean, every vacuity
 # guard in GcBarrierReach must be reachable, the statechart config must
-# check clean, each Bug variant must violate its named invariant, and each
-# known finding must still violate its named invariant. Caches the JRE and tla2tools.jar under
+# check clean, and each Bug variant must violate its named invariant.
+# Caches the JRE and tla2tools.jar under
 # ${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}; TLC state goes to a temp dir.
 set -euo pipefail
 
@@ -108,23 +108,9 @@ run_reach() { # barrier world pushes guard: the clean model reaches the guarded 
   printf 'ok  %-44s reached\n' "reach $mode $4"
 }
 
-run_finding() { # cfg invariant: a known finding in the real design. TLC
-  # must still exit 12 on that invariant. If it stops doing so, the code or
-  # the model changed: re-read the finding in the skill before flipping
-  # the case to a clean check.
-  run_tlc GcBarrier.tla "$1"
-  local got
-  got="$(violated_invariant "$OUT")"
-  if [ "$RC" -eq 12 ] && [ "$got" = "$2" ]; then
-    printf 'FINDING %-40s violated %s, %s distinct states\n' "$1" "$got" "$(distinct_states "$OUT")"
-    return
-  fi
-  grep -E '^Error' "$OUT" >&2 || true
-  fail "$1: the known finding no longer reproduces (expected $2 violated, got '${got:-none}', exit $RC). If server/ was fixed, confirm the fix against the Findings section of .devin/skills/verify-gc-barrier/SKILL.md, then turn this case into a clean check"
-}
-
 run_clean GcBarrier_barrier.cfg
 run_clean GcBarrier_legacy.cfg
+run_clean GcBarrier_split_barrier.cfg
 run_clean GcBarrier_split_legacy.cfg
 run_clean GcBarrier_kept_barrier.cfg
 run_clean GcBarrier_kept_legacy.cfg
@@ -138,7 +124,6 @@ for g in Reach_LandThenRetire Reach_LoserThenRetire Reach_BareLandsMidChain \
 done
 run_reach TRUE single 1 Reach_DrainMarksNew
 run_reach TRUE single 1 Reach_DeltaHandoff
-run_reach TRUE split 2 Reach_PartialRetire
 run_reach TRUE kept 2 Reach_FallbackRetire
 run_reach TRUE kept 2 Reach_NonLossySwap
 run_reach TRUE kept 2 Reach_ThinOverLosslessRetire
@@ -150,8 +135,7 @@ run_case GcBarrier_bug_sweepIgnoresRefsVersion.cfg RefsResolvable
 run_case GcBarrier_bug_abortDropsSurvivor.cfg      RefsResolvable
 run_case GcBarrier_bug_janitorNoGrace.cfg          FetchReadsSucceed
 run_case GcBarrier_bug_fallbackUsesBitmap.cfg      RefsResolvable
+run_case GcBarrier_bug_partialLossyRetire.cfg      LiveClosed
+run_case GcBarrier_bug_partialLossyRetire_refs.cfg RefsResolvable
 
-run_finding GcBarrier_finding_split.cfg      LiveClosed
-run_finding GcBarrier_finding_split_refs.cfg RefsResolvable
-
-echo "verify: all checks passed, with 2 known findings"
+echo "verify: all checks passed"

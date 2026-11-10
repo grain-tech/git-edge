@@ -169,11 +169,12 @@ VARIABLES
   walk,        \* one walk_step between its pop span and commit_ids
   chains,      \* mark inits so far
   errs,        \* Errs after a dead-mark so far
-  diedBy       \* ghost: the path that dead-marked each old pack
+  diedBy,      \* ghost: the path that dead-marked each old pack
+  held         \* ghost: lossy retirable packs a partial swap kept live
 
 vars == <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
           phase, bar, cohort, marked, built, fr, seen, pending, rounds,
-          newPack, retire, walk, chains, errs, diedBy>>
+          newPack, retire, walk, chains, errs, diedBy, held>>
 
 gcVars == <<phase, bar, cohort, marked, built, fr, seen, pending, rounds,
             newPack, retire, walk>>
@@ -287,7 +288,7 @@ PushBegin ==
                 tip |-> IF sh = "thin" THEN "c2" ELSE t,
                 epoch |-> epoch, base |-> {}, cas |-> FALSE]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, landed, fetch,
-                 chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* push_lookup (separate sync request): the thin pack's bases c1 and b
    must be live; the edge then reads their bytes from the packs it found
@@ -299,7 +300,7 @@ PushLookup ==
             push' = [push EXCEPT !.st = "looked", !.base = {p1, p2}]
      ELSE push' = [push EXCEPT !.st = "failed"]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, npush, landed,
-                 fetch, chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 fetch, chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* ingest pass B plus push_index: the base reads complete, Q's bytes are
    durable in R2, its rows are posted and Q is 'ingesting'. push_index
@@ -310,7 +311,8 @@ PushUpload ==
   /\ packs' = [packs EXCEPT !["Q"] = "ingesting"]
   /\ rows' = [rows EXCEPT !["Q"] = {"c2"}]
   /\ bytes' = [bytes EXCEPT !["Q"] = TRUE]
-  /\ UNCHANGED <<refs, moved, epoch, npush, landed, fetch, chains, errs, diedBy>>
+  /\ UNCHANGED <<refs, moved, epoch, npush, landed, fetch, chains, errs,
+                 diedBy, held>>
   /\ UNCHANGED gcVars
 
 (* commit_push: ONE synchronous span. Step 1 open check, step 2 gc_epoch
@@ -324,7 +326,7 @@ PushCommit ==
      THEN \* step 2: "gc ran during push, retry"
           /\ push' = [push EXCEPT !.st = "rejected"]
           /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, npush,
-                         landed, fetch, chains, errs, diedBy>> /\ UNCHANGED gcVars
+                         landed, fetch, chains, errs, diedBy, held>> /\ UNCHANGED gcVars
      ELSE
        LET b       == BarrierActive
            thin    == push.shape = "thin"
@@ -348,7 +350,7 @@ PushCommit ==
              /\ push' = [push EXCEPT !.st = "committed", !.cas = cas]
              /\ UNCHANGED <<rows, bytes, epoch, npush, fetch, chains, errs,
                             phase, bar, cohort, marked, built, seen, rounds,
-                            newPack, retire, walk, diedBy>>
+                            newPack, retire, walk, diedBy, held>>
 
 (* ================================================================== *)
 (* fetch: pack/generate.rs                                             *)
@@ -371,7 +373,7 @@ FetchWalk ==
                              rb |-> FALSE]
          ELSE fetch' = [st |-> "error", picks |-> {}, rb |-> FALSE]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
-                 chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* plan_reads, one sync span after the walk's last await: entries_of reads
    each planned pack's rows with no live filter, so a pack that died but
@@ -393,14 +395,14 @@ FetchPlan ==
                              rb |-> TRUE]
          ELSE fetch' = [st |-> "error", picks |-> {}, rb |-> TRUE]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
-                 chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* pack_chunk: the planned range reads, after the await *)
 FetchRead ==
   /\ fetch.st = "planned"
   /\ fetch' = [fetch EXCEPT !.st = "done", !.picks = {}]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
-                 chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* ================================================================== *)
 (* janitor: jobs/janitor.rs run_slice                                  *)
@@ -411,7 +413,7 @@ JanitorExpire ==
   /\ push.st \in Open /\ Scope = "full"
   /\ push' = [push EXCEPT !.st = "expired", !.base = {}]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, npush, landed,
-                 fetch, chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 fetch, chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* the ingesting pack of an expired or rejected push: rows, then dead *)
 JanitorReap ==
@@ -419,7 +421,7 @@ JanitorReap ==
   /\ packs' = [packs EXCEPT !["Q"] = "dead"]
   /\ rows' = [rows EXCEPT !["Q"] = {}]
   /\ UNCHANGED <<bytes, refs, moved, epoch, push, npush, landed, fetch,
-                 chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* a dead pack with no object rows, past GRACE: delete its R2 key.
    Bug janitorNoGrace ignores the grace hold. *)
@@ -428,7 +430,7 @@ JanitorDelete(p) ==
   /\ (~Held(p) \/ Bug = "janitorNoGrace")
   /\ bytes' = [bytes EXCEPT ![p] = FALSE]
   /\ UNCHANGED <<packs, rows, refs, moved, epoch, push, npush, landed, fetch,
-                 chains, errs, diedBy>> /\ UNCHANGED gcVars
+                 chains, errs, diedBy, held>> /\ UNCHANGED gcVars
 
 (* ================================================================== *)
 (* GC mark: jobs/gc.rs gc_mark                                         *)
@@ -454,7 +456,8 @@ GcMarkInit ==
               /\ seen' = {} /\ pending' = {} /\ rounds' = 0
               /\ newPack' = None /\ retire' = {} /\ walk' = NoWalk
               /\ moved' = FALSE
-  /\ UNCHANGED <<packs, rows, bytes, refs, epoch, push, npush, landed, fetch, errs, diedBy>>
+  /\ UNCHANGED <<packs, rows, bytes, refs, epoch, push, npush, landed, fetch,
+                 errs, diedBy, held>>
 
 (* a mark slice, or a barrier sweep slice past retire_resume (which runs
    first on every sweep slice entry and ends the chain when an intent
@@ -479,7 +482,7 @@ GcPop ==
                     ELSE rounds
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  phase, bar, cohort, marked, built, fr, seen, pending,
-                 newPack, retire, chains, errs, diedBy>>
+                 newPack, retire, chains, errs, diedBy, held>>
 
 (* commit_ids (span B, after the read's await, behind phase_fence): bits
    first, then gc_seen, then the kids at the batch gen minus gc_seen,
@@ -499,7 +502,7 @@ GcCommit ==
          /\ walk' = NoWalk
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  phase, bar, cohort, built, pending, rounds, newPack, retire,
-                 chains, errs, diedBy>>
+                 chains, errs, diedBy, held>>
 
 (* pending_page (barrier, before the pop): drop rows whose pack is not
    live, then feed the oldest live row's non-blobs at gen 1 (minus
@@ -513,7 +516,7 @@ GcPage ==
   /\ rounds' = Min(rounds + 1, DeltaCap)
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  phase, bar, cohort, marked, built, seen, newPack, retire,
-                 walk, chains, errs, diedBy>>
+                 walk, chains, errs, diedBy, held>>
 
 (* barrier_handoff_if_ready: no gen-0 row left, and either frontier and
    gc_pending are both empty, or the delta cap is hit while refs moved *)
@@ -525,7 +528,7 @@ GcHandoff ==
   /\ phase' = "build"
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  bar, cohort, marked, built, fr, seen, pending, rounds,
-                 newPack, retire, walk, chains, errs, diedBy>>
+                 newPack, retire, walk, chains, errs, diedBy, held>>
 
 (* legacy walk: Step::Empty with refs unmoved -> gc_seen wiped, build *)
 GcHandoffLegacy ==
@@ -533,7 +536,7 @@ GcHandoffLegacy ==
   /\ phase' = "build" /\ seen' = {}
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  bar, cohort, marked, built, fr, pending, rounds, newPack,
-                 retire, walk, chains, errs, diedBy>>
+                 retire, walk, chains, errs, diedBy, held>>
 
 (* legacy abort, every refs_moved site except pr5_sweep's own: the walk
    loop (before a pop), begin_build, and a gc_mark slice that finds the
@@ -542,7 +545,8 @@ GcHandoffLegacy ==
 GcAbortLegacy ==
   /\ phase \in {"walking", "build", "sweep"} /\ ~bar /\ Idle /\ moved
   /\ WipeAll
-  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs, diedBy>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs,
+                 diedBy, held>>
 
 (* compact.rs orphaned + orphan_abort, reached from gc_mark's M4 arm: a
    barrier chain at build/sweep whose owner row died (any Err that
@@ -550,7 +554,8 @@ GcAbortLegacy ==
 GcOrphanAbort ==
   /\ phase \in {"build", "sweep"} /\ bar /\ Idle /\ Scope = "full"
   /\ WipeAll
-  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs, diedBy>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs,
+                 diedBy, held>>
 
 (* ================================================================== *)
 (* GC build: gc_consolidate                                            *)
@@ -579,7 +584,8 @@ GcBeginBuild ==
           /\ built' = IF bar THEN marked ELSE built
           /\ UNCHANGED <<rows, phase, bar, cohort, marked, fr, seen,
                          pending, rounds, retire, walk, moved>>
-  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs, diedBy>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs,
+                 diedBy, held>>
 
 (* build's last flush: the multipart upload completes (finish_pack, or
    mpu_err's HEAD hit), the copied rows are posted, then finish_build:
@@ -593,7 +599,7 @@ GcBuildFinish ==
   /\ phase' = "sweep"
   /\ UNCHANGED <<refs, moved, epoch, push, npush, landed, fetch, bar, cohort,
                  marked, built, fr, seen, pending, rounds, newPack, retire,
-                 walk, chains, errs, diedBy>>
+                 walk, chains, errs, diedBy, held>>
 
 (* mpu_err -> Flow::Rebuild -> wipe_build, then begin_build again in the
    same span: the dead upload's ingesting pack is dead-marked (never
@@ -607,7 +613,7 @@ GcRebuild ==
   /\ newPack' = Fresh
   /\ UNCHANGED <<bytes, refs, moved, epoch, push, npush, landed, fetch, phase, bar,
                  cohort, marked, built, fr, seen, pending, rounds, retire,
-                 walk, chains, errs, diedBy>>
+                 walk, chains, errs, diedBy, held>>
 
 (* ================================================================== *)
 (* GC sweep                                                            *)
@@ -622,7 +628,7 @@ GcSweepLegacy ==
   /\ phase = "sweep" /\ ~bar /\ Idle
   /\ IF moved /\ Bug # "sweepIgnoresRefsVersion"
      THEN WipeAll /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch,
-                                 chains, errs, diedBy>>
+                                 chains, errs, diedBy, held>>
      ELSE LET pk1 == [p \in Packs |-> IF p \in cohort THEN "dead"
                                       ELSE packs[p]]
           IN  /\ epoch' = epoch + 1
@@ -637,42 +643,59 @@ GcSweepLegacy ==
                                    retire, walk, moved>>
               /\ diedBy' = [p \in DOMAIN diedBy |->
                               IF p \in cohort THEN "pr5" ELSE diedBy[p]]
-              /\ UNCHANGED <<bytes, refs, push, npush, landed, fetch, chains>>
+              /\ UNCHANGED <<bytes, refs, push, npush, landed, fetch, chains,
+                             held>>
 
 (* barrier gc_sweep: swap_check finds frontier and gc_pending empty and
    runs fenced_swap -> retire_span -> retire_finish -> end_of_chain in the
-   same span. cohort_live / build pack live guards -> wipe_path; P is
-   retirable iff bitmap is a subset of built; lossy iff the build missed
-   entries, which bumps gc_epoch before any destructive write. An Err at
-   gc.swap.after_deadmark keeps the intent, the bump and the dead-mark. *)
+   same span. cohort_live / build pack live guards -> wipe_path. Step 6,
+   as fixed in 43d4c53 (fix/gc-partial-retirement):
+     retirable  P's bitmap is a subset of built (bm_bitmap_subset)
+     lossy(P)   the build missed entries, popcount(built) < count (bm_lossy)
+     whole      every cohort pack is retirable
+     ids        whole ? retirable : the retirable packs that are not lossy
+     lossy      whole /\ some retirable pack is lossy
+   so a lossy pack retires only with the whole cohort, and a partial swap
+   drops nothing and does not bump gc_epoch. ids = {} -> wipe_path (6a). A
+   lossy swap bumps gc_epoch before any destructive write. An Err at
+   gc.swap.after_deadmark keeps the intent, the bump and the dead-mark.
+   Bug partialLossyRetire restores the rule before 43d4c53: ids =
+   retirable, lossy = some retirable pack is lossy. held records each lossy
+   retirable pack a partial swap kept live. *)
 GcSwap ==
   /\ phase = "sweep" /\ bar /\ Idle /\ retire = {}
   /\ FrontierEmpty /\ {p \in pending : Live(p)} = {}
   /\ IF ~CohortLive \/ (newPack # None /\ ~Live(newPack))
-     THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch,
-                                  chains, errs, diedBy>>
+     THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed,
+                                  fetch, chains, errs, diedBy, held>>
      ELSE
-       LET ids   == {p \in cohort : marked \cap rows[p] \subseteq built}
-           lossy == \E p \in ids : ~(rows[p] \subseteq built)
-           pk1   == [p \in Packs |-> IF p \in ids THEN "dead" ELSE packs[p]]
-       IN  IF ids = {}
-           THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed,
-                                        fetch, chains, errs, diedBy>>
-           ELSE /\ epoch' = IF lossy THEN epoch + 1 ELSE epoch
-                /\ packs' = pk1
-                /\ \/ /\ rows' = [p \in Packs |-> IF p \in ids THEN {}
-                                                  ELSE rows[p]]
-                      /\ ClearGc
-                      /\ UNCHANGED errs
-                   \/ /\ errs < MaxErrs /\ errs' = errs + 1
-                      /\ retire' = ids
-                      /\ pending' = {}
-                      /\ UNCHANGED <<rows, phase, bar, cohort, marked,
-                                     built, fr, seen, rounds, newPack,
-                                     walk, moved>>
-                /\ diedBy' = [p \in DOMAIN diedBy |->
-                                IF p \in ids THEN "swap" ELSE diedBy[p]]
-                /\ UNCHANGED <<bytes, refs, push, npush, landed, fetch, chains>>
+       LET retirable == {p \in cohort : marked \cap rows[p] \subseteq built}
+           Lossy(p)  == ~(rows[p] \subseteq built)
+           whole     == retirable = cohort \/ Bug = "partialLossyRetire"
+           ids       == IF whole THEN retirable
+                        ELSE {p \in retirable : ~Lossy(p)}
+           lossy     == whole /\ \E p \in retirable : Lossy(p)
+           pk1       == [p \in Packs |-> IF p \in ids THEN "dead" ELSE packs[p]]
+       IN  /\ held' = held \cup (retirable \ ids)
+           /\ IF ids = {}
+              THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, npush,
+                                           landed, fetch, chains, errs, diedBy>>
+              ELSE /\ epoch' = IF lossy THEN epoch + 1 ELSE epoch
+                   /\ packs' = pk1
+                   /\ \/ /\ rows' = [p \in Packs |-> IF p \in ids THEN {}
+                                                     ELSE rows[p]]
+                         /\ ClearGc
+                         /\ UNCHANGED errs
+                      \/ /\ errs < MaxErrs /\ errs' = errs + 1
+                         /\ retire' = ids
+                         /\ pending' = {}
+                         /\ UNCHANGED <<rows, phase, bar, cohort, marked,
+                                        built, fr, seen, rounds, newPack,
+                                        walk, moved>>
+                   /\ diedBy' = [p \in DOMAIN diedBy |->
+                                   IF p \in ids THEN "swap" ELSE diedBy[p]]
+                   /\ UNCHANGED <<bytes, refs, push, npush, landed, fetch,
+                                  chains>>
 
 (* swap_check on a non-empty drain once tries or drain slices run out:
    fallback_span. P is retirable iff every entry with no live copy outside
@@ -697,7 +720,8 @@ GcFallback ==
                  /\ ClearGc
                  /\ diedBy' = [p \in DOMAIN diedBy |->
                                 IF p \in ids THEN "fallback" ELSE diedBy[p]]
-  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs,
+                 held>>
 
 (* retire_resume on the next sweep slice: the recorded ids are all dead
    (L == 0), so retire_finish re-runs steps 8-11 *)
@@ -706,7 +730,8 @@ GcRetireResume ==
   /\ \A p \in retire : ~Live(p)
   /\ rows' = [p \in Packs |-> IF p \in retire THEN {} ELSE rows[p]]
   /\ ClearGc
-  /\ UNCHANGED <<packs, bytes, refs, epoch, push, npush, landed, fetch, chains, errs, diedBy>>
+  /\ UNCHANGED <<packs, bytes, refs, epoch, push, npush, landed, fetch, chains,
+                 errs, diedBy, held>>
 
 (* ================================================================== *)
 (* spec                                                                *)
@@ -730,6 +755,7 @@ Init ==
   /\ pending = {} /\ rounds = 0 /\ newPack = None /\ retire = {}
   /\ walk = NoWalk /\ chains = 0 /\ errs = 0
   /\ diedBy = [p \in {"P0", "P1"} |-> "none"]
+  /\ held = {}
 
 JanitorWork ==
   \/ push.st \in Open
@@ -785,6 +811,7 @@ TypeOK ==
   /\ walk.pk \in Packs \cup {None}
   /\ chains \in 0..MaxChains /\ errs \in 0..MaxErrs
   /\ diedBy \in [{"P0", "P1"} -> {"none", "pr5", "swap", "fallback"}]
+  /\ held \subseteq OldPacks
 
 (* RefsResolvable: every object reachable from any ref has an objects row
    in a live pack whose R2 bytes exist. *)
