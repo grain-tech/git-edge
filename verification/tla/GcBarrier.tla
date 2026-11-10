@@ -27,16 +27,23 @@
 (* more finely than the code only adds interleavings, so it is sound for   *)
 (* the safety invariants below; no action merges code that can interleave. *)
 (*                                                                         *)
-(* World. Objects c1, b, z, c2 with links c2 -> {c1, b}. The old pack P0  *)
-(* holds c1, b and z and is the only GC candidate. Ref main -> c1, so b is *)
-(* unreachable when the mark snapshot is taken. z is garbage: P0 always   *)
-(* has an unmarked entry, so begin_build always repacks and a retirement   *)
-(* of P0 is always lossy. One push takes one of two shapes, picked at      *)
-(* begin:                                                                  *)
+(* World "single". Objects c1, b, z, c2 with links c2 -> {c1, b}. The     *)
+(* old pack P0 holds c1, b and z and is the only GC candidate. Ref main ->  *)
+(* c1, so b is unreachable when the mark snapshot is taken. z is garbage:  *)
+(* P0 always has an unmarked entry, so begin_build always repacks and a    *)
+(* retirement of P0 is always lossy. One push takes one of two shapes,     *)
+(* picked at begin:                                                        *)
 (*   thin: a pack Q = {c2} that omits its bases c1 and b because lookup    *)
 (*         found them live; its command main: c1 -> c2 lands or loses the  *)
 (*         CAS (a loser still promotes Q, non-atomic push).                *)
 (*   bare: no pack; the command creates ref g -> b.                        *)
+(*                                                                         *)
+(* World "split". Two old candidates. P0 holds c1, b and z as above. P1    *)
+(* holds a, which links to b, and c, which links to nothing. Nothing       *)
+(* reaches a or c at the snapshot. Two bare pushes run one after the       *)
+(* other; each creates ref gc -> c or ga -> a. A second candidate lets     *)
+(* fenced_swap keep one pack and retire the other.                         *)
+(*                                                                         *)
 (* One fetch wants main. Build packs N1..N3 are fresh ids for the repack;  *)
 (* one id is always kept for a later chain, so a run rebuilds at most      *)
 (* once. Compaction is out of scope; cohort_live, which                    *)
@@ -47,8 +54,10 @@
 (*    delete a dead pack's bytes only while no in-flight request (fetch    *)
 (*    plan, push base read) names that pack. A named pack was live when    *)
 (*    the request planned it, so it died after the request started.        *)
-(*  - Candidate = old: P0 is the only pack older than the grace cutoff;    *)
-(*    every pack created during the run is young and never a candidate.    *)
+(*  - Candidate = old: P0 (and P1 in "split") are older than the grace    *)
+(*    cutoff; every pack created during the run is young and never a       *)
+(*    candidate. marked is a set of shas, sound because no sha has rows in *)
+(*    two candidate packs.                                                 *)
 (*  - The push timeout is a nondeterministic janitor expiry of an open     *)
 (*    push. Swap tries and drain slices are a nondeterministic fallback    *)
 (*    trigger at any non-empty swap check.                                 *)
@@ -69,20 +78,31 @@ CONSTANTS
   MaxChains,  \* mark inits allowed: one chain plus restarts
   DeltaCap,   \* mark_delta_rounds knob (gc.delta_rounds handoff cap)
   MaxErrs,    \* Errs after a dead-mark the run may suffer
-  Scope       \* "full" for every check; "chart" narrows the run to the
+  Scope,      \* "full" for every check; "chart" narrows the run to the
               \* thin push racing one chain, for the statechart view
+  World,      \* "single" or "split": the object world, see the header
+  MaxPushes   \* pushes the run may begin, one after another
 
 None == "none"
 
 (* ---- the fixed world ---------------------------------------------- *)
 
-Objs      == {"c1", "b", "z", "c2"}
-Links     == [o \in Objs |-> IF o = "c2" THEN {"c1", "b"} ELSE {}]
-Closure   == [o \in Objs |-> IF o = "c2" THEN {"c2", "c1", "b"} ELSE {o}]
-OldPacks  == {"P0"}
+Objs      == {"c1", "b", "z", "c2", "a", "c"}
+Links     == [o \in Objs |-> CASE o = "c2" -> {"c1", "b"}
+                              [] o = "a"  -> {"b"}
+                              [] OTHER    -> {}]
+(* every link target has no links of its own, so one step is the whole
+   closure *)
+Closure   == [o \in Objs |-> {o} \cup Links[o]]
+OldPacks  == IF World = "single" THEN {"P0"} ELSE {"P0", "P1"}
 BuildIds  == <<"N1", "N2", "N3">>
-Packs     == {"P0", "Q", "N1", "N2", "N3"}
-RefNames  == {"main", "g"}
+Packs     == {"P0", "P1", "Q", "N1", "N2", "N3"}
+RefNames  == {"main", "g", "gc", "ga"}
+(* the shas a bare push may land, and the ref each one creates *)
+BareTips  == IF World = "single" THEN {"b"} ELSE {"c", "a"}
+RefOf(t)  == CASE t = "b" -> "g" [] t = "c" -> "gc" [] OTHER -> "ga"
+P0Init    == {"c1", "b", "z"}
+P1Init    == IF World = "split" THEN {"a", "c"} ELSE {}
 PState    == {"absent", "ingesting", "live", "dead"}
 PushSt    == {"idle", "begun", "looked", "uploaded",
               "committed", "rejected", "expired", "failed"}
@@ -97,7 +117,8 @@ VARIABLES
   refs,        \* refs table
   moved,       \* refs_version # gc.refs_version (moved since init)
   epoch,       \* meta gc_epoch
-  push,        \* the push: [st, shape, epoch, base, cas]
+  push,        \* the current push: [st, shape, tip, epoch, base, cas]
+  npush,       \* pushes begun so far
   landed,      \* ref -> sha the committed push landed (CommittedPush...)
   fetch,       \* [st, plan]
   phase,       \* gc.phase, "idle" when no chain stands
@@ -115,7 +136,7 @@ VARIABLES
   chains,      \* mark inits so far
   errs         \* Errs after a dead-mark so far
 
-vars == <<packs, rows, bytes, refs, moved, epoch, push, landed, fetch,
+vars == <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
           phase, bar, cohort, marked, built, fr, seen, pending, rounds,
           newPack, retire, walk, chains, errs>>
 
@@ -210,12 +231,21 @@ WipePath ==
 (* push: repo_do/mod.rs                                                *)
 (* ================================================================== *)
 
+Shapes == CASE Scope = "chart"   -> {"thin"}
+          [] World = "single" -> {"thin", "bare"}
+          [] OTHER            -> {"bare"}
+
 (* push_begin: the pushes row records the gc_epoch the push validates
-   against. The shape is the client's choice. *)
+   against. The shape and a bare push's tip are the client's choice. A
+   later push begins only once the one before it has ended. *)
 PushBegin ==
-  /\ push.st = "idle"
-  /\ \E sh \in (IF Scope = "chart" THEN {"thin"} ELSE {"thin", "bare"}) :
-       push' = [push EXCEPT !.st = "begun", !.shape = sh, !.epoch = epoch]
+  /\ push.st \in {"idle", "committed", "rejected", "expired", "failed"}
+  /\ npush < MaxPushes
+  /\ npush' = npush + 1
+  /\ \E sh \in Shapes, t \in BareTips :
+       push' = [st |-> "begun", shape |-> sh,
+                tip |-> IF sh = "thin" THEN "c2" ELSE t,
+                epoch |-> epoch, base |-> {}, cas |-> FALSE]
   /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, landed, fetch,
                  chains, errs>> /\ UNCHANGED gcVars
 
@@ -228,8 +258,8 @@ PushLookup ==
      THEN \E p1 \in Holders("c1"), p2 \in Holders("b") :
             push' = [push EXCEPT !.st = "looked", !.base = {p1, p2}]
      ELSE push' = [push EXCEPT !.st = "failed"]
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, landed, fetch,
-                 chains, errs>> /\ UNCHANGED gcVars
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, npush, landed,
+                 fetch, chains, errs>> /\ UNCHANGED gcVars
 
 (* ingest pass B plus push_index: the base reads complete, Q's bytes are
    durable in R2, its rows are posted and Q is 'ingesting'. push_index
@@ -240,7 +270,7 @@ PushUpload ==
   /\ packs' = [packs EXCEPT !["Q"] = "ingesting"]
   /\ rows' = [rows EXCEPT !["Q"] = {"c2"}]
   /\ bytes' = [bytes EXCEPT !["Q"] = TRUE]
-  /\ UNCHANGED <<refs, moved, epoch, landed, fetch, chains, errs>>
+  /\ UNCHANGED <<refs, moved, epoch, npush, landed, fetch, chains, errs>>
   /\ UNCHANGED gcVars
 
 (* commit_push: ONE synchronous span. Step 1 open check, step 2 gc_epoch
@@ -253,17 +283,19 @@ PushCommit ==
   /\ IF push.epoch # epoch /\ Bug # "noEpochCheck"
      THEN \* step 2: "gc ran during push, retry"
           /\ push' = [push EXCEPT !.st = "rejected"]
-          /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, landed,
-                         fetch, chains, errs>> /\ UNCHANGED gcVars
+          /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, npush,
+                         landed, fetch, chains, errs>> /\ UNCHANGED gcVars
      ELSE
        LET b       == BarrierActive
            thin    == push.shape = "thin"
            pend    == b /\ thin /\ Bug # "noBarrierPending"
            pk1     == IF thin THEN [packs EXCEPT !["Q"] = "live"] ELSE packs
-           tip     == IF thin THEN "c2" ELSE "b"
-           ref     == IF thin THEN "main" ELSE "g"
+           tip     == push.tip
+           ref     == IF thin THEN "main" ELSE RefOf(tip)
            tipLive == \E p \in Packs : pk1[p] = "live" /\ tip \in rows[p]
-       IN \E cas \in (IF thin THEN {TRUE, FALSE} ELSE {TRUE}) :
+       \* a thin push updates main and may lose the CAS to another
+       \* writer; a bare push creates its ref, which lands iff it is absent
+       IN \E cas \in (IF thin THEN {TRUE, FALSE} ELSE {refs[ref] = None}) :
           LET lands == tipLive /\ cas
               feed  == b /\ lands /\ Bug # "noLandingFeed"
           IN /\ packs' = pk1
@@ -274,7 +306,7 @@ PushCommit ==
                           ELSE landed
              /\ moved' = (phase # "idle" /\ (moved \/ pend \/ lands \/ thin))
              /\ push' = [push EXCEPT !.st = "committed", !.cas = cas]
-             /\ UNCHANGED <<rows, bytes, epoch, fetch, chains, errs,
+             /\ UNCHANGED <<rows, bytes, epoch, npush, fetch, chains, errs,
                             phase, bar, cohort, marked, built, seen, rounds,
                             newPack, retire, walk>>
 
@@ -295,14 +327,14 @@ FetchPlan ==
                 /\ fetch' = [st |-> "planned",
                              plan |-> {pick[o] : o \in want}]
          ELSE fetch' = [st |-> "error", plan |-> {}]
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, landed,
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
                  chains, errs>> /\ UNCHANGED gcVars
 
 (* pack_chunk: the planned range reads, after the await *)
 FetchRead ==
   /\ fetch.st = "planned"
   /\ fetch' = [st |-> "done", plan |-> {}]
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, landed,
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed,
                  chains, errs>> /\ UNCHANGED gcVars
 
 (* ================================================================== *)
@@ -313,15 +345,15 @@ FetchRead ==
 JanitorExpire ==
   /\ push.st \in Open /\ Scope = "full"
   /\ push' = [push EXCEPT !.st = "expired", !.base = {}]
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, landed, fetch,
-                 chains, errs>> /\ UNCHANGED gcVars
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, npush, landed,
+                 fetch, chains, errs>> /\ UNCHANGED gcVars
 
 (* the ingesting pack of an expired or rejected push: rows, then dead *)
 JanitorReap ==
   /\ packs["Q"] = "ingesting" /\ push.st \in {"expired", "rejected"}
   /\ packs' = [packs EXCEPT !["Q"] = "dead"]
   /\ rows' = [rows EXCEPT !["Q"] = {}]
-  /\ UNCHANGED <<bytes, refs, moved, epoch, push, landed, fetch,
+  /\ UNCHANGED <<bytes, refs, moved, epoch, push, npush, landed, fetch,
                  chains, errs>> /\ UNCHANGED gcVars
 
 (* a dead pack with no object rows, past GRACE: delete its R2 key.
@@ -330,7 +362,7 @@ JanitorDelete(p) ==
   /\ packs[p] = "dead" /\ rows[p] = {} /\ bytes[p]
   /\ (~Held(p) \/ Bug = "janitorNoGrace")
   /\ bytes' = [bytes EXCEPT ![p] = FALSE]
-  /\ UNCHANGED <<packs, rows, refs, moved, epoch, push, landed, fetch,
+  /\ UNCHANGED <<packs, rows, refs, moved, epoch, push, npush, landed, fetch,
                  chains, errs>> /\ UNCHANGED gcVars
 
 (* ================================================================== *)
@@ -357,7 +389,7 @@ GcMarkInit ==
               /\ seen' = {} /\ pending' = {} /\ rounds' = 0
               /\ newPack' = None /\ retire' = {} /\ walk' = NoWalk
               /\ moved' = FALSE
-  /\ UNCHANGED <<packs, rows, bytes, refs, epoch, push, landed, fetch, errs>>
+  /\ UNCHANGED <<packs, rows, bytes, refs, epoch, push, npush, landed, fetch, errs>>
 
 (* a mark slice, or a barrier sweep slice past retire_resume (which runs
    first on every sweep slice entry and ends the chain when an intent
@@ -380,7 +412,7 @@ GcPop ==
             walk' = [sha |-> o, gen |-> IF bar THEN fr[o] ELSE 0, pk |-> pk]
        /\ rounds' = IF bar /\ fr[o] = 1 THEN Min(rounds + 1, DeltaCap)
                     ELSE rounds
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, landed, fetch,
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  phase, bar, cohort, marked, built, fr, seen, pending,
                  newPack, retire, chains, errs>>
 
@@ -400,7 +432,7 @@ GcCommit ==
          /\ seen' = sn
          /\ fr' = IF drop THEN [f1 EXCEPT ![o] = NoGen] ELSE f1
          /\ walk' = NoWalk
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, landed, fetch,
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  phase, bar, cohort, built, pending, rounds, newPack, retire,
                  chains, errs>>
 
@@ -414,7 +446,7 @@ GcPage ==
                   ELSE Feed(fr, UNION {rows[p] : p \in lp}, 1, seen)
          /\ pending' = {}
   /\ rounds' = Min(rounds + 1, DeltaCap)
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, landed, fetch,
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  phase, bar, cohort, marked, built, seen, newPack, retire,
                  walk, chains, errs>>
 
@@ -426,7 +458,7 @@ GcHandoff ==
   /\ \/ FrontierEmpty /\ pending = {}
      \/ rounds >= DeltaCap /\ moved
   /\ phase' = "build"
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, landed, fetch,
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  bar, cohort, marked, built, fr, seen, pending, rounds,
                  newPack, retire, walk, chains, errs>>
 
@@ -434,7 +466,7 @@ GcHandoff ==
 GcHandoffLegacy ==
   /\ phase = "walking" /\ ~bar /\ Idle /\ ~moved /\ FrontierEmpty
   /\ phase' = "build" /\ seen' = {}
-  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, landed, fetch,
+  /\ UNCHANGED <<packs, rows, bytes, refs, moved, epoch, push, npush, landed, fetch,
                  bar, cohort, marked, built, fr, pending, rounds, newPack,
                  retire, walk, chains, errs>>
 
@@ -445,7 +477,7 @@ GcHandoffLegacy ==
 GcAbortLegacy ==
   /\ phase \in {"walking", "build", "sweep"} /\ ~bar /\ Idle /\ moved
   /\ WipeAll
-  /\ UNCHANGED <<bytes, refs, epoch, push, landed, fetch, chains, errs>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs>>
 
 (* compact.rs orphaned + orphan_abort, reached from gc_mark's M4 arm: a
    barrier chain at build/sweep whose owner row died (any Err that
@@ -453,7 +485,7 @@ GcAbortLegacy ==
 GcOrphanAbort ==
   /\ phase \in {"build", "sweep"} /\ bar /\ Idle /\ Scope = "full"
   /\ WipeAll
-  /\ UNCHANGED <<bytes, refs, epoch, push, landed, fetch, chains, errs>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs>>
 
 (* ================================================================== *)
 (* GC build: gc_consolidate                                            *)
@@ -482,7 +514,7 @@ GcBeginBuild ==
           /\ built' = IF bar THEN marked ELSE built
           /\ UNCHANGED <<rows, phase, bar, cohort, marked, fr, seen,
                          pending, rounds, retire, walk, moved>>
-  /\ UNCHANGED <<bytes, refs, epoch, push, landed, fetch, chains, errs>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs>>
 
 (* build's last flush: the multipart upload completes (finish_pack, or
    mpu_err's HEAD hit), the copied rows are posted, then finish_build:
@@ -494,7 +526,7 @@ GcBuildFinish ==
   /\ rows' = [rows EXCEPT ![newPack] = IF bar THEN built ELSE marked]
   /\ bytes' = [bytes EXCEPT ![newPack] = TRUE]
   /\ phase' = "sweep"
-  /\ UNCHANGED <<refs, moved, epoch, push, landed, fetch, bar, cohort,
+  /\ UNCHANGED <<refs, moved, epoch, push, npush, landed, fetch, bar, cohort,
                  marked, built, fr, seen, pending, rounds, newPack, retire,
                  walk, chains, errs>>
 
@@ -508,7 +540,7 @@ GcRebuild ==
   /\ packs' = [packs EXCEPT ![newPack] = "dead", ![Fresh] = "ingesting"]
   /\ rows' = [rows EXCEPT ![newPack] = {}]
   /\ newPack' = Fresh
-  /\ UNCHANGED <<bytes, refs, moved, epoch, push, landed, fetch, phase, bar,
+  /\ UNCHANGED <<bytes, refs, moved, epoch, push, npush, landed, fetch, phase, bar,
                  cohort, marked, built, fr, seen, pending, rounds, retire,
                  walk, chains, errs>>
 
@@ -524,7 +556,7 @@ GcRebuild ==
 GcSweepLegacy ==
   /\ phase = "sweep" /\ ~bar /\ Idle
   /\ IF moved /\ Bug # "sweepIgnoresRefsVersion"
-     THEN WipeAll /\ UNCHANGED <<bytes, refs, epoch, push, landed, fetch,
+     THEN WipeAll /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch,
                                  chains, errs>>
      ELSE LET pk1 == [p \in Packs |-> IF p \in cohort THEN "dead"
                                       ELSE packs[p]]
@@ -538,7 +570,7 @@ GcSweepLegacy ==
                     /\ UNCHANGED <<rows, phase, bar, cohort, marked, built,
                                    fr, seen, pending, rounds, newPack,
                                    retire, walk, moved>>
-              /\ UNCHANGED <<bytes, refs, push, landed, fetch, chains>>
+              /\ UNCHANGED <<bytes, refs, push, npush, landed, fetch, chains>>
 
 (* barrier gc_sweep: swap_check finds frontier and gc_pending empty and
    runs fenced_swap -> retire_span -> retire_finish -> end_of_chain in the
@@ -550,14 +582,14 @@ GcSwap ==
   /\ phase = "sweep" /\ bar /\ Idle /\ retire = {}
   /\ FrontierEmpty /\ {p \in pending : Live(p)} = {}
   /\ IF ~CohortLive \/ (newPack # None /\ ~Live(newPack))
-     THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, landed, fetch,
+     THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch,
                                   chains, errs>>
      ELSE
        LET ids   == {p \in cohort : marked \cap rows[p] \subseteq built}
            lossy == \E p \in ids : ~(rows[p] \subseteq built)
            pk1   == [p \in Packs |-> IF p \in ids THEN "dead" ELSE packs[p]]
        IN  IF ids = {}
-           THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, landed,
+           THEN WipePath /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed,
                                         fetch, chains, errs>>
            ELSE /\ epoch' = IF lossy THEN epoch + 1 ELSE epoch
                 /\ packs' = pk1
@@ -571,7 +603,7 @@ GcSwap ==
                       /\ UNCHANGED <<rows, phase, bar, cohort, marked,
                                      built, fr, seen, rounds, newPack,
                                      walk, moved>>
-                /\ UNCHANGED <<bytes, refs, push, landed, fetch, chains>>
+                /\ UNCHANGED <<bytes, refs, push, npush, landed, fetch, chains>>
 
 (* swap_check on a non-empty drain once tries or drain slices run out:
    fallback_span. P is retirable iff every entry with no live copy outside
@@ -591,7 +623,7 @@ GcFallback ==
                  /\ rows' = [p \in Packs |-> IF p \in ids THEN {}
                                              ELSE rows[p]]
                  /\ ClearGc
-  /\ UNCHANGED <<bytes, refs, epoch, push, landed, fetch, chains, errs>>
+  /\ UNCHANGED <<bytes, refs, epoch, push, npush, landed, fetch, chains, errs>>
 
 (* retire_resume on the next sweep slice: the recorded ids are all dead
    (L == 0), so retire_finish re-runs steps 8-11 *)
@@ -600,7 +632,7 @@ GcRetireResume ==
   /\ \A p \in retire : ~Live(p)
   /\ rows' = [p \in Packs |-> IF p \in retire THEN {} ELSE rows[p]]
   /\ ClearGc
-  /\ UNCHANGED <<packs, bytes, refs, epoch, push, landed, fetch, chains, errs>>
+  /\ UNCHANGED <<packs, bytes, refs, epoch, push, npush, landed, fetch, chains, errs>>
 
 (* ================================================================== *)
 (* spec                                                                *)
@@ -608,12 +640,15 @@ GcRetireResume ==
 
 Init ==
   /\ packs = [p \in Packs |-> IF p \in OldPacks THEN "live" ELSE "absent"]
-  /\ rows = [p \in Packs |-> IF p = "P0" THEN {"c1", "b", "z"} ELSE {}]
+  /\ rows = [p \in Packs |-> CASE p = "P0" -> P0Init
+                             [] p = "P1" -> P1Init
+                             [] OTHER    -> {}]
   /\ bytes = [p \in Packs |-> p \in OldPacks]
   /\ refs = [r \in RefNames |-> IF r = "main" THEN "c1" ELSE None]
   /\ moved = FALSE /\ epoch = 0
-  /\ push = [st |-> "idle", shape |-> None, epoch |-> 0, base |-> {},
-             cas |-> FALSE]
+  /\ push = [st |-> "idle", shape |-> None, tip |-> None, epoch |-> 0,
+             base |-> {}, cas |-> FALSE]
+  /\ npush = 0
   /\ landed = [r \in RefNames |-> None]
   /\ fetch = [st |-> "idle", plan |-> {}]
   /\ phase = "idle" /\ bar = FALSE /\ cohort = {} /\ marked = {}
@@ -629,6 +664,7 @@ JanitorWork ==
 (* every actor finished: lets TLC tell a real deadlock from the end *)
 Quiesced ==
   /\ push.st \in {"committed", "rejected", "expired", "failed"}
+  /\ npush = MaxPushes
   /\ (fetch.st \in {"done", "error"} \/ Scope = "chart")
   /\ phase = "idle" /\ chains = MaxChains
   /\ ~JanitorWork
@@ -659,6 +695,7 @@ TypeOK ==
   /\ refs \in [RefNames -> Objs \cup {None}]
   /\ moved \in BOOLEAN /\ epoch \in 0..4
   /\ push.st \in PushSt /\ push.shape \in {None, "thin", "bare"}
+  /\ push.tip \in Objs \cup {None} /\ npush \in 0..MaxPushes
   /\ push.epoch \in 0..4 /\ push.base \subseteq Packs
   /\ push.cas \in BOOLEAN
   /\ landed \in [RefNames -> Objs \cup {None}]
@@ -684,11 +721,10 @@ LiveBytesPresent ==
 
 (* CommittedPushResolvable: a ref the server reported as landed by a
    committed push resolves completely for as long as it still points
-   there. *)
+   there. (landed is written only by a committing push.) *)
 CommittedPushResolvable ==
-  push.st = "committed" =>
-    \A r \in RefNames :
-      (landed[r] # None /\ refs[r] = landed[r]) => ClosureOk(landed[r])
+  \A r \in RefNames :
+    (landed[r] # None /\ refs[r] = landed[r]) => ClosureOk(landed[r])
 
 (* YoungPacksClosed: every object in a live pack written during the run
    (a pushed pack, a loser's pack, a build pack) resolves completely. GC
@@ -697,6 +733,14 @@ CommittedPushResolvable ==
    the U-subset-of-P oracle of testhooks mark_check. *)
 YoungPacksClosed ==
   \A p \in Packs \ OldPacks : Live(p) => \A o \in rows[p] : ClosureOk(o)
+
+(* LiveClosed: CONTRACTS.md 2.5, the connectivity rule. Every object in a
+   live pack links only to objects that resolve: a live row with R2
+   bytes. Ingest and apply_one check only that a link target or a tip is
+   live, and rely on this rule for everything behind it. *)
+LiveClosed ==
+  \A p \in Packs : Live(p) =>
+    \A o \in rows[p] : \A x \in Links[o] : Resolves(x)
 
 (* FetchReadsSucceed: every pack an in-flight fetch planned to read still
    has its R2 bytes (GRACE > request lifetime). *)

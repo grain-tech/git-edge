@@ -44,4 +44,11 @@ Reach_FetchOutlivesPack ==
 Reach_DeltaHandoff ==
   ~(phase = "build" /\ ~FrontierEmpty)
 
+(* split world, the partial-retirement schedule: a ref landed at c during
+   the chain, the drain marked c in P1 after the built snapshot, and the
+   swap kept P1 but retired P0 *)
+Reach_PartialRetire ==
+  ~(refs["gc"] = "c" /\ packs["P0"] = "dead" /\ packs["P1"] = "live"
+    /\ phase = "idle")
+
 =============================================================================

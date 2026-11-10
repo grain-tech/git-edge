@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Runs TLC on GcBarrier: both clean configs (barrier and legacy) must check
-# clean, every vacuity guard in GcBarrierReach must be reachable, the
-# statechart config must check clean, and each Bug variant must violate its
-# named invariant. Caches the JRE and tla2tools.jar under
+# Runs TLC on GcBarrier: every clean config must check clean, every vacuity
+# guard in GcBarrierReach must be reachable, the statechart config must
+# check clean, each Bug variant must violate its named invariant, and each
+# known finding must still violate its named invariant. Caches the JRE and tla2tools.jar under
 # ${GE_TLA_CACHE:-$HOME/.cache/git-edge-tla}; TLC state goes to a temp dir.
 set -euo pipefail
 
@@ -94,30 +94,48 @@ run_case() { # cfg invariant: TLC exits 12 (safety violation) on that invariant
   printf 'ok  %-44s violated %s, %s distinct states\n' "$1" "$got" "$(distinct_states "$OUT")"
 }
 
-run_reach() { # barrier guard: the clean model reaches the guarded state
-  local cfg="$META/reach-$1-$2.cfg"
-  printf 'SPECIFICATION Spec\nCONSTANTS\n  Barrier = %s\n  Bug = "none"\n  MaxChains = 2\n  DeltaCap = 1\n  MaxErrs = 1\n  Scope = "full"\nINVARIANT\n  %s\n' \
-    "$1" "$2" >"$cfg"
+run_reach() { # barrier world pushes guard: the clean model reaches the guarded state
+  local cfg="$META/reach-$1-$2-$4.cfg"
+  printf 'SPECIFICATION Spec\nCONSTANTS\n  Barrier = %s\n  Bug = "none"\n  MaxChains = 2\n  DeltaCap = 1\n  MaxErrs = 1\n  Scope = "full"\n  World = "%s"\n  MaxPushes = %s\nINVARIANT\n  %s\n' \
+    "$1" "$2" "$3" "$4" >"$cfg"
   run_tlc GcBarrierReach.tla "$cfg"
   local got mode
   got="$(violated_invariant "$OUT")"
   mode="$([ "$1" = TRUE ] && echo barrier || echo legacy)"
-  [ "$RC" -eq 12 ] && [ "$got" = "$2" ] \
-    || { grep -E '^Error' "$OUT" >&2 || true; fail "$2 ($mode): guarded state unreachable (exit $RC) -- the clean run is vacuous"; }
-  printf 'ok  %-44s reached\n' "reach $mode $2"
+  [ "$2" = single ] || mode="$mode $2"
+  [ "$RC" -eq 12 ] && [ "$got" = "$4" ] \
+    || { grep -E '^Error' "$OUT" >&2 || true; fail "$4 ($mode): guarded state unreachable (exit $RC) -- the clean run is vacuous"; }
+  printf 'ok  %-44s reached\n' "reach $mode $4"
+}
+
+run_finding() { # cfg invariant: a known finding in the real design. TLC
+  # must still exit 12 on that invariant. If it stops doing so, the code or
+  # the model changed: re-read the finding in the skill before flipping
+  # the case to a clean check.
+  run_tlc GcBarrier.tla "$1"
+  local got
+  got="$(violated_invariant "$OUT")"
+  if [ "$RC" -eq 12 ] && [ "$got" = "$2" ]; then
+    printf 'FINDING %-40s violated %s, %s distinct states\n' "$1" "$got" "$(distinct_states "$OUT")"
+    return
+  fi
+  grep -E '^Error' "$OUT" >&2 || true
+  fail "$1: the known finding no longer reproduces (expected $2 violated, got '${got:-none}', exit $RC). If server/ was fixed, confirm the fix against the Findings section of .devin/skills/verify-gc-barrier/SKILL.md, then turn this case into a clean check"
 }
 
 run_clean GcBarrier_barrier.cfg
 run_clean GcBarrier_legacy.cfg
+run_clean GcBarrier_split_legacy.cfg
 run_clean statechart/ThinPushRace.cfg
 
 for g in Reach_LandThenRetire Reach_LoserThenRetire Reach_BareLandsMidChain \
          Reach_ErrThenSurvivor Reach_EpochReject Reach_FetchOutlivesPack; do
-  run_reach TRUE "$g"
-  run_reach FALSE "$g"
+  run_reach TRUE single 1 "$g"
+  run_reach FALSE single 1 "$g"
 done
-run_reach TRUE Reach_DrainMarksNew
-run_reach TRUE Reach_DeltaHandoff
+run_reach TRUE single 1 Reach_DrainMarksNew
+run_reach TRUE single 1 Reach_DeltaHandoff
+run_reach TRUE split 2 Reach_PartialRetire
 
 run_case GcBarrier_bug_noBarrierPending.cfg        YoungPacksClosed
 run_case GcBarrier_bug_noLandingFeed.cfg           RefsResolvable
@@ -126,4 +144,7 @@ run_case GcBarrier_bug_sweepIgnoresRefsVersion.cfg RefsResolvable
 run_case GcBarrier_bug_abortDropsSurvivor.cfg      RefsResolvable
 run_case GcBarrier_bug_janitorNoGrace.cfg          FetchReadsSucceed
 
-echo "verify: all checks passed"
+run_finding GcBarrier_finding_split.cfg      LiveClosed
+run_finding GcBarrier_finding_split_refs.cfg RefsResolvable
+
+echo "verify: all checks passed, with 2 known findings"
