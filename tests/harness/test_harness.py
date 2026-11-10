@@ -437,6 +437,36 @@ class HarnessTests(unittest.TestCase):
         ge.git("fsck", "--strict", cwd=clone)
 
 
+
+    def test_l_fresh_knob_error_leaves_job_queued(self):
+        """A SliceBudget::fresh failure (hooks on, knob read error) must
+        leave the job queued, never running — the budget is built before
+        the claim."""
+        r = repo("fresh-fail")
+        before = ge.enqueue(r.name, "janitor")
+        queued = [j for j in before["jobs"] if j["state"] == "queued"]
+        self.assertTrue(queued, "no queued job to step: %r" % before["jobs"])
+        ge.failpoint(r.name, "knob.read", "error", 1)
+        st, body = ge.http("POST", "/%s/_admin/test/step" % r.name,
+                           {"kind": "janitor"})
+        self.assertEqual(st, 500, "step should fail on a knob read error: %s"
+                         % ge.redact(body[:400].decode("utf-8", "replace")))
+        after = ge.jobs(r.name)
+        running = [j for j in after["jobs"] if j["state"] == "running"]
+        self.assertEqual(running, [],
+                         "fresh() failure left a job running: %r" % running)
+        after_by_id = {j["id"]: j for j in after["jobs"]}
+        for j in queued:
+            a = after_by_id.get(j["id"])
+            self.assertIsNotNone(a, "queued job %s vanished" % j["id"])
+            self.assertEqual(a["state"], "queued",
+                             "job %s was touched: %r" % (j["id"], a))
+            self.assertEqual(a["attempts"], j["attempts"],
+                             "job %s attempts changed: %r" % (j["id"], a))
+            self.assertEqual(a["strands"], j["strands"],
+                             "job %s strands changed: %r" % (j["id"], a))
+
+
 class AdmissionTests(unittest.TestCase):
     """PR3 (G2b): the live-pack admission cap.
 

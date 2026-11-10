@@ -483,6 +483,9 @@ pub(crate) fn knob(d: &RepoDo, name: &str) -> Result<Option<i64>, Error> {
     struct R {
         value: i64,
     }
+    // hooks-on only: an armed knob.read makes this read fail so a test can
+    // prove SliceBudget::fresh errors before a job is claimed.
+    failpoint(d, "knob.read")?;
     // to_array, never one() — a zero-row cursor makes workers-rs throw a
     // "Critical error" that kills the isolate outright
     d.q(KNOBS_DDL, vec![])?;
