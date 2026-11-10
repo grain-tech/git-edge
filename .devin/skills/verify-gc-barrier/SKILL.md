@@ -238,7 +238,14 @@ Not covered:
 - The split world adds old pack P1 with `a` and `c`. Object `a` links to `b`. Two bare pushes run one after the other. Each one creates ref `gc` at `c` or ref `ga` at `a`. A second push begins only after the first one ends.
 - No sha has rows in two candidate packs, so the model keeps marks as a set of shas.
 - One fetch of `main`. Up to two mark inits. At most one Err after a dead-mark. At most one rebuild a run, because one build id always stays free for a later chain.
-- The model has no clock. GRACE is longer than a request, so the janitor keeps a dead pack's bytes while an in-flight request planned to read that pack. A planned pack was live at plan time, so it died after the request started. The `janitorNoGrace` variant drops this hold.
+- The model has no clock. In place of GRACE, the janitor keeps a dead pack's bytes while an in-flight request names that pack. The `janitorNoGrace` variant drops this hold. The hold rests on these facts at the sync commit:
+  - `jobs/janitor.rs` sets `GRACE_MS` and `PUSH_TIMEOUT_MS` both to `3_600_000`, which is one hour.
+  - `run_slice` deletes the R2 key of a dead pack only when `dead_at < now - GRACE_MS` and the pack has no `objects` rows.
+  - Every pack a request reads comes from a lookup that ran after the request began. `store` `lookup`, which `send_set`, `load` and `push_lookup` use, returns rows of live packs only. So the `dead_at` of that pack is not earlier than the start of the request.
+  - `store` `entries_of`, which `plan_reads` calls, does not filter on live packs. A plan can therefore name a pack that is already dead but still has rows. That pack came from a live lookup of the walk, so the fact above still holds. `FetchPlan` keeps such a pack, and `Reach_PlanNamesDead` reaches that case.
+  - A push. The janitor deletes the bytes of a base pack only after that pack was dead for GRACE. The pack died after the push began, so the push began more than `PUSH_TIMEOUT_MS` ago. Step 1 of the same janitor slice expires that push before step 3 deletes keys, at most 400 pushes a slice. GRACE equal to PUSH_TIMEOUT is the smallest value that keeps this fact true.
+  - A fetch has no timeout. The hold assumes that a fetch ends less than GRACE after its last lookup. A fetch that runs longer can fail halfway.
+  - `FetchReadsSucceed` and `PushBaseReadsSucceed` are about reads in flight. A read that finds no bytes fails that request. That failure loses no stored data, because ingest writes resolved objects into the new pack, and readers resolve through SQLite rows.
 - Candidates are the old packs. Every pack created during the run is young and never a candidate.
 - The push timeout is a free janitor expiry of an open push. The swap tries and drain slice bounds are a free fallback trigger at any non-empty swap check. The net-positive byte rule in `fallback_span` is a free choice.
 - `refs_version` is a flag that says the version moved since this chain's init. Every read of `refs_version` in the code compares it with the init capture.
