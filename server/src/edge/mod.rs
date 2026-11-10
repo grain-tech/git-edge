@@ -92,16 +92,6 @@ where
     Ok(body)
 }
 
-/// One stream chunk as its own Vec — the copy `BodyReader`'s stream
-/// performs per item. The reservation is fallible BEFORE the copy, so a
-/// refused allocation is the in-band retry Limit and the chunk is never
-/// copied.
-fn chunk_vec<C: BodyChunk>(c: &C) -> Result<Vec<u8>, Error> {
-    let mut v = crate::try_grow::zeroed(c.len())?;
-    c.copy_into(&mut v);
-    Ok(v)
-}
-
 /// One item off a request-body ReadableStream as a Uint8Array — the
 /// acceptance rule `request_body_bytes` and the R2 reader share: bytes
 /// arrive as a Uint8Array or an ArrayBuffer; anything else is a Storage
@@ -116,15 +106,20 @@ fn body_chunk(item: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>) -> Res
     })
 }
 
-/// One stream item as the chunk Vec `BodyReader` buffers.
-fn body_vec(item: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>) -> Result<Vec<u8>, Error> {
-    chunk_vec(&body_chunk(item)?)
+/// One stream item as the boxed raw chunk `BodyReader` keeps pending —
+/// the JS bytes stay a view until `fill` copies the allowed prefix, so
+/// an over-cap chunk is refused before it is ever materialized in Rust.
+fn body_chunk_boxed(item: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>) -> Result<Box<dyn BodyChunk>, Error> {
+    Ok(Box::new(body_chunk(item)?))
 }
 
 /// The request body as a chunked byte stream (section 6). gzip is decoded through a
 /// `DecompressionStream` when `Content-Encoding: gzip` is set; other encodings are rejected.
 pub struct BodyReader {
-    stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Error>>>>,
+    stream: Pin<Box<dyn Stream<Item = Result<Box<dyn BodyChunk>, Error>>>>,
+    /// The raw chunk `fill` is partway through, with the bytes already
+    /// copied into `buf` — the rest stays pending until consumed.
+    pending: Option<(Box<dyn BodyChunk>, usize)>,
     buf: Vec<u8>,
     eof: bool,
     pub total: u64,
@@ -152,7 +147,7 @@ impl BodyReader {
             let ds = web_sys::DecompressionStream::new(web_sys::CompressionFormat::Gzip)
                 .map_err(|e| Error::Internal(format!("DecompressionStream: {e:?}")))?;
             let body = raw.pipe_through(wasm_bindgen::JsCast::unchecked_ref::<web_sys::ReadableWritablePair>(&ds));
-            let stream = wasm_streams::ReadableStream::from_raw(body).into_stream().map(body_vec);
+            let stream = wasm_streams::ReadableStream::from_raw(body).into_stream().map(body_chunk_boxed);
             return Ok(Self::wrap(stream));
         }
         let declared_len = req
@@ -165,35 +160,88 @@ impl BodyReader {
             .inner()
             .body()
             .ok_or_else(|| Error::Protocol("no body for request".into()))?;
-        let stream = wasm_streams::ReadableStream::from_raw(raw).into_stream().map(body_vec);
+        let stream = wasm_streams::ReadableStream::from_raw(raw).into_stream().map(body_chunk_boxed);
         let mut r = Self::wrap(stream);
         r.declared_len = declared_len;
         Ok(r)
     }
     /// Test-only: a reader over in-memory chunks, so pass A runs natively.
     #[cfg(test)]
-    pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>, declared_len: Option<u64>) -> Self {
-        let mut r = Self::wrap(futures_util::stream::iter(chunks.into_iter().map(Ok)));
+    pub(crate) fn from_chunks<C: BodyChunk + 'static>(chunks: Vec<C>, declared_len: Option<u64>) -> Self {
+        Self::from_stream(futures_util::stream::iter(chunks.into_iter().map(Ok)), declared_len)
+    }
+    /// Test-only: a reader over an arbitrary chunk stream (counting fakes).
+    #[cfg(test)]
+    pub(crate) fn from_stream<C, S>(stream: S, declared_len: Option<u64>) -> Self
+    where
+        C: BodyChunk + 'static,
+        S: Stream<Item = Result<C, Error>> + 'static,
+    {
+        let mut r = Self::wrap(stream.map(|item| item.map(|c| Box::new(c) as Box<dyn BodyChunk>)));
         r.declared_len = declared_len;
         r
     }
     fn wrap<S>(stream: S) -> Self
     where
-        S: Stream<Item = Result<Vec<u8>, Error>> + 'static,
+        S: Stream<Item = Result<Box<dyn BodyChunk>, Error>> + 'static,
     {
-        Self { stream: Box::pin(stream), buf: Vec::new(), eof: false, total: 0, declared_len: None }
+        Self { stream: Box::pin(stream), pending: None, buf: Vec::new(), eof: false, total: 0, declared_len: None }
     }
     /// Read until buf.len() >= min or EOF. Ok(false) means EOF before min.
+    /// Pending chunks are consumed whole while `buf` is short — the pack
+    /// and LFS paths want the bytes regardless.
     pub async fn fill(&mut self, min: usize) -> Result<bool, Error> {
-        while self.buf.len() < min && !self.eof {
-            match self.stream.next().await {
-                Some(Ok(chunk)) => {
-                    self.total = self.total.saturating_add(chunk.len() as u64);
-                    crate::try_grow::vec(&mut self.buf, chunk.len())?;
-                    self.buf.extend_from_slice(&chunk);
+        self.fill_inner(min, usize::MAX, None).await
+    }
+    /// Bounded fill: `buf` never exceeds `max` — a pending raw chunk is
+    /// consumed piecewise and the rest stays pending on the reader. For
+    /// the receive header, whose window stays small while the pack tail
+    /// in the same chunk may be huge.
+    pub async fn fill_bounded(&mut self, min: usize, max: usize) -> Result<bool, Error> {
+        self.fill_inner(min, max, None).await
+    }
+    /// Capped fill: a raw chunk whose arrival would take the pulled total
+    /// over `cap` is refused BEFORE it is reserved or copied — `too_big`
+    /// is the path's over-cap error. For command bodies under a hard cap.
+    pub async fn fill_total(&mut self, min: usize, cap: usize, too_big: &'static str) -> Result<bool, Error> {
+        self.fill_inner(min, usize::MAX, Some((cap, too_big))).await
+    }
+    async fn fill_inner(&mut self, min: usize, max: usize, cap: Option<(usize, &'static str)>) -> Result<bool, Error> {
+        use futures_util::StreamExt as _;
+        while self.buf.len() < min && self.buf.len() < max && !self.eof {
+            if self.pending.is_none() {
+                match self.stream.next().await {
+                    Some(Ok(c)) => {
+                        if let Some((limit, too_big)) = cap {
+                            if self.total.saturating_add(c.len() as u64) > limit as u64 {
+                                return Err(Error::Limit(too_big.into()));
+                            }
+                        }
+                        self.total = self.total.saturating_add(c.len() as u64);
+                        self.pending = Some((c, 0));
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => self.eof = true,
                 }
-                Some(Err(e)) => return Err(e),
-                None => self.eof = true,
+                continue;
+            }
+            let mut p = self.pending.take().unwrap();
+            let rem = p.0.len() - p.1;
+            if rem == 0 {
+                continue;
+            }
+            let n = rem.min(max.saturating_sub(self.buf.len()));
+            if n == 0 {
+                self.pending = Some(p);
+                break;
+            }
+            crate::try_grow::vec(&mut self.buf, n)?;
+            let start = self.buf.len();
+            self.buf.resize(start + n, 0);
+            p.0.copy_range_into(&mut self.buf[start..], p.1);
+            p.1 += n;
+            if p.1 < p.0.len() {
+                self.pending = Some(p);
             }
         }
         Ok(self.buf.len() >= min)
@@ -222,6 +270,7 @@ impl BodyReader {
         const MAX_DRAIN: u64 = 2 << 30; // the same ceiling a pushed pack gets
         const IDLE_MS: u64 = 15_000; // per-chunk stall bound, not total
         self.buf.clear();
+        self.pending = None;
         while self.total < MAX_DRAIN && !self.eof {
             let next = self.stream.next();
             let timeout = worker::Delay::from(std::time::Duration::from_millis(IDLE_MS));
@@ -509,7 +558,7 @@ async fn state_probe(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend)
 /// upload-pack Limit.
 async fn read_upload_body(reader: &mut BodyReader, cap: usize) -> Result<Vec<u8>, Error> {
     let mut body = Vec::new();
-    while reader.fill(FILL_STEP).await? {
+    while reader.fill_total(FILL_STEP, cap, "upload-pack body > 1 MiB").await? {
         if body.len().saturating_add(reader.buffered().len()) > cap {
             return Err(Error::Limit("upload-pack body > 1 MiB".into()));
         }
@@ -1274,7 +1323,7 @@ async fn receive_header(body: &mut BodyReader) -> Result<(wire::ReceiveHeader, V
         match wire::parse_receive_header(&mut fresh)? {
             Some(h) => return Ok((h, fresh.remainder())),
             None => {
-                body.fill(FILL_STEP).await?;
+                body.fill_bounded(FILL_STEP, FILL_STEP).await?;
                 if body.buffered().is_empty() {
                     return Err(Error::Protocol("truncated receive header".into()));
                 }
@@ -1622,6 +1671,10 @@ mod tests {
             self.1.set(self.1.get() + 1);
             dst.copy_from_slice(&self.0);
         }
+        fn copy_range_into(&self, dst: &mut [u8], skip: usize) {
+            self.1.set(self.1.get() + 1);
+            dst.copy_from_slice(&self.0[skip..skip + dst.len()]);
+        }
     }
 
     /// A body stream that counts its polls.
@@ -1724,39 +1777,6 @@ mod tests {
         assert!(crate::try_grow::is_retry(&err), "{err}");
         assert_eq!(copies.get(), 0, "a refused reservation must not copy the chunk");
         assert_eq!(polls.get(), 1);
-    }
-
-    /// chunk_vec copies the chunk exactly once into a fresh Vec.
-    #[test]
-    fn chunk_vec_copies_the_chunk_exactly_once() {
-        let copies = Rc::new(Cell::new(0));
-        let c = Counted(vec![1, 2, 3], copies.clone());
-        assert_eq!(chunk_vec(&c).unwrap(), vec![1, 2, 3]);
-        assert_eq!(copies.get(), 1);
-    }
-
-    /// A refused reservation is the in-band retry Limit and the chunk is
-    /// never copied.
-    #[test]
-    fn chunk_vec_refused_reservation_is_the_retry_limit() {
-        let _guard = crate::try_grow::HookGuard;
-        let copies = Rc::new(Cell::new(0));
-        let c = Counted(vec![7u8; 100], copies.clone());
-        crate::try_grow::fail_above(Some(50));
-        let err = chunk_vec(&c).unwrap_err();
-        assert!(crate::try_grow::is_retry(&err), "{err}");
-        assert_eq!(copies.get(), 0, "a refused reservation must not copy the chunk");
-    }
-
-    /// A zero-length chunk yields an empty Vec without asking the gate.
-    #[test]
-    fn chunk_vec_zero_length_asks_nothing() {
-        let _guard = crate::try_grow::HookGuard;
-        crate::try_grow::log_asks();
-        crate::try_grow::fail_above(Some(0));
-        let c = Counted(Vec::new(), Rc::new(Cell::new(0)));
-        assert!(chunk_vec(&c).unwrap().is_empty());
-        assert!(crate::try_grow::take_asks().is_empty(), "an empty chunk must not reach the gate");
     }
 
     /// The reader's own buffer grows through the same fallible
@@ -1940,19 +1960,22 @@ mod tests {
     }
 
     /// A client can send one oversized request-body stream chunk (reproduced
-    /// at 4 MiB) on a 1 MiB-capped path. `BodyReader::fill` reserves and
-    /// copies that whole chunk BEFORE any cap check — the refused chunk's
-    /// reservation is the retry 503, not the cap error.
+    /// at 4 MiB) on a 1 MiB-capped path. The cap is checked against the raw
+    /// chunk's len() BEFORE any reservation or copy: the chunk is never
+    /// copied and never reaches the try_grow ask log — the refusal is the
+    /// cap error, not the retry 503 a refused reservation would give.
     #[test]
     fn upload_body_rejects_an_oversized_first_chunk_uncopied() {
         let _guard = crate::try_grow::HookGuard;
+        let copies = Rc::new(Cell::new(0));
+        let mut reader = BodyReader::from_chunks(vec![Counted(vec![0u8; 4 << 20], copies.clone())], None);
         crate::try_grow::log_asks();
-        let mut reader = BodyReader::from_chunks(vec![vec![0u8; 4 << 20]], None);
         let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
         assert!(
             matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
             "{err}"
         );
+        assert_eq!(copies.get(), 0, "the oversized chunk must not be copied");
         let asks = crate::try_grow::take_asks();
         assert!(asks.is_empty(), "the oversized chunk must not be reserved: {asks:?}");
     }
@@ -1961,16 +1984,20 @@ mod tests {
     /// without being reserved or copied — the chunks before it were.
     #[test]
     fn upload_body_rejects_the_chunk_crossing_the_cap() {
-        let _guard = crate::try_grow::HookGuard;
-        crate::try_grow::log_asks();
-        let mut chunks: Vec<Vec<u8>> = (0..15).map(|_| vec![0u8; FILL_STEP]).collect();
-        chunks.push(vec![0u8; 2 * FILL_STEP]);
+        let copies = Rc::new(Cell::new(0));
+        let crossing = Rc::new(Cell::new(0));
+        let mut chunks: Vec<Counted> = (0..15)
+            .map(|_| Counted(vec![0u8; FILL_STEP], copies.clone()))
+            .collect();
+        chunks.push(Counted(vec![0u8; 2 * FILL_STEP], crossing.clone()));
         let mut reader = BodyReader::from_chunks(chunks, None);
         let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
         assert!(
             matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
             "{err}"
         );
+        assert_eq!(crossing.get(), 0, "the crossing chunk must not be copied");
+        assert_eq!(copies.get(), 15, "only the admitted chunks may be copied");
         assert!(
             reader.total <= CMD_CAP as u64,
             "reader.total = {} — the crossing chunk must not be pulled in",
@@ -1979,10 +2006,9 @@ mod tests {
     }
 
     /// A client can put a whole receive header AND a large pack tail in one
-    /// stream chunk. `header_push` requires the entire buffered chunk to fit
-    /// under CMD_CAP before it pushes, so a legal short header sharing a
-    /// chunk with pack data is refused as "receive header > 1 MiB" — and the
-    /// pack bytes after the flush must stay available as leftover.
+    /// stream chunk. Only header bytes may enter the accumulator: the tail
+    /// stays pending on the reader, so a legal short header is not refused
+    /// as "receive header > 1 MiB" and no pack byte is lost after the flush.
     #[test]
     fn receive_header_accepts_a_short_header_with_a_large_pack_tail() {
         let mut w = PktWriter::default();
@@ -1994,7 +2020,8 @@ mod tests {
         let pack_tail = vec![7u8; 4 << 20];
         let mut input = w.out;
         input.extend_from_slice(&pack_tail);
-        let mut reader = BodyReader::from_chunks(vec![input], None);
+        let copies = Rc::new(Cell::new(0));
+        let mut reader = BodyReader::from_chunks(vec![Counted(input, copies.clone())], None);
         let (hdr, leftover) = block_on(receive_header(&mut reader)).unwrap();
         assert_eq!(hdr.commands.len(), 1);
         assert_eq!(hdr.commands[0].name.to_string(), "refs/heads/main");
@@ -2002,6 +2029,11 @@ mod tests {
         assert!(
             pack_tail.starts_with(&leftover),
             "leftover must be a prefix of the pack tail"
+        );
+        assert_eq!(
+            copies.get(),
+            1,
+            "only the header window may be copied — the pack tail stays pending"
         );
         // the pack bytes past the buffered window are still pending on the reader
         let mut rest = leftover.clone();
@@ -2014,5 +2046,21 @@ mod tests {
             }
         }
         assert_eq!(rest, pack_tail, "no pack byte may be lost after the header flush");
+    }
+
+    /// fill_bounded copies at most `max` bytes out of a larger pending
+    /// chunk; the rest stays pending and a later fill still sees it in
+    /// order.
+    #[test]
+    fn body_fill_bounded_leaves_the_chunk_pending() {
+        let copies = Rc::new(Cell::new(0));
+        let data: Vec<u8> = (0u8..200).collect();
+        let mut reader = BodyReader::from_chunks(vec![Counted(data.clone(), copies.clone())], None);
+        assert!(block_on(reader.fill_bounded(64, 100)).unwrap());
+        assert_eq!(reader.buffered(), &data[..100]);
+        assert_eq!(copies.get(), 1);
+        assert!(block_on(reader.fill(150)).unwrap());
+        assert_eq!(reader.buffered(), &data[..]);
+        assert_eq!(copies.get(), 2, "the pending remainder is copied whole by fill");
     }
 }

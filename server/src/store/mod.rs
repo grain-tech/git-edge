@@ -488,6 +488,13 @@ pub(crate) trait BodyChunk {
     fn len(&self) -> usize;
     /// Copy every byte of the chunk into `dst`. `dst.len()` is `len()`.
     fn copy_into(&self, dst: &mut [u8]);
+    /// Copy `dst.len()` bytes starting at `skip` into `dst` —
+    /// `skip + dst.len() <= len()`. The default covers whole-chunk
+    /// copies only; ranged impls override.
+    fn copy_range_into(&self, dst: &mut [u8], skip: usize) {
+        assert!(skip == 0 && dst.len() == self.len(), "copy_range_into needs a ranged impl");
+        self.copy_into(dst);
+    }
 }
 
 impl BodyChunk for js_sys::Uint8Array {
@@ -496,6 +503,9 @@ impl BodyChunk for js_sys::Uint8Array {
     }
     fn copy_into(&self, dst: &mut [u8]) {
         self.copy_to(dst);
+    }
+    fn copy_range_into(&self, dst: &mut [u8], skip: usize) {
+        self.subarray(skip as u32, (skip + dst.len()) as u32).copy_to(dst);
     }
 }
 
@@ -2195,6 +2205,9 @@ mod tests {
         fn copy_into(&self, dst: &mut [u8]) {
             dst.copy_from_slice(self);
         }
+        fn copy_range_into(&self, dst: &mut [u8], skip: usize) {
+            dst.copy_from_slice(&self[skip..skip + dst.len()]);
+        }
     }
     impl BodyChunk for &[u8] {
         fn len(&self) -> usize {
@@ -2202,6 +2215,9 @@ mod tests {
         }
         fn copy_into(&self, dst: &mut [u8]) {
             dst.copy_from_slice(self);
+        }
+        fn copy_range_into(&self, dst: &mut [u8], skip: usize) {
+            dst.copy_from_slice(&self[skip..skip + dst.len()]);
         }
     }
 
