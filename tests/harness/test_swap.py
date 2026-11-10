@@ -641,11 +641,16 @@ class Swap(unittest.TestCase):
     # -- §6.8: flag-off invariance ---------------------------------------------
 
     def test_flag_off_sweep_unchanged(self):
-        """§6.8: no gc_barrier knob — a push before the sweep aborts the
-        chain exactly as before: gc_last_swap absent, gc_epoch unchanged,
-        cohort live, the build pack dead-marked (the unchanged keep rule).
-        PASSES today — it pins the flag-off contract."""
+        """§6.8: barrier off — a push before the sweep aborts the chain
+        exactly as before: gc_last_swap absent, gc_epoch unchanged, cohort
+        live, the build pack dead-marked (the unchanged keep rule). It pins
+        the flag-off contract.
+
+        The knob pins the mode to off. Without it the chain takes the
+        server's GE_GC_BARRIER default, and a server started with
+        GE_GC_BARRIER=1 runs a barrier chain whose swap is correct."""
         r = repo("flag-off")
+        ge.knob(r.name, "gc_barrier", 0)
         th.seed_gc_repo(r)
         cutoff_now(r)
         tb.step_until(r, "gc_mark", {"done"})
