@@ -467,11 +467,17 @@ pub fn jobs_view(d: &RepoDo) -> Result<Response, Error> {
 /// Lazily created by set_knob — deliberately NOT in the production schema list.
 const KNOBS_DDL: &str = "CREATE TABLE IF NOT EXISTS test_knobs(name TEXT PRIMARY KEY, value INTEGER)";
 
-/// Named integer knobs (slice_subreqs, gc_part_bytes, max_live_packs) — read
-/// ONLY when the hooks flag is on; hooks off means no SQL at all (and no lazy table).
-pub(crate) fn knob(d: &RepoDo, name: &str) -> Option<i64> {
+/// Named integer knobs (slice_subreqs, gc_part_bytes, max_live_packs, gc_barrier).
+/// Read ONLY when the hooks flag is on; hooks off means no SQL at all (and
+/// no lazy table).
+///
+/// The table is created here as well as in `set_knob`, so a missing table is
+/// not a query error. No row means the knob is unset and the caller falls
+/// back to its env or default. A DDL or SELECT failure is returned as Err
+/// so it cannot be mistaken for unset — and silently pick a mode.
+pub(crate) fn knob(d: &RepoDo, name: &str) -> Result<Option<i64>, Error> {
     if !enabled(d) {
-        return None;
+        return Ok(None);
     }
     #[derive(serde::Deserialize)]
     struct R {
@@ -479,11 +485,11 @@ pub(crate) fn knob(d: &RepoDo, name: &str) -> Option<i64> {
     }
     // to_array, never one() — a zero-row cursor makes workers-rs throw a
     // "Critical error" that kills the isolate outright
-    d.q("SELECT value FROM test_knobs WHERE name=?", vec![V::from(name)])
-        .ok()
-        .and_then(|c| c.to_array::<R>().ok())
-        .and_then(|rows| rows.into_iter().next())
-        .map(|r| r.value)
+    d.q(KNOBS_DDL, vec![])?;
+    let rows = d
+        .q("SELECT value FROM test_knobs WHERE name=?", vec![V::from(name)])?
+        .to_array::<R>()?;
+    Ok(rows.into_iter().next().map(|r| r.value))
 }
 
 /// POST /_do/test/knob {"name":..,"value":..} — value null deletes the knob.

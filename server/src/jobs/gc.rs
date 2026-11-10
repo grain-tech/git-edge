@@ -211,10 +211,10 @@ pub(crate) fn barrier_active(d: &RepoDo) -> Result<bool, Error> {
 /// The mark-init capture of GE_GC_BARRIER (default off) with the gc_barrier
 /// test knob — read once here, persisted as gc.barrier=1 only when on; every
 /// arm afterwards reads the meta, never the env.
-fn barrier_capture(d: &RepoDo) -> bool {
-    crate::testhooks::knob(d, "gc_barrier")
+fn barrier_capture(d: &RepoDo) -> Result<bool, Error> {
+    Ok(crate::testhooks::knob(d, "gc_barrier")?
         .map(|v| v != 0)
-        .unwrap_or_else(|| d.env_i64("GE_GC_BARRIER", 0) != 0)
+        .unwrap_or_else(|| d.env_i64("GE_GC_BARRIER", 0) != 0))
 }
 
 fn refs_moved(d: &RepoDo) -> Result<bool, Error> {
@@ -259,7 +259,7 @@ fn barrier_handoff_if_ready(
         .meta_opt("gc.delta_rounds")?
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0);
-    let cap = crate::testhooks::knob(d, "mark_delta_rounds").unwrap_or(8);
+    let cap = crate::testhooks::knob(d, "mark_delta_rounds")?.unwrap_or(8);
     let both_empty = pending_n == 0 && min_gen.is_none();
     if both_empty || (rounds >= cap && refs_moved(d)?) {
         enqueue(sql, JobKind::GcConsolidate, now_ms(), &chain_payload(d)?)?;
@@ -442,11 +442,11 @@ pub async fn gc_mark(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> Result<
         put(d, "gc.chain", hex16()?)?;
         put(d, "gc.refs_version", d.meta("refs_version")?)?;
         // captured now, persisted at the end — every arm reads the meta
-        let barrier = barrier_capture(d);
+        let barrier = barrier_capture(d)?;
         // gc_candidate_before_ms knob (testhooks): an absolute candidate
         // cutoff — a test splits packs into old candidates and young keepers
         // without racing a moving now-grace boundary
-        let cutoff = crate::testhooks::knob(d, "gc_candidate_before_ms")
+        let cutoff = crate::testhooks::knob(d, "gc_candidate_before_ms")?
             .unwrap_or_else(|| now.saturating_sub(d.gc_grace_ms()));
         exec(
             &sql,
@@ -918,8 +918,8 @@ fn pending_page(
     };
     // knobs: the test values keep the windows small; production defaults
     // are 50 000 idx / 5 000 rows per span (§5.2)
-    let window = crate::testhooks::knob(d, "pending_window").unwrap_or(50_000).max(1);
-    let page_rows = crate::testhooks::knob(d, "pending_page").unwrap_or(5_000).max(1);
+    let window = crate::testhooks::knob(d, "pending_window")?.unwrap_or(50_000).max(1);
+    let page_rows = crate::testhooks::knob(d, "pending_page")?.unwrap_or(5_000).max(1);
     let hi = row.cursor.saturating_add(window);
     let page = exec(
         sql,
@@ -1124,7 +1124,7 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
         // consolidate multi-part on a tiny repo — after_part becomes reachable.
         // Clamped: R2 refuses non-final parts under PART_MIN even in dev.
         out.set_part_size(
-            crate::testhooks::knob(d, "gc_part_bytes")
+            crate::testhooks::knob(d, "gc_part_bytes")?
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(PART)
                 .clamp(PART_MIN, PART),
@@ -2033,8 +2033,8 @@ fn swap_check(d: &RepoDo, sql: &SqlStorage, job: &Job, chain: Option<&str>) -> R
     // charged — a try is a *completed* non-empty check that saw refs move,
     // so K=1 still lets the first moved check drain once and the fallback
     // fires on the next non-empty check
-    let k = crate::testhooks::knob(d, "swap_tries").unwrap_or(8);
-    let s = crate::testhooks::knob(d, "swap_max_slices").unwrap_or(64);
+    let k = crate::testhooks::knob(d, "swap_tries")?.unwrap_or(8);
+    let s = crate::testhooks::knob(d, "swap_max_slices")?.unwrap_or(64);
     if sm.tries >= k || sm.slices >= s {
         // §3.3: the bounded-retry lossless fallback — sync, fenced (this
         // span), frontier may be non-empty; it never enqueues a mark
