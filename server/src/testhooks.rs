@@ -464,7 +464,7 @@ pub fn jobs_view(d: &RepoDo) -> Result<Response, Error> {
     json(view(d)?)
 }
 
-/// Lazily created by set_knob — deliberately NOT in the production schema list.
+/// Lazily created by knob() on read and by set_knob — deliberately NOT in the production schema list.
 const KNOBS_DDL: &str = "CREATE TABLE IF NOT EXISTS test_knobs(name TEXT PRIMARY KEY, value INTEGER)";
 
 /// Named integer knobs (slice_subreqs, gc_part_bytes, max_live_packs, gc_barrier).
@@ -483,6 +483,9 @@ pub(crate) fn knob(d: &RepoDo, name: &str) -> Result<Option<i64>, Error> {
     struct R {
         value: i64,
     }
+    // hooks-on only: an armed knob.read makes this read fail so a test can
+    // prove SliceBudget::fresh errors before a job is claimed.
+    failpoint(d, "knob.read")?;
     // to_array, never one() — a zero-row cursor makes workers-rs throw a
     // "Critical error" that kills the isolate outright
     d.q(KNOBS_DDL, vec![])?;
