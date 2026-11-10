@@ -1938,4 +1938,81 @@ mod tests {
             "{err}"
         );
     }
+
+    /// A client can send one oversized request-body stream chunk (reproduced
+    /// at 4 MiB) on a 1 MiB-capped path. `BodyReader::fill` reserves and
+    /// copies that whole chunk BEFORE any cap check — the refused chunk's
+    /// reservation is the retry 503, not the cap error.
+    #[test]
+    fn upload_body_rejects_an_oversized_first_chunk_uncopied() {
+        let _guard = crate::try_grow::HookGuard;
+        crate::try_grow::log_asks();
+        let mut reader = BodyReader::from_chunks(vec![vec![0u8; 4 << 20]], None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        let asks = crate::try_grow::take_asks();
+        assert!(asks.is_empty(), "the oversized chunk must not be reserved: {asks:?}");
+    }
+
+    /// The same hole mid-stream: a chunk that would cross the cap is refused
+    /// without being reserved or copied — the chunks before it were.
+    #[test]
+    fn upload_body_rejects_the_chunk_crossing_the_cap() {
+        let _guard = crate::try_grow::HookGuard;
+        crate::try_grow::log_asks();
+        let mut chunks: Vec<Vec<u8>> = (0..15).map(|_| vec![0u8; FILL_STEP]).collect();
+        chunks.push(vec![0u8; 2 * FILL_STEP]);
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        assert!(
+            reader.total <= CMD_CAP as u64,
+            "reader.total = {} — the crossing chunk must not be pulled in",
+            reader.total
+        );
+    }
+
+    /// A client can put a whole receive header AND a large pack tail in one
+    /// stream chunk. `header_push` requires the entire buffered chunk to fit
+    /// under CMD_CAP before it pushes, so a legal short header sharing a
+    /// chunk with pack data is refused as "receive header > 1 MiB" — and the
+    /// pack bytes after the flush must stay available as leftover.
+    #[test]
+    fn receive_header_accepts_a_short_header_with_a_large_pack_tail() {
+        let mut w = PktWriter::default();
+        w.data(
+            b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\0report-status\n",
+        )
+        .unwrap();
+        w.flush();
+        let pack_tail = vec![7u8; 4 << 20];
+        let mut input = w.out;
+        input.extend_from_slice(&pack_tail);
+        let mut reader = BodyReader::from_chunks(vec![input], None);
+        let (hdr, leftover) = block_on(receive_header(&mut reader)).unwrap();
+        assert_eq!(hdr.commands.len(), 1);
+        assert_eq!(hdr.commands[0].name.to_string(), "refs/heads/main");
+        assert!(!leftover.is_empty() && leftover.len() < pack_tail.len());
+        assert!(
+            pack_tail.starts_with(&leftover),
+            "leftover must be a prefix of the pack tail"
+        );
+        // the pack bytes past the buffered window are still pending on the reader
+        let mut rest = leftover.clone();
+        loop {
+            let more = block_on(reader.fill(FILL_STEP)).unwrap();
+            rest.extend_from_slice(reader.buffered());
+            reader.consume(usize::MAX);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(rest, pack_tail, "no pack byte may be lost after the header flush");
+    }
 }
