@@ -1229,7 +1229,7 @@ impl RepoDo {
     /// cap <= 0 disables (never at cap). The janitor-done hook in jobs/mod.rs
     /// consults the same predicate to keep a capped repo's GC chain alive.
     pub(crate) fn at_pack_cap(&self) -> Result<bool, Error> {
-        let cap = match crate::testhooks::knob(self, "max_live_packs") {
+        let cap = match crate::testhooks::knob(self, "max_live_packs")? {
             Some(v) => v,
             None => {
                 let v = self.env_i64("GE_MAX_LIVE_PACKS", DEFAULT_MAX_LIVE_PACKS);

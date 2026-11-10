@@ -194,6 +194,7 @@ class Swap(unittest.TestCase):
         _, g_pack = push_garbage(r, "g")
         cutoff_now(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         cohort = tb.cohort_ids(r)  # the marked flag wipes with the chain
         epoch0 = epoch(r)
         gone = False
@@ -240,6 +241,7 @@ class Swap(unittest.TestCase):
         g, g_pack = push_garbage(r, "g")
         cutoff_now(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         # resurrect the garbage commit — an empty-pack ref create whose new
         # oid is only reachable inside the (unbuilt) cohort pack
         st, body = ge.receive_pack(
@@ -290,6 +292,7 @@ class Swap(unittest.TestCase):
                ":refs/heads/c0", cwd=r.dir)
         cutoff_now(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         st, body = ge.receive_pack(
             r.name, [(ZERO, c, "refs/heads/c")], ge.empty_pack())
         self.assertIn(b"ok refs/heads/c", body,
@@ -346,6 +349,7 @@ class Swap(unittest.TestCase):
         tgs.import_until_commit_phase(r)
         epoch0 = epoch(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         finish_chain(r, limit=60)
         swap = ge.last_swap(r.name)
         self.assertIsNotNone(swap, "no gc_last_swap")
@@ -385,6 +389,7 @@ class Swap(unittest.TestCase):
         tgs.import_until_commit_phase(r)
         epoch0 = epoch(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         finish_chain(r, limit=60)
         swap = ge.last_swap(r.name)
         self.assertIsNotNone(swap, "no gc_last_swap")
@@ -431,6 +436,7 @@ class Swap(unittest.TestCase):
                     tb.seed(r, 2)
                 cutoff_now(r)
                 tb.to_stage(r, "presweep")
+                th.assert_barrier(self, r, True)
                 cohort = tb.cohort_ids(r)
                 new_pack = tb.meta(r).get("gc.new_pack")
                 epoch0 = epoch(r)
@@ -497,6 +503,7 @@ class Swap(unittest.TestCase):
         # and a mark queued after handoff only Reschedules at the M4 build
         # guard (same pattern as tb.test_mark_completes_under_writer)
         t, box = tb.pause_mark(r)
+        th.assert_barrier(self, r, True)
         for i in range(5):
             push_commit(r, "pre%d" % i)  # pending rows + gen-1, all pre-baseline
         tb.release_pause(r, t, box)
@@ -537,6 +544,7 @@ class Swap(unittest.TestCase):
                 # the mark is mid-flight, or the mark they queue stalls at
                 # the M4 build guard and the chain never reaches phase=sweep
                 t, box = tb.pause_mark(r)
+                th.assert_barrier(self, r, True)
                 push_commit(r, "pre")
                 if mode == "delete_during_drain":
                     # pre-baseline on purpose: drain work inside the try
@@ -627,8 +635,10 @@ class Swap(unittest.TestCase):
                 cutoff_now(r)
                 if stage == "markdone":
                     tb.step_until(r, "gc_mark", {"done"})
+                    th.assert_barrier(self, r, True)
                 elif stage == "presweep":
                     tb.to_stage(r, "presweep")
+                    th.assert_barrier(self, r, True)
                 if extra == "fallback":
                     ge.knob(r.name, "swap_tries", 1)
                     push_commit(r, "fb")  # moved rv + drain work → fallback
@@ -638,6 +648,8 @@ class Swap(unittest.TestCase):
                         "presweep": "gc_sweep"}[stage]
                 ge.failpoint(r.name, fp, action, 1)
                 s = ge.step(r.name, kind)
+                if stage == "start":
+                    th.assert_barrier(self, r, True)
                 if action == "crash":
                     self.assertEqual(
                         s["outcome"], "crashed",
@@ -667,6 +679,7 @@ class Swap(unittest.TestCase):
         th.seed_gc_repo(r)
         cutoff_now(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         push_commit(r, "pre")  # drain work so the pause is inside a slice
         t, box = pause_drain(r)
         ge.repair(r.name)  # requeue the stranded row → a fresh slice owns it
@@ -737,6 +750,7 @@ class Swap(unittest.TestCase):
                 th.seed_gc_repo(r)
                 cutoff_now(r)
                 tb.to_stage(r, "presweep")
+                th.assert_barrier(self, r, True)
                 cohort = tb.cohort_ids(r)  # marked wipes with the chain end
                 ge.marked_built_null(r.name)  # 500s until the column ships
                 epoch0 = epoch(r)
@@ -799,6 +813,7 @@ class Swap(unittest.TestCase):
                                if p["id"] == garbage)
                 ge.knob(r.name, "gc_candidate_before_ms", created + 1)
                 tb.to_stage(r, "presweep")
+                th.assert_barrier(self, r, True)
                 ge.failpoint(r.name, "gc.swap.after_deadmark", "error", 1)
                 s = ge.step(r.name, "gc_sweep")
                 self.assertEqual(s["outcome"], "retry",
@@ -836,6 +851,7 @@ class Swap(unittest.TestCase):
         g, g_pack = push_garbage(r, "g")
         cutoff_now(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         ge.failpoint(r.name, "gc.swap.after_epoch", "error", 1)
         s = ge.step(r.name, "gc_sweep")
         self.assertEqual(s["outcome"], "retry",
@@ -897,6 +913,7 @@ class Swap(unittest.TestCase):
                 self.assertIn(b"queued", body)
                 tgs.import_until_commit_phase(r)
                 tb.to_stage(r, "presweep")
+                th.assert_barrier(self, r, True)
                 ge.failpoint(r.name, "gc.swap.after_deadmark", "error", 1)
                 s = ge.step(r.name, "gc_sweep")
                 self.assertEqual(s["outcome"], "retry",
@@ -962,6 +979,7 @@ class Swap(unittest.TestCase):
                     # baseline; the test's writer packs are excluded below
                     bytes_before = sum(p["bytes"] for p in tgs.live_packs(r))
                     tb.to_stage(r, "presweep")
+                    th.assert_barrier(self, r, True)
                     if cycle == 1:
                         new_pack1 = tb.meta(r).get("gc.new_pack")
                     ge.knob(r.name, "swap_tries", 1)
@@ -1049,6 +1067,7 @@ class Swap(unittest.TestCase):
                 self.assertIn(b"queued", body)
                 tgs.import_until_commit_phase(r)  # checked; commit still queued
                 tb.to_stage(r, "presweep")
+                th.assert_barrier(self, r, True)
                 finish_chain(r, limit=60)  # the swap lands mid-flight
                 self.assertIsNotNone(
                     ge.last_swap(r.name), "no swap recorded mid-import")
@@ -1085,6 +1104,7 @@ class Swap(unittest.TestCase):
         ge.git("push", "-q", r.url, ":refs/heads/g2", cwd=r.dir)
         cutoff_now(r)
         tb.to_stage(r, "presweep")
+        th.assert_barrier(self, r, True)
         cohort = tb.cohort_ids(r)
         new_pack = tb.meta(r).get("gc.new_pack")
         # resurrect one unbuilt object per cohort pack → none retirable
@@ -1130,6 +1150,7 @@ class Swap(unittest.TestCase):
                 ge.knob(r.name, "compact_min_age_ms", 0)
                 ge.knob(r.name, "compact_fanin", 2)
                 tb.to_stage(r, "presweep")
+                th.assert_barrier(self, r, True)
                 # a compact row arriving mid-chain reschedules behind it
                 ge.enqueue(r.name, "gc_compact")
                 s = ge.step(r.name, "gc_compact")

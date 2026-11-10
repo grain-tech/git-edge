@@ -89,18 +89,18 @@ pub struct SliceBudget {
     yield_after: u32,
 }
 impl SliceBudget {
-    pub fn fresh(d: &RepoDo) -> Self {
+    pub fn fresh(d: &RepoDo) -> Result<Self, Error> {
         // slice_subreqs knob (testhooks): pull the yield forward so a job
         // yields Continue early — the hard 400 cap never moves
-        let yield_after = crate::testhooks::knob(d, "slice_subreqs")
+        let yield_after = crate::testhooks::knob(d, "slice_subreqs")?
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(320)
             .min(320);
-        Self {
+        Ok(Self {
             started_ms: crate::wall_now(),
             req: ReqBudget { max_subrequests: 400, used: 0, started_ms: crate::wall_now(), max_ms: 20_000.0, sink: None, lease: None },
             yield_after,
-        }
+        })
     }
     pub fn spent_80pct(&self) -> bool {
         let elapsed = crate::wall_now() - self.started_ms;
@@ -440,7 +440,7 @@ async fn dispatch_inner(d: &RepoDo, pick: Pick) -> Result<Option<Report>, Error>
     let repo = platform::do_id_name(&d.state).unwrap_or_else(|| "-".into());
     let attempt = job.attempts.saturating_add(1);
     platform::job_event(&d.env, &repo, job.kind.as_str(), "start", "ok", attempt, 0, false, "");
-    let mut budget = SliceBudget::fresh(d);
+    let mut budget = SliceBudget::fresh(d)?;
     let out = run_slice(d, &job, &mut budget).await;
     // a "crash" failpoint is a simulated isolate death (testhooks.rs): return
     // now, WITHOUT the outcome span — the row stays 'running' holding its lease

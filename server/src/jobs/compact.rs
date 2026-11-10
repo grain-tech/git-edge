@@ -31,15 +31,15 @@ pub struct Knobs {
     pub max_rows: i64, // the init bitmap scan / swap row-delete budget
 }
 
-pub fn knobs(d: &RepoDo) -> Knobs {
-    let k = |name: &str, env: &str, def: i64| {
-        crate::testhooks::knob(d, name).unwrap_or_else(|| d.env_i64(env, def))
+pub fn knobs(d: &RepoDo) -> Result<Knobs, Error> {
+    let k = |name: &str, env: &str, def: i64| -> Result<i64, Error> {
+        Ok(crate::testhooks::knob(d, name)?.unwrap_or_else(|| d.env_i64(env, def)))
     };
-    Knobs {
-        fanin: k("compact_fanin", "GE_COMPACT_FANIN", 16).max(2),
-        min_age_ms: k("compact_min_age_ms", "GE_COMPACT_MIN_AGE_MS", 60_000),
-        max_rows: k("compact_max_rows", "GE_COMPACT_MAX_ROWS", 100_000),
-    }
+    Ok(Knobs {
+        fanin: k("compact_fanin", "GE_COMPACT_FANIN", 16)?.max(2),
+        min_age_ms: k("compact_min_age_ms", "GE_COMPACT_MIN_AGE_MS", 60_000)?,
+        max_rows: k("compact_max_rows", "GE_COMPACT_MAX_ROWS", 100_000)?,
+    })
 }
 
 /// One live pack row — the select_cohort input.
@@ -245,7 +245,7 @@ fn quarantine_bump(q: &mut Vec<(String, i64)>, id: &str, n: i64) {
 pub fn trigger(d: &RepoDo) -> Result<(), Error> {
     let packs = live_packs(d)?;
     let quarantined = quarantine_ids(&quarantine_load(d)?);
-    let k = knobs(d);
+    let k = knobs(d)?;
     let run_at = if select_cohort(&packs, &quarantined, now_ms(), &k).is_some() {
         Some(now_ms())
     } else {
@@ -418,7 +418,7 @@ pub fn gc_compact(d: &RepoDo, _job: &Job) -> Result<SliceOutcome, Error> {
     }
     let packs = live_packs(d)?;
     let quar = gc_compact_prune_quarantine(d, &packs)?;
-    let k = knobs(d);
+    let k = knobs(d)?;
     let Some(cohort) = select_cohort(&packs, &quarantine_ids(&quar), now_ms(), &k) else {
         return Ok(SliceOutcome::Done);
     };

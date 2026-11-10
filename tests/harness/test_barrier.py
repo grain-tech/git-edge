@@ -91,8 +91,14 @@ def assert_cohort_live(tc, r, cohort):
     """A sweep that aborted retired nothing: every cohort pack is still live."""
     tc.assertTrue(cohort, "no cohort to check")
     packs = {p["id"]: p for p in ge.jobs(r.name)["packs"]}
-    tc.assertTrue(all(packs[c]["state"] == "live" for c in cohort),
-                  "the sweep retired the cohort instead of aborting: %r" % packs)
+    missing = sorted(c for c in cohort if c not in packs)
+    tc.assertFalse(
+        missing,
+        "cohort pack(s) missing from packs: %r; packs=%r" % (missing, packs))
+    dead = sorted(c for c in cohort if packs[c]["state"] != "live")
+    tc.assertFalse(
+        dead,
+        "the sweep retired the cohort instead of aborting: %r" % packs)
 
 
 def barrier_active(r):
@@ -298,6 +304,7 @@ class Barrier(unittest.TestCase):
                 ge.git("push", "-q", r.url, "%s:refs/heads/del0" % old, cwd=r.dir)
                 ctx = {"old": old, "tip": git_tip(r)}
                 release = to_stage(r, stage)
+                th.assert_barrier(self, r, True)
                 ok, detail = do_action(r, kind, 0, ctx)
                 if release is not None:
                     release()
@@ -324,6 +331,7 @@ class Barrier(unittest.TestCase):
         seed(r, 2)
         ge.knob(r.name, "slice_subreqs", 1)
         ge.step(r.name, "gc_mark")  # a live chain for the assertions to bite
+        th.assert_barrier(self, r, True)
         tip = git_tip(r)
         tip1 = ge.git("rev-parse", "HEAD~1", cwd=r.dir).stdout.strip()
         ctx = {"tip": tip}
@@ -382,6 +390,8 @@ class Barrier(unittest.TestCase):
         leftover_gen1 = False
         for i in range(40):
             t, box = pause_mark(r)
+            if i == 0:
+                th.assert_barrier(self, r, True)
             # a writer lands during the await so gen-1 stays fed
             new_commit(r, "wr%d" % i)
             r.push()
@@ -442,6 +452,7 @@ class Barrier(unittest.TestCase):
         # after_read and promote a pack holding xc during the await.
         ge.knob(r.name, "slice_subreqs", 0)
         t, box = pause_mark(r)
+        th.assert_barrier(self, r, True)
         st, body = ge.receive_pack(
             r.name, [(ZERO, xc, "refs/heads/x2")], ge.pack_objects(r.dir, [xc]))
         self.assertIn(b"ok refs/heads/x2", body, "%r" % body[:300])
@@ -531,6 +542,7 @@ class Barrier(unittest.TestCase):
         seed(r, 2)
         ge.knob(r.name, "slice_subreqs", 1)
         ge.step(r.name, "gc_mark")  # init
+        th.assert_barrier(self, r, True)
         c = new_commit(r, "pend")
         r.push()
         # the promoted pack's pending row is visible before the mark drains it
@@ -556,6 +568,7 @@ class Barrier(unittest.TestCase):
         ge.knob(r.name, "pending_page", 8)
         ge.knob(r.name, "slice_subreqs", 1)
         ge.step(r.name, "gc_mark")  # init: barrier chain live before the push
+        th.assert_barrier(self, r, True)
         # one pack of tiny blobs + a commit ref — python-built so the idx
         # layout is exact and no local objects are needed
         pack, csha = blob_pack(300)
@@ -585,6 +598,7 @@ class Barrier(unittest.TestCase):
         ge.knob(r.name, "pending_page", 8)
         ge.knob(r.name, "slice_subreqs", 1)
         ge.step(r.name, "gc_mark")  # init before the push so the row pends
+        th.assert_barrier(self, r, True)
         # tree+commit land at idx ~100 — past the first 64-idx window, so the
         # second page span is what feeds them
         pack, csha = blob_pack(100, tail_nonblob=True)
@@ -604,6 +618,7 @@ class Barrier(unittest.TestCase):
         seed(r, 2)
         ge.knob(r.name, "slice_subreqs", 1)
         ge.step(r.name, "gc_mark")
+        th.assert_barrier(self, r, True)
         # atomic push where one command loses: the whole push is rejected,
         # the promoted pack demotes, and its pending row must not protect it
         c = new_commit(r, "dem")
@@ -665,6 +680,7 @@ class Barrier(unittest.TestCase):
         barrier_on(r)
         seed(r, 2)
         step_until(r, "gc_mark", {"done"})
+        th.assert_barrier(self, r, True)
         step_until(r, "gc_consolidate", {"done"}, limit=10)
         v = ge.jobs(r.name)
         new_pack = v["gc_meta"].get("gc.new_pack")
@@ -760,6 +776,7 @@ class Barrier(unittest.TestCase):
         barrier_on(r)
         seed(r, 2)
         step_until(r, "gc_mark", {"done"})
+        th.assert_barrier(self, r, True)
         old_chain = meta(r).get("gc.chain")
         # strand the consolidate: exhaust the budget first, then kill
         # (boot→repair on every admin call would otherwise resurrect it)
@@ -769,6 +786,7 @@ class Barrier(unittest.TestCase):
         r.push()
         s = ge.step(r.name, "gc_mark")
         self.assertTrue(s["ran"], "%r" % s)
+        th.assert_barrier(self, r, True)
         m = meta(r)
         self.assertIsNotNone(m.get("gc.chain"), "%r" % m)
         self.assertNotEqual(m.get("gc.chain"), old_chain,
@@ -827,6 +845,7 @@ class Barrier(unittest.TestCase):
         ge.knob(r.name, "gc_candidate_before_ms", garbage_created + 1)
         ge.failpoint(r.name, "gc.build.handoff", "error", 1)
         step_until(r, "gc_mark", {"done"}, limit=10)
+        th.assert_barrier(self, r, True)
         s = ge.step(r.name, "gc_consolidate")
         self.assertEqual(s["outcome"], "retry",
                          "handoff failpoint never fired: %r" % s)
@@ -854,6 +873,7 @@ class Barrier(unittest.TestCase):
                     s = ge.step(r.name, "gc_mark")
                     if not s["ran"]:
                         break
+                    th.assert_barrier(self, r, True)
                     if s["outcome"] == "retry":
                         saw_retry = True
                     if s["outcome"] == "done":
@@ -989,6 +1009,43 @@ def blob_pack(n_blobs, tail_nonblob=False):
         body += _entry(kind, content)
     body += hashlib.sha1(bytes(body)).digest()
     return bytes(body), commit_sha
+
+
+class AssertCohortLiveTests(unittest.TestCase):
+    """No server: a missing pack must be an assertion, not a KeyError."""
+
+    def _check(self, packs, cohort):
+        class R:
+            name = "x"
+        saved = ge.jobs
+        ge.jobs = lambda _name: {"packs": packs}
+        try:
+            assert_cohort_live(self, R(), cohort)
+        finally:
+            ge.jobs = saved
+
+    def test_missing_pack_is_assertion_not_keyerror(self):
+        with self.assertRaises(AssertionError) as cm:
+            self._check([{"id": "a", "state": "live"}], {"a", "gone"})
+        msg = str(cm.exception)
+        self.assertIn("missing", msg)
+        self.assertIn("gone", msg)
+
+    def test_dead_pack_is_assertion(self):
+        with self.assertRaises(AssertionError) as cm:
+            self._check([{"id": "a", "state": "dead"}], {"a"})
+        self.assertIn("retired the cohort", str(cm.exception))
+
+    def test_empty_cohort_is_assertion(self):
+        with self.assertRaises(AssertionError) as cm:
+            self._check([{"id": "a", "state": "live"}], set())
+        self.assertIn("no cohort", str(cm.exception))
+
+    def test_live_cohort_passes(self):
+        self._check(
+            [{"id": "a", "state": "live"}, {"id": "b", "state": "live"}],
+            {"a", "b"},
+        )
 
 
 if __name__ == "__main__":
