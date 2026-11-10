@@ -365,8 +365,14 @@ class GcSafety(unittest.TestCase):
         A non-atomic push whose every command loses still promotes its pack to
         live. Pre-fix refs_version never moves, so the running chain's mark
         snapshot goes stale without aborting: X is swept even though the new
-        live pack's commit C links to it, and the z ref create dangles."""
+        live pack's commit C links to it, and the z ref create dangles.
+
+        The knob pins the mode to off. Without it the chain takes the
+        server's GE_GC_BARRIER default, and a server started with
+        GE_GC_BARRIER=1 runs a barrier chain, which has no refs_version
+        fence mid-walk."""
         r = repo("c2-loser")
+        ge.knob(r.name, "gc_barrier", 0)
         a = r.commit_file("f", "x\n", "a")
         tree_x = ge.git("rev-parse", "HEAD^{tree}", cwd=r.dir).stdout.strip()
         r.push()  # P = {A, treeX, blob}
@@ -521,8 +527,14 @@ class GcSafety(unittest.TestCase):
         Today the mid-build consolidate hits a missing gc.refs_version after
         the mark's abort() wiped gc.* — a Storage error — and backs off until
         dead (its last_error, collected in `errs`, is "meta.gc.refs_version
-        missing")."""
+        missing").
+
+        The knob pins the mode to off. Without it the chain takes the
+        server's GE_GC_BARRIER default, and a server started with
+        GE_GC_BARRIER=1 runs a barrier chain, whose mid-walk abort
+        behaviour is not the flag-off contract this test pins."""
         r = repo("c3-wedge")
+        ge.knob(r.name, "gc_barrier", 0)
         ge.knob(r.name, "gc_part_bytes", 5 << 20)
         # pull the yield point all the way forward: the first build slice must
         # yield 'continue' mid-build, not race to done inside one budget
