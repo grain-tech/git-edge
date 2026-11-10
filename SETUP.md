@@ -68,6 +68,8 @@ All have defaults; set in `wrangler.jsonc` `[vars]` or `wrangler dev --var`:
 | `GE_COMPACT_MIN_AGE_MS` | 60,000 | Minimum pack age before a pack can join a compact cohort |
 | `GE_COMPACT_MAX_ROWS` | 100,000 | Object-row budget per compact cohort (packs over `max_rows`/2 objects are ineligible) |
 | `GE_MAX_LIVE_PACKS` | 1,000 | Live+ingesting packs per repo; min 2 when enabled, ≤0 disables — over-cap pushes/imports get 503 + `Retry-After: 60`. Compaction (`GE_COMPACT_*`) is what normally keeps live packs under this cap |
+| `GE_EDGE_INGEST_SLOTS` / `GE_EDGE_INGEST_WAIT_MS` | 1 / 240,000 | Concurrent pass-B push ingests per isolate, and how long a push waits for a slot or a drained heap before answering busy in-band; the effective wait is also capped by the request budget minus `GE_EDGE_INGEST_PASS_B_RESERVE_MS`, and a push that cannot cover the reserve fails busy up front; slots ≤0 disables the gate. The 40 MiB heap low-water means one large in-flight pass B (~60 MiB live) blocks a second ingest, so effective concurrency for large pushes is 1 even with slots > 1 |
+| `GE_EDGE_INGEST_PASS_B_RESERVE_MS` | 150,000 | Cap on the size-aware pass-B reserve — what pass A learned (object count, pack bytes) sizes the wall pass B needs (~6 ms/object, ~150 s/GiB, 15 s floor, this value as ceiling). The effective queued wait is `min(WAIT_MS, budget_left − reserve(pack))`: a ~26k-object push reserves the full ~150 s and fails fast when the budget can't cover it; a ~5k-object push reserves ~30 s and may wait correspondingly longer; ≤0 drops the reserve |
 
 `GE_METRICS` (Analytics Engine binding in `wrangler.jsonc`) is optional —
 one datapoint per request; delete the binding line if you don't want it.

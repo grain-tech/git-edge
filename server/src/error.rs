@@ -165,11 +165,26 @@ impl Error {
             Error::NotFound => 404,
             Error::Gone => 410,
             Error::Conflict(_) => 409,
-            Error::Budget | Error::Limit(_) => 413,
+            Error::Budget => 413,
+            // the memory-pressure Limit is transient — a client that waits
+            // and retries can succeed, so it is a 503, not a permanent 413
+            Error::Limit(_) if crate::try_grow::is_retry(self) => 503,
+            Error::Limit(_) => 413,
             Error::RateLimit(_) => 429,
             Error::Busy(_) => 503,
             Error::Unpack(_) | Error::Storage(_) | Error::Internal(_) => 500,
         }
+    }
+}
+
+/// The Retry-After value an error response carries, if any: RateLimit and
+/// Busy keep their own seconds floored at 1; the transient memory-pressure
+/// Limit gets a fixed minute; every other error gets none.
+fn retry_after(e: &Error) -> Option<String> {
+    match e {
+        Error::RateLimit(secs) | Error::Busy(secs) => Some((*secs).max(1).to_string()),
+        _ if crate::try_grow::is_retry(e) => Some("60".into()),
+        _ => None,
     }
 }
 
@@ -212,11 +227,45 @@ pub fn respond(r: Result<Response, Error>, git_pkt: bool, subreqs: u32) -> worke
             if matches!(e, Error::Auth) {
                 resp.headers_mut().set("WWW-Authenticate", "Basic realm=\"git-edge\"").ok();
             }
-            if let Error::RateLimit(secs) | Error::Busy(secs) = e {
-                resp.headers_mut().set("Retry-After", &secs.max(1).to_string()).ok();
+            if let Some(v) = retry_after(&e) {
+                resp.headers_mut().set("Retry-After", &v).ok();
             }
             stamp_subrequests(&mut resp, subreqs);
             Ok(resp.with_status(status))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The memory-pressure Limit is transient: 503, not the permanent 413
+    /// every other Limit/Budget keeps.
+    #[test]
+    fn retry_memory_limit_maps_to_503_other_limits_to_413() {
+        assert_eq!(Error::Limit(crate::try_grow::MEM_RETRY_MSG.into()).status(), 503);
+        assert_eq!(Error::Limit("pack too big".into()).status(), 413);
+        assert_eq!(Error::Budget.status(), 413);
+        assert_eq!(Error::Busy(5).status(), 503);
+    }
+
+    /// Every Retry-After case: RateLimit/Busy carry their own seconds
+    /// floored at 1, the transient memory-pressure Limit gets a fixed
+    /// minute, and every other error gets no header.
+    #[test]
+    fn retry_after_covers_every_hint() {
+        assert_eq!(retry_after(&Error::RateLimit(30)).as_deref(), Some("30"));
+        assert_eq!(retry_after(&Error::RateLimit(0)).as_deref(), Some("1"));
+        assert_eq!(retry_after(&Error::Busy(7)).as_deref(), Some("7"));
+        assert_eq!(retry_after(&Error::Busy(0)).as_deref(), Some("1"));
+        assert_eq!(
+            retry_after(&Error::Limit(crate::try_grow::MEM_RETRY_MSG.into())).as_deref(),
+            Some("60")
+        );
+        assert_eq!(retry_after(&Error::Limit("pack too big".into())), None);
+        assert_eq!(retry_after(&Error::Budget), None);
+        assert_eq!(retry_after(&Error::Auth), None);
+        assert_eq!(retry_after(&Error::Protocol("bad".into())), None);
     }
 }

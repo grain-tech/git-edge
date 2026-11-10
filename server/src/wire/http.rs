@@ -125,9 +125,22 @@ pub async fn stub_json<T: serde::de::DeserializeOwned>(
     body: &impl serde::Serialize,
     budget: &mut ReqBudget,
 ) -> Result<T, Error> {
-    budget.charge(1)?;
     let text = serde_json::to_string(body).map_err(|e| Error::Internal(e.to_string()))?;
-    let req = repo.internal_request(path, text.into_bytes())?;
+    stub_json_body(stub, repo, path, text.into_bytes(), budget).await
+}
+
+/// `stub_json` with the body already serialized — callers that must bound
+/// the serialization's memory (the pass-B index posts) build `body` at an
+/// exact capacity themselves.
+pub async fn stub_json_body<T: serde::de::DeserializeOwned>(
+    stub: &Stub,
+    repo: &RepoRoute,
+    path: &str,
+    body: Vec<u8>,
+    budget: &mut ReqBudget,
+) -> Result<T, Error> {
+    budget.charge(1)?;
+    let req = repo.internal_request(path, body)?;
     let mut resp = stub.fetch_with_request(req).await?;
     if resp.status_code() != 200 {
         return Err(Error::from_do_response(resp, budget).await);

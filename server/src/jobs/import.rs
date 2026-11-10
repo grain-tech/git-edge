@@ -267,7 +267,8 @@ async fn reject_push(sql: &SqlStorage, job: &Job, push: &str, why: &str) -> Resu
 /// A fetch answer that can never succeed — protocol/remote rejection — versus
 /// a transport blip a re-fetch might beat. Only the first kind rejects the push.
 fn deterministic(e: &Error) -> bool {
-    matches!(e, Error::Protocol(_) | Error::Limit(_))
+    // the memory-pressure Limit is transient: the slice retries it
+    matches!(e, Error::Protocol(_) | Error::Limit(_)) && !crate::try_grow::is_retry(e)
 }
 
 /// payload.url set: clone the remote ourselves. ls-refs mints the command set
@@ -375,7 +376,10 @@ async fn fetch_slice(
                     let (Some(band), data) = (d.first(), &d[1..]) else { continue };
                     match *band {
                         1 => {
-                            out.append(data);
+                            if let Err(e) = out.append(data) {
+                                fatal = Some(e);
+                                break 'stream;
+                            }
                             hold.extend_from_slice(data);
                             if hold.len() > ds {
                                 let n = hold.len() - ds;
@@ -837,7 +841,7 @@ async fn resume_drain<'a>(
     };
     let idx = Index(sql);
     let mut cx = Cx {
-        win: Window { bucket: &bucket, src, pack_len, start: 0, buf: Vec::new() },
+        win: Window { reads: crate::pack::ingest::Reader::Bucket(&bucket), src, pack_len, start: 0, buf: Vec::new() },
         cache: Cache::default(),
         z: Inflate::default(),
         by_id: IdMap::Sql { idx: &idx, pack: &pack.0, mem: HashMap::new() },
@@ -845,6 +849,10 @@ async fn resume_drain<'a>(
         obj_kind: p.kind(),
         res_depth: 0,
         chain_live: 0,
+        rows_held: 0,
+        // the DO path keeps the generous chain bound and no heap guard —
+        // its alarm slices carry their own budget
+        mem: None,
     };
     let toc = Toc::Sql { sql, push: &p.push };
     #[derive(Deserialize)]
@@ -1061,7 +1069,7 @@ async fn resume_drain<'a>(
             u32::try_from(n).unwrap_or(0),
             cs.lo.and_then(|v| u64::try_from(v).ok()).unwrap_or(u64::MAX),
             cs.hi.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
-        );
+        )?;
     }
     // re-attempt parked entries rather than trusting the cursor's base ids: a base
     // may have resolved since the cursor saved (crash slices lose wake bookkeeping)
@@ -1700,5 +1708,14 @@ mod tests {
         assert!(!dead_upload(&Error::Storage("Error: get: object does not exist".into())));
         assert!(!dead_upload(&Error::Unpack("missing base aa".into())));
         assert!(!dead_upload(&Error::Budget));
+    }
+    /// The "treat as temporary" rule: the memory-pressure Limit retries the
+    /// slice; every other Protocol/Limit still rejects the push for good.
+    #[test]
+    fn deterministic_leaves_the_retry_limit_to_the_slice() {
+        assert!(!super::deterministic(&Error::Limit(crate::try_grow::MEM_RETRY_MSG.into())), "the retry Limit is transient");
+        assert!(super::deterministic(&Error::Limit("pack too big".into())), "a real Limit still rejects");
+        assert!(super::deterministic(&Error::Protocol("bad ref".into())), "protocol errors still reject");
+        assert!(!super::deterministic(&Error::Storage("r2 blip".into())), "transport errors were never deterministic");
     }
 }

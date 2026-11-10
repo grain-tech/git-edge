@@ -3,18 +3,20 @@
 //! returns HTTP 200 carrying `unpack <err>` + `ng <ref>` for each command.
 
 use std::cell::Cell;
+use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
 use futures_util::{Stream, StreamExt};
 use gix_hash::ObjectId;
-use worker::{Env, Method, Request, Response};
+use worker::{Env, Method, Request, Response, Stub};
 
 use crate::auth::{self, Level};
 use crate::error::{respond, Error};
 use crate::pack;
 use crate::platform;
 use crate::store::{Bucket, PackId, PushId, RepoId};
+use crate::store::BodyChunk;
 use crate::wire::{
     self,
     http::{stub_json, stub_raw, RepoRoute},
@@ -25,6 +27,100 @@ use crate::{ReqBudget, Spend};
 const CMD_CAP: usize = 1 << 20; // section 6.3: command section cap
 const FILL_STEP: usize = 64 << 10; // 6.3: fill in 64 KiB steps
 
+/// The one size check every capped request body shares — the declared
+/// Content-Length and each streamed chunk's running total. Over-cap is
+/// the caller's Protocol wording; the check itself allocates nothing.
+fn check_body_len(len: usize, cap: usize, too_big: &'static str) -> Result<(), Error> {
+    if len > cap {
+        return Err(Error::Protocol(too_big.into()));
+    }
+    Ok(())
+}
+
+/// The declared Content-Length checked before a byte is read. An absent
+/// or unparsable header falls through — the streamed check bounds the real
+/// body. A length beyond usize's reach counts as over-cap.
+fn declared_len_ok(header: Option<&str>, cap: usize, too_big: &'static str) -> Result<(), Error> {
+    if let Some(n) = header.and_then(|v| v.parse::<u64>().ok()) {
+        check_body_len(usize::try_from(n).unwrap_or(usize::MAX), cap, too_big)?;
+    }
+    Ok(())
+}
+
+/// `Request::bytes()` without worker's infallible `vec![0; len]` inside
+/// `Uint8Array::to_vec()`, and bounded by `cap`: the declared
+/// Content-Length is checked before a byte is read, and the streamed
+/// length is checked before each chunk's reservation — an over-cap body
+/// never buys a reservation. A refused reservation is the in-band
+/// memory Limit.
+async fn request_body_bytes(req: &mut Request, cap: usize, too_big: &'static str) -> Result<Vec<u8>, Error> {
+    let declared = req.headers().get("content-length").ok().flatten();
+    declared_len_ok(declared.as_deref(), cap, too_big)?;
+    let Some(raw) = req.inner().body() else {
+        return Ok(Vec::new()); // no body — the same empty Vec array_buffer() produced
+    };
+    use futures_util::StreamExt as _;
+    use wasm_bindgen::JsCast as _;
+    let chunks = wasm_streams::ReadableStream::from_raw(raw.unchecked_into())
+        .into_stream()
+        .map(body_chunk);
+    fill_capped(cap, too_big, chunks).await
+}
+
+/// The capped body read, generic over the chunk type so native tests drive
+/// it with counting fakes: each chunk's `len()` is checked against the
+/// running total BEFORE it is copied — an over-cap chunk is the caller's
+/// Protocol error, never copied and never followed by another poll. An
+/// admitted chunk's growth is reserved fallibly first (a refusal is the
+/// in-band retry Limit), then copied into the new tail.
+async fn fill_capped<C, S>(cap: usize, too_big: &'static str, stream: S) -> Result<Vec<u8>, Error>
+where
+    C: BodyChunk,
+    S: Stream<Item = Result<C, Error>>,
+{
+    use futures_util::StreamExt as _;
+    let mut body = Vec::new();
+    let mut stream = std::pin::pin!(stream);
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        check_body_len(body.len().saturating_add(chunk.len()), cap, too_big)?;
+        crate::try_grow::vec(&mut body, chunk.len())?;
+        let start = body.len();
+        body.resize(start + chunk.len(), 0);
+        chunk.copy_into(&mut body[start..]);
+    }
+    Ok(body)
+}
+
+/// One stream chunk as its own Vec — the copy `BodyReader`'s stream
+/// performs per item. The reservation is fallible BEFORE the copy, so a
+/// refused allocation is the in-band retry Limit and the chunk is never
+/// copied.
+fn chunk_vec<C: BodyChunk>(c: &C) -> Result<Vec<u8>, Error> {
+    let mut v = crate::try_grow::zeroed(c.len())?;
+    c.copy_into(&mut v);
+    Ok(v)
+}
+
+/// One item off a request-body ReadableStream as a Uint8Array — the
+/// acceptance rule `request_body_bytes` and the R2 reader share: bytes
+/// arrive as a Uint8Array or an ArrayBuffer; anything else is a Storage
+/// error.
+fn body_chunk(item: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>) -> Result<js_sys::Uint8Array, Error> {
+    use wasm_bindgen::JsCast as _;
+    let v = item.map_err(|e| Error::Storage(format!("body stream: {e:?}")))?;
+    Ok(match v.dyn_into::<js_sys::Uint8Array>() {
+        Ok(a) => a,
+        Err(v) if v.is_instance_of::<js_sys::ArrayBuffer>() => js_sys::Uint8Array::new(&v),
+        Err(v) => return Err(Error::Storage(format!("body chunk is not bytes: {v:?}"))),
+    })
+}
+
+/// One stream item as the chunk Vec `BodyReader` buffers.
+fn body_vec(item: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>) -> Result<Vec<u8>, Error> {
+    chunk_vec(&body_chunk(item)?)
+}
+
 /// The request body as a chunked byte stream (section 6). gzip is decoded through a
 /// `DecompressionStream` when `Content-Encoding: gzip` is set; other encodings are rejected.
 pub struct BodyReader {
@@ -32,6 +128,11 @@ pub struct BodyReader {
     buf: Vec<u8>,
     eof: bool,
     pub total: u64,
+    /// The identity-encoded body's declared Content-Length — evidence of
+    /// how many bytes (and so how many pack entries) can follow. None for
+    /// gzip, where the wire length says nothing about the decoded size,
+    /// and for chunked uploads that declare no length.
+    pub declared_len: Option<u64>,
 }
 impl BodyReader {
     pub fn new(req: &mut Request) -> Result<Self, Error> {
@@ -51,23 +152,36 @@ impl BodyReader {
             let ds = web_sys::DecompressionStream::new(web_sys::CompressionFormat::Gzip)
                 .map_err(|e| Error::Internal(format!("DecompressionStream: {e:?}")))?;
             let body = raw.pipe_through(wasm_bindgen::JsCast::unchecked_ref::<web_sys::ReadableWritablePair>(&ds));
-            let stream = wasm_streams::ReadableStream::from_raw(body).into_stream();
-            return Ok(Self::wrap(stream.map(|item| {
-                let v = item.map_err(|e| Error::Storage(format!("body stream: {e:?}")))?;
-                let a = js_sys::Uint8Array::new(&v);
-                let mut b = vec![0u8; a.length() as usize];
-                a.copy_to(&mut b);
-                Ok(b)
-            })));
+            let stream = wasm_streams::ReadableStream::from_raw(body).into_stream().map(body_vec);
+            return Ok(Self::wrap(stream));
         }
-        let stream = req.stream().map_err(|e| Error::Protocol(e.to_string()))?;
-        Ok(Self::wrap(stream.map(|item| item.map_err(|e| Error::Storage(e.to_string())))))
+        let declared_len = req
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let raw = req
+            .inner()
+            .body()
+            .ok_or_else(|| Error::Protocol("no body for request".into()))?;
+        let stream = wasm_streams::ReadableStream::from_raw(raw).into_stream().map(body_vec);
+        let mut r = Self::wrap(stream);
+        r.declared_len = declared_len;
+        Ok(r)
+    }
+    /// Test-only: a reader over in-memory chunks, so pass A runs natively.
+    #[cfg(test)]
+    pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>, declared_len: Option<u64>) -> Self {
+        let mut r = Self::wrap(futures_util::stream::iter(chunks.into_iter().map(Ok)));
+        r.declared_len = declared_len;
+        r
     }
     fn wrap<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Vec<u8>, Error>> + 'static,
     {
-        Self { stream: Box::pin(stream), buf: Vec::new(), eof: false, total: 0 }
+        Self { stream: Box::pin(stream), buf: Vec::new(), eof: false, total: 0, declared_len: None }
     }
     /// Read until buf.len() >= min or EOF. Ok(false) means EOF before min.
     pub async fn fill(&mut self, min: usize) -> Result<bool, Error> {
@@ -75,6 +189,7 @@ impl BodyReader {
             match self.stream.next().await {
                 Some(Ok(chunk)) => {
                     self.total = self.total.saturating_add(chunk.len() as u64);
+                    crate::try_grow::vec(&mut self.buf, chunk.len())?;
                     self.buf.extend_from_slice(&chunk);
                 }
                 Some(Err(e)) => return Err(e),
@@ -124,6 +239,20 @@ impl BodyReader {
 
 /// The one public entry point (lib.rs #[event(fetch)]).
 pub async fn fetch(req: Request, env: Env) -> worker::Result<Response> {
+    // wasm-bindgen-futures never settles the request promise after a panic —
+    // the runtime then cancels the invocation as "hung". Log the panic message
+    // (never request data) so the console shows the real cause. wasm-only:
+    // native test builds keep the default hook. Installed once — every fetch
+    // used to re-box the hook and drop the old one.
+    #[cfg(target_arch = "wasm32")]
+    {
+        static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+        PANIC_HOOK.call_once(|| {
+            std::panic::set_hook(Box::new(|info| {
+                worker::console_error!("git-edge panic: {info}");
+            }));
+        });
+    }
     let started = platform::now_ms();
     // Request-wide subrequest tally: every ReqBudget the request creates reports
     // into it, so respond() stamps x-ge-subrequests even on error paths where the
@@ -372,6 +501,42 @@ async fn state_probe(req: &Request, env: &Env, route: &RepoRoute, spend: &Spend)
     git_resp(bytes, "application/json")
 }
 
+/// The upload-pack command body read whole under `cap`. The cap check runs
+/// BEFORE each append and counts the bytes `fill` already pulled into the
+/// buffer — checking the assembled body alone would let a chunked upload
+/// overshoot by a whole fill step. Each append's growth is reserved
+/// fallibly first: a refusal is the in-band retry Limit, over-cap the
+/// upload-pack Limit.
+async fn read_upload_body(reader: &mut BodyReader, cap: usize) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    while reader.fill(FILL_STEP).await? {
+        if body.len().saturating_add(reader.buffered().len()) > cap {
+            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+        }
+        crate::try_grow::vec(&mut body, reader.buffered().len())?;
+        body.extend_from_slice(reader.buffered());
+        reader.consume(usize::MAX);
+    }
+    if body.len().saturating_add(reader.buffered().len()) > cap {
+        return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+    }
+    crate::try_grow::vec(&mut body, reader.buffered().len())?;
+    body.extend_from_slice(reader.buffered()); // EOF tail shorter than FILL_STEP
+    Ok(body)
+}
+
+/// The upload-pack command body under CMD_CAP: a declared Content-Length
+/// is rejected before any byte is buffered, and read_upload_body caps a
+/// chunked body while it streams in.
+async fn upload_command_body(reader: &mut BodyReader, declared: Option<u64>) -> Result<Vec<u8>, Error> {
+    if let Some(n) = declared {
+        if n > CMD_CAP as u64 {
+            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
+        }
+    }
+    read_upload_body(reader, CMD_CAP).await
+}
+
 /// POST /:owner/:repo/git-upload-pack — v2 only; route on the command name, forward raw.
 async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate(&req, env, Level::Read, route, spend).await?;
@@ -383,32 +548,14 @@ async fn upload_pack(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spe
         return git_resp(w.out, "application/x-git-upload-pack-result")
             .map(|r| r.with_status(400));
     }
-    // bound the read: a declared Content-Length is rejected before any byte is buffered,
-    // and a chunked body is still capped at CMD_CAP while streaming in
-    if let Some(n) = req
+    let declared = req
         .headers()
         .get("content-length")
         .ok()
         .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if n > CMD_CAP as u64 {
-            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
-        }
-    }
+        .and_then(|v| v.parse::<u64>().ok());
     let mut reader = BodyReader::new(&mut req)?;
-    let mut body = Vec::new();
-    while reader.fill(FILL_STEP).await? {
-        if reader.buffered().len() > CMD_CAP {
-            return Err(Error::Limit("upload-pack body > 1 MiB".into()));
-        }
-        body.extend_from_slice(reader.buffered());
-        reader.consume(usize::MAX);
-    }
-    body.extend_from_slice(reader.buffered()); // EOF tail shorter than FILL_STEP
-    if body.len() > CMD_CAP {
-        return Err(Error::Limit("upload-pack body > 1 MiB".into()));
-    }
+    let body = upload_command_body(&mut reader, declared).await?;
     let path = match wire::parse_v2_command(&body)? {
         wire::V2Command::LsRefs(_) => "/_do/ls-refs",
         wire::V2Command::Fetch(_) => "/_do/fetch",
@@ -483,34 +630,48 @@ async fn pack_get(req: &Request, env: &Env, _route: &RepoRoute, name: &str, spen
     Ok(resp)
 }
 
+/// The lfs_batch gate as a seam: `auth` settles before `body` is invoked —
+/// a failed auth returns its error and the body reader never runs. The
+/// auth output comes back with the body so the caller can act on what the
+/// resolution granted.
+async fn auth_then_body<S, T, A, B, FB>(auth: A, body: B) -> Result<(S, T), Error>
+where
+    A: Future<Output = Result<S, Error>>,
+    B: FnOnce() -> FB,
+    FB: Future<Output = Result<T, Error>>,
+{
+    let s = auth.await?;
+    let t = body().await?;
+    Ok((s, t))
+}
+
+/// The LFS batch `operation` field as the auth level it needs.
+fn lfs_need(v: &serde_json::Value) -> Result<Level, Error> {
+    match v.get("operation").and_then(|o| o.as_str()) {
+        Some("download") => Ok(Level::Read),
+        Some("upload") => Ok(Level::Write),
+        _ => Err(Error::Protocol("lfs operation must be download or upload".into())),
+    }
+}
+
 /// POST /:owner/:repo/info/lfs/objects/batch — Git LFS batch API (#21, basic
 /// transfer). The operation picks the auth level: download needs read, upload
 /// needs write. The DO does existence checks + mints the signed `/_lfs/` URLs.
 async fn lfs_batch(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
-    // a batch spec is small JSON (≤100 objects typical) — cap before buffering
-    let too_big = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|n| n > 1_048_576)
-        .unwrap_or(false);
-    if too_big {
-        return Err(Error::Protocol("lfs batch body too large".into()));
-    }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
-    if body.len() > 1_048_576 {
-        return Err(Error::Protocol("lfs batch body too large".into()));
-    }
+    // one resolution before the body is read — the granted level decides
+    // download-vs-upload after `operation` parses, with no second DO call.
+    // Credentials come out synchronously so the resolve future holds no
+    // borrow on `req`.
+    let creds = auth::credentials(&req);
+    let (grant, body) = auth_then_body(
+        auth::resolve(creds, env, route, spend),
+        || request_body_bytes(&mut req, 1_048_576, "lfs batch body too large"),
+    )
+    .await?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("lfs batch: {e}")))?;
-    let level = match v.get("operation").and_then(|o| o.as_str()) {
-        Some("download") => Level::Read,
-        Some("upload") => Level::Write,
-        _ => return Err(Error::Protocol("lfs operation must be download or upload".into())),
-    };
-    auth::authenticate(&req, env, level, route, spend).await?;
+    let need = lfs_need(&v)?;
+    auth::admit(grant, need)?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let base = req.url().ok().map(|u| u.origin().ascii_serialization());
     let mut resp = stub_raw(&stub, route, "/_do/lfs/batch", body, &mut budget, base.as_deref()).await?;
@@ -569,7 +730,10 @@ async fn lfs_object(req: Request, env: &Env, _route: &RepoRoute, oid: &str, op: 
                     if n == 0 {
                         break;
                     }
-                    out.append(body.buffered());
+                    if let Err(e) = out.append(body.buffered()) {
+                        err = Some(e);
+                        break;
+                    }
                     body.consume(n);
                     if let Err(e) = out.flush_if_full(&mut budget).await {
                         err = Some(e);
@@ -597,22 +761,7 @@ async fn lfs_object(req: Request, env: &Env, _route: &RepoRoute, oid: &str, op: 
 async fn token_create(mut req: Request, env: &Env, route: &RepoRoute, spend: &Spend) -> Result<Response, Error> {
     auth::authenticate_admin(&req, env)?;
     // {name, level} needs a few hundred bytes; cap before buffering the body whole
-    let too_big = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|n| n > 65_536)
-        .unwrap_or(false);
-    if too_big {
-        return Err(Error::Protocol("token create body too large".into()));
-    }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
-    if body.len() > 65_536 {
-        // chunked upload had no content-length to check up front
-        return Err(Error::Protocol("token create body too large".into()));
-    }
+    let body = request_body_bytes(&mut req, 65_536, "token create body too large").await?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("token create body: {e}")))?;
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
@@ -658,21 +807,7 @@ async fn token_revoke(req: &Request, env: &Env, route: &RepoRoute, id: &str, spe
 
 /// Bounded JSON body for the small _admin payloads (public/pin/unpin).
 async fn json_body(req: &mut Request) -> Result<serde_json::Value, Error> {
-    if let Some(n) = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if n > 4_096 {
-            return Err(Error::Protocol("admin body too large".into()));
-        }
-    }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
-    if body.len() > 4_096 {
-        return Err(Error::Protocol("admin body too large".into()));
-    }
+    let body = request_body_bytes(req, 4_096, "admin body too large").await?;
     serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("admin body: {e}")))
 }
 
@@ -821,7 +956,10 @@ async fn import_stage(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
                 if n == 0 {
                     break;
                 }
-                out.append(body.buffered());
+                if let Err(e) = out.append(body.buffered()) {
+                    err = Some(e);
+                    break;
+                }
                 body.consume(n);
                 total = total.saturating_add(n as u64);
                 if let Err(e) = out.flush_if_full(&mut budget).await {
@@ -875,21 +1013,7 @@ async fn import_stage(mut req: Request, env: &Env, route: &RepoRoute, spend: &Sp
 /// Bounded body for _admin/import — commands for a many-ref import run to a few
 /// hundred KB, so this gets its own cap rather than json_body's 4 KiB.
 async fn import_body(req: &mut Request) -> Result<serde_json::Value, Error> {
-    if let Some(n) = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if n > (4 << 20) {
-            return Err(Error::Protocol("import body too large".into()));
-        }
-    }
-    let body = req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?;
-    if body.len() > (4 << 20) {
-        return Err(Error::Protocol("import body too large".into()));
-    }
+    let body = request_body_bytes(req, 4 << 20, "import body too large").await?;
     serde_json::from_slice(&body).map_err(|e| Error::Protocol(format!("import body: {e}")))
 }
 
@@ -1040,7 +1164,7 @@ async fn test_forward(mut req: Request, env: &Env, route: &RepoRoute, path: &str
             .unwrap_or_else(|| "refs".into());
         serde_json::to_vec(&serde_json::json!({ "mode": mode })).map_err(|e| Error::Internal(e.to_string()))?
     } else {
-        req.bytes().await.map_err(|e| Error::Protocol(e.to_string()))?
+        request_body_bytes(&mut req, 1 << 20, "test body too large").await?
     };
     let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
     let mut resp = stub_raw(&stub, route, path, body, &mut budget, None).await?;
@@ -1075,6 +1199,11 @@ async fn export_bundle(req: &Request, env: &Env, route: &RepoRoute, spend: &Spen
 /// POST /:owner/:repo/git-receive-pack — two-phase push (2.4, 3) with the A2 error arm.
 async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spend) -> Result<Response, Error> {
     let principal = auth::authenticate(&req, &env, Level::Write, &route, spend).await?;
+    // the pass-B memory guard's "is the isolate busy" count — pass A isn't
+    // admission-gated but still holds heap, so the whole handler counts.
+    // Created only AFTER auth: an unauthenticated request must not count as
+    // an in-progress receive-pack peer (it would skew busy-vs-slices).
+    let receive_pack_guard = pack::run::ReceivePackGuard::new();
     // A27: sha1 of the presented token is the rate-limit bucket key — the raw
     // credential never crosses the stub boundary (8.1)
     let rate_key = auth::presented_hash(&req)?;
@@ -1103,7 +1232,8 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
     }
 
     // ---- post-header (A2): everything from here reports HTTP 200 + report-status ----
-    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, admin, spend).await {
+    let lease = receive_pack_guard.lease();
+    match receive_inner(&mut body, &env, &route, &hdr, &principal, &rate_key, admin, spend, lease).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             // A27/G2b: a throttled or over-cap push answers a real HTTP
@@ -1117,6 +1247,20 @@ async fn receive_pack(mut req: Request, env: Env, route: RepoRoute, spend: &Spen
             report_status_200(&hdr, Err(e.client_message()), &[])
         }
     }
+}
+
+/// The next buffered chunk into the header accumulator: the cap is checked
+/// against `pr.buf` plus the pending bytes BEFORE the push, so a refusal
+/// never leaves the accumulator over CMD_CAP.
+fn header_push(pr: &mut PktReader, body: &mut BodyReader) -> Result<(), Error> {
+    check_body_len(
+        pr.buf.len().saturating_add(body.buffered().len()),
+        CMD_CAP,
+        "receive header > 1 MiB",
+    )?;
+    pr.push(body.buffered());
+    body.consume(usize::MAX);
+    Ok(())
 }
 
 /// Parse the receive-pack command header: pkt-lines up to the first flush, then the
@@ -1134,16 +1278,13 @@ async fn receive_header(body: &mut BodyReader) -> Result<(wire::ReceiveHeader, V
                 if body.buffered().is_empty() {
                     return Err(Error::Protocol("truncated receive header".into()));
                 }
-                pr.push(&body.buffered().to_vec());
-                body.consume(usize::MAX);
-                if pr.buf.len() > CMD_CAP {
-                    return Err(Error::Protocol("receive header > 1 MiB".into()));
-                }
+                header_push(&mut pr, body)?;
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_inner(
     body: &mut BodyReader,
     env: &Env,
@@ -1153,8 +1294,11 @@ async fn receive_inner(
     rate_key: &str,
     admin: bool,
     spend: &Spend,
+    lease: std::rc::Rc<pack::run::Lease>,
 ) -> Result<Response, Error> {
-    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend));
+    // the budget carries this request's lease: its charges (and the pass-B
+    // guard, which borrows the handle) renew only this request's leases
+    let (stub, mut budget) = (route.stub(env)?, ReqBudget::paid().reporting(spend).leased(lease));
     let push = PushId::random()?;
     #[derive(serde::Deserialize)]
     struct Begin {
@@ -1179,15 +1323,7 @@ async fn receive_inner(
     // error; the Limit message reaches the client in `unpack`.
     if !begin.claimed {
         if let Err(e) = owner_claim(env, route, &mut budget).await {
-            let _: serde_json::Value = stub_json(
-                &stub,
-                route,
-                "/_do/push/abort",
-                &serde_json::json!({ "push_id": push.0 }),
-                &mut budget,
-            )
-            .await
-            .unwrap_or_default();
+            push_abort(&stub, route, &push, spend).await;
             return Err(e);
         }
     }
@@ -1195,17 +1331,9 @@ async fn receive_inner(
 
     // a post-begin failure must close the open push row now — leaving it for the
     // janitor's 1h expiry lets 64 failures DoS all pushes
-    let run = pack::run::run(body, &bucket, &stub, route, &push, hdr.caps.object_format, &mut budget).await;
+    let run = pack::run::run(body, &bucket, &stub, route, &push, hdr.caps.object_format, env, &mut budget).await;
     if run.is_err() {
-        let _: serde_json::Value = stub_json(
-            &stub,
-            route,
-            "/_do/push/abort",
-            &serde_json::json!({ "push_id": push.0 }),
-            &mut budget,
-        )
-        .await
-        .unwrap_or_default();
+        push_abort(&stub, route, &push, spend).await;
     }
     let (pack, tags) = run?;
     let commands: Vec<serde_json::Value> = hdr
@@ -1240,15 +1368,7 @@ async fn receive_inner(
     let res: Commit = match commit {
         Ok(r) => r,
         Err(e) => {
-            let _: serde_json::Value = stub_json(
-                &stub,
-                route,
-                "/_do/push/abort",
-                &serde_json::json!({ "push_id": push.0 }),
-                &mut budget,
-            )
-            .await
-            .unwrap_or_default();
+            push_abort(&stub, route, &push, spend).await;
             return Err(e);
         }
     };
@@ -1261,6 +1381,25 @@ async fn receive_inner(
         })
         .collect();
     report_status_200(hdr, Ok(()), &results)
+}
+
+/// One bounded attempt at /_do/push/abort. The request's own budget is
+/// often WHY the abort runs — an admission timeout or a Budget failure
+/// means it is already exhausted — so the abort gets a fresh small budget
+/// (ReqBudget::cleanup) that still reports into the request's spend tally.
+/// Best-effort: the result is discarded; if this attempt also fails the
+/// row expires via the janitor.
+async fn push_abort(stub: &Stub, route: &RepoRoute, push: &PushId, spend: &Spend) {
+    let mut budget = ReqBudget::cleanup(spend);
+    let _: serde_json::Value = stub_json(
+        stub,
+        route,
+        "/_do/push/abort",
+        &serde_json::json!({ "push_id": push.0 }),
+        &mut budget,
+    )
+    .await
+    .unwrap_or_default();
 }
 
 /// report-status `ng` reasons are `&'static str`; the DO's known reasons get their static form,
@@ -1365,4 +1504,438 @@ async fn owner_release(env: &Env, route: &RepoRoute) {
         return;
     }
     let _ = stub.fetch_with_request(r).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The declared-length precheck: over-cap refuses with the caller's
+    /// Protocol wording, len == cap is admitted, and an absent or
+    /// unparsable header falls through to the streamed check. A length
+    /// beyond usize's reach counts as over-cap.
+    #[test]
+    fn declared_len_precheck() {
+        let err = declared_len_ok(Some("65"), 64, "declared too large").unwrap_err();
+        assert!(matches!(&err, Error::Protocol(m) if m == "declared too large"), "{err}");
+        declared_len_ok(Some("64"), 64, "declared too large").unwrap();
+        declared_len_ok(None, 64, "declared too large").unwrap();
+        declared_len_ok(Some("not-a-number"), 64, "declared too large").unwrap();
+        declared_len_ok(Some("18446744073709551615"), 64, "declared too large").unwrap_err();
+    }
+
+    /// A waker that does nothing — auth_then_body's fakes resolve on
+    /// first poll, so its future never really pends in these tests.
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn no_op(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    /// Drive `f` to completion — the seam's fakes never pend.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let w = noop_waker();
+        let mut cx = std::task::Context::from_waker(&w);
+        let mut f = std::pin::pin!(f);
+        for _ in 0..1_000_000 {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+        panic!("future did not resolve");
+    }
+
+    /// lfs_batch's order as a seam: a failed Read auth returns its own
+    /// error and the body reader is never invoked; on success auth runs
+    /// before the body read.
+    #[test]
+    fn auth_then_body_gates_the_body_read() {
+        let ran = Rc::new(Cell::new(false));
+        let r = Rc::clone(&ran);
+        let err = block_on(auth_then_body(
+            async { Err::<(), Error>(Error::Forbidden) },
+            move || {
+                r.set(true);
+                async { Ok::<Vec<u8>, Error>(Vec::new()) }
+            },
+        ))
+        .unwrap_err();
+        assert!(matches!(err, Error::Forbidden), "{err}");
+        assert!(!ran.get(), "the body reader ran despite the auth failure");
+
+        let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (a, b) = (Rc::clone(&order), Rc::clone(&order));
+        let (_, out) = block_on(auth_then_body(
+            async move {
+                a.borrow_mut().push("auth");
+                Ok::<(), Error>(())
+            },
+            move || {
+                let b = Rc::clone(&b);
+                async move {
+                    b.borrow_mut().push("body");
+                    Ok(vec![1u8, 2])
+                }
+            },
+        ))
+        .unwrap();
+        assert_eq!(out, vec![1, 2]);
+        assert_eq!(order.borrow().as_slice(), ["auth", "body"]);
+    }
+
+    /// lfs_batch's operation -> level mapping: download reads, upload
+    /// writes, anything else is the Protocol error.
+    #[test]
+    fn lfs_need_maps_operation_to_level() {
+        assert!(matches!(
+            lfs_need(&serde_json::json!({"operation": "download"})),
+            Ok(Level::Read)
+        ));
+        assert!(matches!(
+            lfs_need(&serde_json::json!({"operation": "upload"})),
+            Ok(Level::Write)
+        ));
+        for v in [
+            serde_json::json!({"operation": "delete"}),
+            serde_json::json!({"operation": 1}),
+            serde_json::json!({}),
+        ] {
+            let err = lfs_need(&v).map(|_| ()).unwrap_err();
+            assert!(
+                matches!(&err, Error::Protocol(m) if m == "lfs operation must be download or upload"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A chunk that counts its copies, so a test can see that none ran.
+    struct Counted(Vec<u8>, Rc<Cell<usize>>);
+    impl BodyChunk for Counted {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            self.1.set(self.1.get() + 1);
+            dst.copy_from_slice(&self.0);
+        }
+    }
+
+    /// A body stream that counts its polls.
+    struct Probe<C> {
+        items: std::collections::VecDeque<C>,
+        polls: Rc<Cell<usize>>,
+    }
+    impl<C: Unpin> Stream for Probe<C> {
+        type Item = Result<C, Error>;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.polls.set(self.polls.get() + 1);
+            std::task::Poll::Ready(self.items.pop_front().map(Ok))
+        }
+    }
+    fn probe<C>(items: Vec<C>) -> (Probe<C>, Rc<Cell<usize>>) {
+        let polls = Rc::new(Cell::new(0));
+        (Probe { items: items.into(), polls: polls.clone() }, polls)
+    }
+    fn counted(items: &[&[u8]], copies: &Rc<Cell<usize>>) -> Vec<Counted> {
+        items.iter().map(|b| Counted(b.to_vec(), copies.clone())).collect()
+    }
+
+    /// Many small chunks under the cap join into the exact body.
+    #[test]
+    fn fill_capped_joins_chunks_under_the_cap() {
+        let copies = Rc::new(Cell::new(0));
+        let want: Vec<u8> = (0..200u8).collect();
+        let parts: Vec<&[u8]> = vec![&want[..1], &want[1..100], &want[100..101], &want[101..]];
+        let (s, polls) = probe(counted(&parts, &copies));
+        let body = block_on(fill_capped(1 << 20, "test body too large", s)).unwrap();
+        assert_eq!(body, want);
+        assert_eq!(copies.get(), parts.len(), "every admitted chunk is copied once");
+        assert_eq!(polls.get(), parts.len() + 1, "chunks plus the end-of-stream poll");
+    }
+
+    /// A single oversized FIRST chunk is the Protocol error: it is never
+    /// copied, never reaches the try_grow ask log, and the stream is
+    /// polled exactly once.
+    #[test]
+    fn fill_capped_rejects_an_oversized_first_chunk_uncopied() {
+        let _guard = crate::try_grow::HookGuard;
+        let copies = Rc::new(Cell::new(0));
+        let (s, polls) = probe(counted(&[&[0u8; 65]], &copies));
+        crate::try_grow::log_asks();
+        let err = block_on(fill_capped(64, "test body too large", s)).unwrap_err();
+        assert!(matches!(&err, Error::Protocol(m) if m == "test body too large"), "{err}");
+        assert_eq!(copies.get(), 0, "the oversized chunk must not be copied");
+        assert_eq!(polls.get(), 1, "the stream must not be polled again");
+        assert!(crate::try_grow::take_asks().is_empty(), "the refused chunk must not reach try_grow");
+    }
+
+    /// A chunk that crosses the cap mid-stream is the Protocol error:
+    /// earlier chunks were copied, the crossing chunk was not, and the
+    /// stream was never polled past it.
+    #[test]
+    fn fill_capped_rejects_the_chunk_crossing_the_cap() {
+        let copies = Rc::new(Cell::new(0));
+        let (s, polls) = probe(counted(&[&[1, 2], &[3, 4, 5], &[6], &[7]], &copies));
+        let err = block_on(fill_capped(4, "test body too large", s)).unwrap_err();
+        assert!(matches!(&err, Error::Protocol(m) if m == "test body too large"), "{err}");
+        assert_eq!(copies.get(), 1, "only the first chunk may be copied");
+        assert_eq!(polls.get(), 2, "the stream stops at the crossing chunk");
+    }
+
+    /// A body whose chunks sum to exactly the cap is admitted.
+    #[test]
+    fn fill_capped_admits_a_body_exactly_at_the_cap() {
+        let copies = Rc::new(Cell::new(0));
+        let want: Vec<u8> = (0..64u8).collect();
+        let parts: Vec<&[u8]> = vec![&want[..10], &want[10..40], &want[40..]];
+        let (s, _) = probe(counted(&parts, &copies));
+        let body = block_on(fill_capped(64, "test body too large", s)).unwrap();
+        assert_eq!(body, want);
+        assert_eq!(copies.get(), parts.len());
+    }
+
+    /// An empty body — an empty stream, or one of only empty chunks — is Ok.
+    #[test]
+    fn fill_capped_accepts_an_empty_body() {
+        let (s, polls) = probe(Vec::<Counted>::new());
+        assert!(block_on(fill_capped(8, "test body too large", s)).unwrap().is_empty());
+        assert_eq!(polls.get(), 1);
+        let copies = Rc::new(Cell::new(0));
+        let (s, _) = probe(counted(&[&[], &[]], &copies));
+        assert!(block_on(fill_capped(8, "test body too large", s)).unwrap().is_empty());
+    }
+
+    /// A refused reservation is the in-band retry Limit and the chunk is
+    /// never copied.
+    #[test]
+    fn fill_capped_refused_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let copies = Rc::new(Cell::new(0));
+        let (s, polls) = probe(counted(&[&[7u8; 100]], &copies));
+        crate::try_grow::fail_above(Some(50));
+        let err = block_on(fill_capped(1 << 20, "test body too large", s)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert_eq!(copies.get(), 0, "a refused reservation must not copy the chunk");
+        assert_eq!(polls.get(), 1);
+    }
+
+    /// chunk_vec copies the chunk exactly once into a fresh Vec.
+    #[test]
+    fn chunk_vec_copies_the_chunk_exactly_once() {
+        let copies = Rc::new(Cell::new(0));
+        let c = Counted(vec![1, 2, 3], copies.clone());
+        assert_eq!(chunk_vec(&c).unwrap(), vec![1, 2, 3]);
+        assert_eq!(copies.get(), 1);
+    }
+
+    /// A refused reservation is the in-band retry Limit and the chunk is
+    /// never copied.
+    #[test]
+    fn chunk_vec_refused_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let copies = Rc::new(Cell::new(0));
+        let c = Counted(vec![7u8; 100], copies.clone());
+        crate::try_grow::fail_above(Some(50));
+        let err = chunk_vec(&c).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert_eq!(copies.get(), 0, "a refused reservation must not copy the chunk");
+    }
+
+    /// A zero-length chunk yields an empty Vec without asking the gate.
+    #[test]
+    fn chunk_vec_zero_length_asks_nothing() {
+        let _guard = crate::try_grow::HookGuard;
+        crate::try_grow::log_asks();
+        crate::try_grow::fail_above(Some(0));
+        let c = Counted(Vec::new(), Rc::new(Cell::new(0)));
+        assert!(chunk_vec(&c).unwrap().is_empty());
+        assert!(crate::try_grow::take_asks().is_empty(), "an empty chunk must not reach the gate");
+    }
+
+    /// The reader's own buffer grows through the same fallible
+    /// reservation: a refused growth is the in-band retry Limit and
+    /// buffers nothing.
+    #[test]
+    fn body_reader_fill_refused_buf_growth_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let mut body = BodyReader::from_chunks(vec![vec![7u8; 100]], None);
+        crate::try_grow::fail_above(Some(50));
+        let err = block_on(body.fill(1)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert!(body.buffered().is_empty(), "a refused growth buffers nothing");
+    }
+
+    /// A chunked upload-pack body (no Content-Length) is capped WHILE it
+    /// streams: 64 x 64 KiB refuses with the Limit error after ~1 MiB has
+    /// been pulled — reader.total proves the refusal did not wait for EOF.
+    #[test]
+    fn upload_body_cap_fires_while_streaming() {
+        let chunks: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; FILL_STEP]).collect();
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        assert!(
+            reader.total <= CMD_CAP as u64 + 2 * FILL_STEP as u64,
+            "reader.total = {} — the cap must fire while streaming, not after EOF",
+            reader.total
+        );
+    }
+
+    /// Chunks summing to exactly the cap are admitted whole.
+    #[test]
+    fn upload_body_admits_exactly_cap() {
+        let chunks: Vec<Vec<u8>> = (0..16).map(|i| vec![i as u8; FILL_STEP]).collect();
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let body = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap();
+        assert_eq!(body.len(), CMD_CAP);
+        assert_eq!(body[0], 0);
+        assert_eq!(body[FILL_STEP], 1);
+        assert_eq!(body[CMD_CAP - 1], 15);
+    }
+
+    /// A small chunked body passes through untouched.
+    #[test]
+    fn upload_body_admits_a_small_body() {
+        let payload: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let mut reader = BodyReader::from_chunks(vec![payload.clone()], None);
+        let body = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap();
+        assert_eq!(body, payload);
+    }
+
+    /// A chunked upload-pack command body is capped while it streams through
+    /// upload_command_body: 64 x 64 KiB refuses with the Limit after ~1 MiB
+    /// has been pulled — reader.total proves the refusal did not wait for EOF.
+    #[test]
+    fn upload_command_body_caps_a_chunked_body_while_streaming() {
+        let chunks: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; FILL_STEP]).collect();
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let err = block_on(upload_command_body(&mut reader, None)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        assert!(
+            reader.total <= CMD_CAP as u64 + FILL_STEP as u64,
+            "reader.total = {} — the cap must fire while streaming, not after EOF",
+            reader.total
+        );
+    }
+
+    /// A declared Content-Length over the cap refuses before a byte is pulled.
+    #[test]
+    fn upload_command_body_refuses_an_over_cap_declared_length() {
+        let mut reader = BodyReader::from_chunks(vec![vec![0u8; FILL_STEP]], None);
+        let err = block_on(upload_command_body(&mut reader, Some(CMD_CAP as u64 + 1))).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+        assert_eq!(reader.total, 0, "the declared-length refusal must precede any read");
+    }
+
+    /// The line of the try_grow call that ends `snippet`, found in this
+    /// file's production code — ingest.rs's guarded_site twin, so a test
+    /// names a guarded site by its code, not by a line number.
+    fn guarded_site(snippet: &str) -> (&'static str, u32) {
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests module")];
+        let hits: Vec<usize> = prod.match_indices(snippet).map(|(i, _)| i).collect();
+        assert_eq!(hits.len(), 1, "snippet must name one site: {snippet:?}");
+        let end = hits[0] + snippet.len();
+        (file!(), u32::try_from(prod[..end].matches('\n').count() + 1).unwrap())
+    }
+
+    /// A sub-FILL_STEP EOF tail taking a cap-sized body over the cap is refused.
+    #[test]
+    fn upload_body_tail_crossing_the_cap_is_refused() {
+        let mut chunks: Vec<Vec<u8>> = (0..16).map(|_| vec![0u8; FILL_STEP]).collect();
+        chunks.push(vec![0u8; 100]);
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Limit(m) if m == "upload-pack body > 1 MiB"),
+            "{err}"
+        );
+    }
+
+    /// The in-loop reserve refused at its own site is the in-band retry Limit.
+    #[test]
+    fn upload_body_refused_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let site = guarded_site("        crate::try_grow::vec(&mut body, reader.buffered().len())?;");
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(0));
+        let mut reader = BodyReader::from_chunks(vec![vec![0u8; FILL_STEP]], None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+    }
+
+    /// The EOF-tail reserve refused at its own site is the in-band retry Limit.
+    #[test]
+    fn upload_body_refused_tail_reservation_is_the_retry_limit() {
+        let _guard = crate::try_grow::HookGuard;
+        let site = guarded_site("\n    crate::try_grow::vec(&mut body, reader.buffered().len())?;");
+        crate::try_grow::fail_only_at(Some(site));
+        crate::try_grow::fail_above(Some(0));
+        let mut reader = BodyReader::from_chunks(vec![vec![0u8; FILL_STEP], vec![0u8; 100]], None);
+        let err = block_on(read_upload_body(&mut reader, CMD_CAP)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+    }
+
+    /// The header accumulator refuses BEFORE the push that would take it
+    /// over the cap: pr.buf stays at or under CMD_CAP.
+    #[test]
+    fn header_push_refuses_before_exceeding_the_cap() {
+        let mut pr = PktReader::default();
+        pr.buf = vec![0u8; CMD_CAP - 1_000];
+        let mut body = BodyReader::from_chunks(vec![vec![7u8; FILL_STEP]], None);
+        block_on(body.fill(FILL_STEP)).unwrap();
+        let err = header_push(&mut pr, &mut body).unwrap_err();
+        assert!(
+            matches!(&err, Error::Protocol(m) if m == "receive header > 1 MiB"),
+            "{err}"
+        );
+        assert!(
+            pr.buf.len() <= CMD_CAP,
+            "pr.buf.len() = {} — the refusal must precede the push",
+            pr.buf.len()
+        );
+    }
+
+    /// An unterminated receive header is refused at the cap and the error
+    /// propagates — a caller that swallows header_push's error would spin
+    /// forever on the unconsumed chunk, so the run is bounded by a timeout.
+    #[test]
+    fn receive_header_refuses_an_oversized_header_and_stops() {
+        let line = b"0035shallow 0000000000000000000000000000000000000000\n";
+        let mut stream = Vec::new();
+        while stream.len() <= CMD_CAP {
+            stream.extend_from_slice(line);
+        }
+        let chunks: Vec<Vec<u8>> = stream.chunks(FILL_STEP).map(|c| c.to_vec()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BodyReader::from_chunks(chunks, None);
+            let _ = tx.send(block_on(receive_header(&mut reader)));
+        });
+        let err = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("receive_header completed an oversized header"),
+            Err(_) => panic!("receive_header did not stop after a refused push"),
+        };
+        assert!(
+            matches!(&err, Error::Protocol(m) if m == "receive header > 1 MiB"),
+            "{err}"
+        );
+    }
 }

@@ -1197,7 +1197,7 @@ pub async fn gc_consolidate(d: &RepoDo, job: &Job, budget: &mut SliceBudget) -> 
                     n,
                     cs.lo.and_then(|v| u64::try_from(v).ok()).unwrap_or(u64::MAX),
                     cs.hi.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
-                );
+                )?;
                 pos.ord0 = n;
             } else {
                 // tail bytes lost/short — replay from the durable boundary
@@ -1267,7 +1267,7 @@ async fn build(
                 None => {
                     Index(sql).insert_objects(&PackId(pos.pack.clone()), &staged)?;
                     staged.clear();
-                    return match out.finish(&mut budget.req).await {
+                    return match crate::store::finish_pack(out, crate::jobs::GcPermit(()), &mut budget.req).await {
                         Ok(meta) => {
                             // R12: after the MPU completes, before the swap's final
                             // fence — the pause a push or clone interleaves through
@@ -1399,7 +1399,7 @@ async fn build(
                             }
                         }
                         p = p.saturating_add(u64::try_from(frag.len()).map_err(|_| Error::Internal("frag".into()))?);
-                        out.raw_extend(&frag);
+                        out.raw_extend(&frag)?;
                         pos.frag = p.saturating_sub(l.offset);
                         if let Some(f) = flush(
                             d, sql, bucket, key, &mut out, pos, &mut staged, &mut spans, &cur,

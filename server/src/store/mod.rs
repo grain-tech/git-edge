@@ -17,6 +17,165 @@ pub const PART: usize = 8 << 20; // 6.4: every part exactly 8 MiB except the las
 pub const PART_MIN: usize = 5 << 20;
 pub const MAX_OBJECT: u64 = 16 << 20; // A7: single-object cap, inflated
 
+/// The capacity `room` would grow `buf` to for `extra` incoming bytes:
+/// whole-part steps, so capacity stays a multiple of `part` (one part plus
+/// at most the overshoot append) instead of Vec's doubling holding ~2x
+/// across a flush boundary. `part` must be > 0. Returns `cap` unchanged
+/// when the need already fits — i.e. no growth.
+fn room_target(len: usize, cap: usize, part: usize, extra: usize) -> usize {
+    let need = len.saturating_add(extra);
+    if need <= cap {
+        return cap;
+    }
+    let step = part.max(1);
+    need.div_ceil(step).saturating_mul(step)
+}
+
+/// Grow `buf` for `extra` incoming bytes in whole-part steps. The growth
+/// is fallible (`try_reserve_exact`): a block the allocator cannot place
+/// returns the in-band memory Limit, and the caller's write that follows
+/// then fits the capacity without growing.
+pub(crate) fn room(buf: &mut Vec<u8>, part: usize, extra: usize) -> Result<(), Error> {
+    let target = room_target(buf.len(), buf.capacity(), part, extra);
+    if target > buf.capacity() {
+        crate::try_grow::vec_exact(buf, target.saturating_sub(buf.len()))?;
+    }
+    Ok(())
+}
+
+/// The writer counters `resume_tail` folds — grouped so the helper stays
+/// readable at the call site.
+#[derive(Clone, Copy, Debug)]
+struct TailState {
+    offset: u64,
+    count: u32,
+    commit_lo: u64,
+    commit_hi: u64,
+}
+
+/// `resume_tail`'s state transition, factored so the reservation order is
+/// testable natively: the room the CLEARED buffer would need is reserved
+/// BEFORE `part` is cleared, so a refused reservation changes nothing —
+/// the buffered tail bytes and every counter the caller keeps stay as
+/// they were. Returns the writer's new counters only on success.
+fn resume_tail_apply(
+    part: &mut Vec<u8>,
+    part_size: usize,
+    bytes: &[u8],
+    st: TailState,
+    extra: u32,
+    lo: u64,
+    hi: u64,
+) -> Result<TailState, Error> {
+    let new_offset = st
+        .offset
+        .saturating_sub(part.len() as u64)
+        .saturating_add(bytes.len() as u64);
+    // reserve exactly what room() would allocate for the cleared buffer —
+    // sized against len 0, not the bytes about to be dropped
+    let target = room_target(0, part.capacity(), part_size, bytes.len());
+    if target > part.capacity() {
+        crate::try_grow::vec_exact(part, target.saturating_sub(part.len()))?;
+    }
+    part.clear();
+    part.extend_from_slice(bytes);
+    Ok(TailState {
+        offset: new_offset,
+        count: st.count.saturating_add(extra),
+        commit_lo: st.commit_lo.min(lo),
+        commit_hi: st.commit_hi.max(hi),
+    })
+}
+
+/// Per-allocation overhead a growing buffer can add on top of its byte
+/// capacity: the allocator's chunk header and alignment rounding, and
+/// `memory.grow` handing out whole 64 KiB wasm pages. One page covers all
+/// three for a single allocation.
+pub(crate) const ALLOC_OVERHEAD: usize = 64 << 10;
+
+/// The bytes `room` adds to the heap for `extra` incoming bytes — the
+/// memory guard's preflight size for append paths. 0 when the need
+/// already fits (no allocation). Otherwise the bound is the new block plus
+/// ALLOC_OVERHEAD (see `growth_incoming`): the old block is already inside
+/// the live and linear readings the guard adds this to.
+pub(crate) fn room_growth(buf: &Vec<u8>, part: usize, extra: usize) -> usize {
+    let cap = buf.capacity();
+    let target = room_target(buf.len(), cap, part, extra);
+    if target <= cap {
+        return 0;
+    }
+    growth_incoming(target)
+}
+
+/// The incoming bytes a growth to `new_cap` bytes adds on top of what the
+/// guard already reads. A moving reallocation holds the old and the new
+/// block at once, but the old block is already counted in live bytes and
+/// sits inside linear memory, so the peak is live + new_cap. On the linear
+/// side the worst case is the same: the new block needs at most new_cap
+/// bytes of fresh pages. One ALLOC_OVERHEAD covers the allocator's header,
+/// rounding and page granularity.
+pub(crate) fn growth_incoming(new_cap: usize) -> usize {
+    new_cap.saturating_add(ALLOC_OVERHEAD)
+}
+
+/// The bytes a writer's finish adds to the heap before its last upload,
+/// for a part buffer `part`, a uniform part size and a `ds`-byte trailer:
+/// the trailer's whole-part growth of the buffer (`room_growth`), plus the
+/// split's exact-size head copy when the buffer and the trailer reach a
+/// whole part. The last part is moved out of the buffer, not copied.
+pub(crate) fn finish_growth(part: &Vec<u8>, part_size: usize, ds: usize) -> usize {
+    let grow = room_growth(part, part_size, ds);
+    let split = if part.len().saturating_add(ds) >= part_size { growth_incoming(part_size) } else { 0 };
+    grow.saturating_add(split)
+}
+
+/// Upper bound on `codec::encode_entry`'s appended bytes for `n` input bytes:
+/// zlib's deflateBound shape (n + n/4096 + n/16384 + n/33M + 13) covers
+/// deflate's worst case, and the flat slack covers the varint header and
+/// rounding — used to pre-size `part` so the encoder's own growth never
+/// doubles past the reserved whole parts.
+pub(crate) fn encoded_bound(n: usize) -> usize {
+    n.saturating_add(n >> 12)
+        .saturating_add(n >> 14)
+        .saturating_add(n >> 25)
+        .saturating_add(13)
+        .saturating_add(320)
+}
+
+/// How a PackWriter finish treats its multipart upload on failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Finish {
+    /// A push: nothing resumes it, so a failure aborts the upload rather
+    /// than leave it and its parts orphaned in R2.
+    Ordinary,
+    /// The import job: the upload is a checkpoint a retry resumes, so a
+    /// failure keeps it.
+    Resumable,
+}
+
+/// The seal's last budget charge before complete(). On failure, returns
+/// the error and whether to abort the upload: an ordinary finish must not
+/// drop the writer silently (abort best-effort, like every other finish
+/// error path); a resumable finish keeps its checkpointed upload.
+fn seal_charge(budget: &mut ReqBudget, mode: Finish) -> Result<(), (Error, bool)> {
+    budget.charge(1).map_err(|e| (e, mode == Finish::Ordinary))
+}
+
+/// Split `buf` at `n`: returns a tight `n`-byte Vec for upload while `buf`
+/// keeps the tail in its existing allocation. Always the copy-out form —
+/// the head is exact-size so the chunk held across `upload_part` never
+/// retains a part-sized-plus allocation for one part of data, and neither
+/// branch holds capacity + a second full-size copy: the transient is the
+/// head's `n` bytes on top of `buf`'s existing capacity.
+/// The head copy is fallible: on failure `buf` is unchanged.
+/// Caller guarantees `n <= buf.len()`.
+pub(crate) fn split_part(buf: &mut Vec<u8>, n: usize) -> Result<Vec<u8>, Error> {
+    let head = crate::try_grow::copy(&buf[..n])?;
+    buf.copy_within(n.., 0);
+    buf.truncate(buf.len() - n);
+    Ok(head)
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RepoId(pub String);
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -253,7 +412,8 @@ pub mod codec {
             return Err(Error::Limit("object too large (16 MiB max)".into()));
         }
         let z = bytes.get(hlen..).ok_or_else(|| Error::Storage("truncated entry".into()))?;
-        let mut out = vec![0u8; usize::try_from(size).map_err(|_| Error::Limit("size".into()))?];
+        // the inflate target is the decode's one large block: fallible
+        let mut out = crate::try_grow::zeroed(usize::try_from(size).map_err(|_| Error::Limit("size".into()))?)?;
         let (status, used, n) = gix_zlib::Inflate::default()
             .once(z, &mut out)
             .map_err(|e| Error::Storage(format!("inflate: {e}")))?;
@@ -307,10 +467,128 @@ impl gix_object::Exists for MemFind {
     }
 }
 
+/// Coalesced-read merge rules (7.2): same-pack locs merge across gaps
+/// < READ_GAP while the merged span stays <= READ_SPAN. Shared by
+/// `read_entries` and `read_entries_bound` so the memory preflight cannot
+/// drift from the fetch it prices.
+const READ_GAP: u64 = 256 * 1024;
+const READ_SPAN: u64 = 8 << 20;
+/// Flat slack inside `read_entries_bound`: request/response plumbing and
+/// the JS-side copy bookkeeping the size terms don't name — the same role
+/// FETCH_SCRATCH plays for window fetches.
+const READ_SLACK: usize = 256 << 10;
+
 pub struct Bucket {
     pub inner: worker::Bucket,
     pub repo: RepoId,
 }
+/// One body chunk the exact-fill core copies from: a JS Uint8Array in
+/// production, a byte slice in native tests.
+pub(crate) trait BodyChunk {
+    fn len(&self) -> usize;
+    /// Copy every byte of the chunk into `dst`. `dst.len()` is `len()`.
+    fn copy_into(&self, dst: &mut [u8]);
+}
+
+impl BodyChunk for js_sys::Uint8Array {
+    fn len(&self) -> usize {
+        self.length() as usize
+    }
+    fn copy_into(&self, dst: &mut [u8]) {
+        self.copy_to(dst);
+    }
+}
+
+/// Read exactly `want` bytes from `stream` into one Rust buffer. The
+/// buffer is reserved fallibly BEFORE the stream is polled, so a refusal
+/// is the in-band memory Limit and no chunk is ever held. Each chunk is
+/// copied into place and dropped. A chunk that would pass `want` is a
+/// Storage error at once, before it is copied and before the stream is
+/// polled again. A stream that ends short of `want` is a Storage error.
+pub(crate) async fn fill_exact<C, S>(want: usize, stream: S) -> Result<Vec<u8>, Error>
+where
+    C: BodyChunk,
+    S: futures_util::Stream<Item = Result<C, Error>>,
+{
+    use futures_util::StreamExt as _;
+    let mut buf = crate::try_grow::zeroed(want)?;
+    let mut pos = 0usize;
+    let mut stream = std::pin::pin!(stream);
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        let n = chunk.len();
+        let end = match pos.checked_add(n) {
+            Some(end) if end <= want => end,
+            _ => return Err(Error::Storage(format!("r2 body longer than {want}"))),
+        };
+        chunk.copy_into(&mut buf[pos..end]);
+        pos = end;
+    }
+    if pos < want {
+        return Err(Error::Storage(format!("r2 body {pos} bytes, wanted {want}")));
+    }
+    Ok(buf)
+}
+
+/// `ObjectBody` → Vec without worker's infallible `vec![0; len]`, and
+/// without a JS-side copy of the body: `fill_exact` reserves `want`
+/// bytes first, then each ReadableStream chunk is cast to a Uint8Array
+/// and copied straight into place. An ArrayBuffer chunk gets a view,
+/// which copies nothing.
+async fn object_body_vec(body: worker::ObjectBody<'_>, want: usize) -> Result<Vec<u8>, Error> {
+    use futures_util::StreamExt as _;
+    use wasm_bindgen::JsCast as _;
+    let stream = match body.response_body()? {
+        worker::ResponseBody::Body(b) => {
+            if b.len() != want {
+                return Err(Error::Storage(format!("r2 body {} bytes, wanted {want}", b.len())));
+            }
+            return Ok(b);
+        }
+        worker::ResponseBody::Empty => return Err(Error::Storage("r2 body empty".into())),
+        worker::ResponseBody::Stream(rs) => rs,
+    };
+    let chunks = wasm_streams::ReadableStream::from_raw(stream.unchecked_into())
+        .into_stream()
+        .map(|item| {
+            let v = item.map_err(|e| Error::Storage(format!("r2 body stream: {e:?}")))?;
+            Ok(match v.dyn_into::<js_sys::Uint8Array>() {
+                Ok(a) => a,
+                Err(v) if v.is_instance_of::<js_sys::ArrayBuffer>() => js_sys::Uint8Array::new(&v),
+                Err(v) => return Err(Error::Storage(format!("r2 body chunk is not bytes: {v:?}"))),
+            })
+        });
+    fill_exact(want, chunks).await
+}
+
+/// The trailer's fallible room + append — the growth `finish_inner` makes
+/// for the last part's trailer, kept in one step so it cannot revert to
+/// an infallible extend.
+fn trailer_append(part: &mut Vec<u8>, part_size: usize, trailer: &[u8]) -> Result<(), Error> {
+    room(part, part_size, trailer.len())?;
+    part.extend_from_slice(trailer);
+    Ok(())
+}
+
+/// One located entry's bytes out of a span read — the fallible copy
+/// `Bucket::read_entries` makes per entry.
+fn located_entry(
+    bytes: &[u8],
+    e: &&(ObjectId, ObjLoc),
+    start: u64,
+    key: &str,
+) -> Result<(ObjectId, Vec<u8>), Error> {
+    let lo = usize::try_from(e.1.offset.saturating_sub(start))
+        .map_err(|_| Error::Internal("offset".into()))?;
+    let hi = lo
+        .checked_add(usize::try_from(e.1.len).map_err(|_| Error::Internal("len".into()))?)
+        .ok_or_else(|| Error::Internal("len overflow".into()))?;
+    let entry = bytes
+        .get(lo..hi)
+        .ok_or_else(|| Error::Storage(format!("entry outside span in {key}")))?;
+    Ok((e.0, crate::try_grow::copy(entry)?))
+}
+
 impl Bucket {
     pub fn new(inner: worker::Bucket, repo: RepoId) -> Self {
         Self { inner, repo }
@@ -324,6 +602,10 @@ impl Bucket {
         budget: &mut ReqBudget,
     ) -> Result<Vec<u8>, Error> {
         budget.charge(1)?;
+        // the returned body comes from the R2 binding: the range length
+        // is bounded upstream (window fetch, entry wire cap, read_entries
+        // span), and object_body_vec reserves it fallibly before copying —
+        // callers still preflight through the memory guard
         let obj = self
             .inner
             .get(key)
@@ -331,15 +613,11 @@ impl Bucket {
             .execute()
             .await?
             .ok_or_else(|| Error::Storage(format!("missing {key}")))?;
-        let bytes = obj
+        let body = obj
             .body()
-            .ok_or_else(|| Error::Storage(format!("no body for {key}")))?
-            .bytes()
-            .await?;
-        if u64::try_from(bytes.len()).ok() != Some(len) {
-            return Err(Error::Storage(format!("short read on {key}")));
-        }
-        Ok(bytes)
+            .ok_or_else(|| Error::Storage(format!("no body for {key}")))?;
+        let want = usize::try_from(len).map_err(|_| Error::Storage(format!("range too large on {key}")))?;
+        object_body_vec(body, want).await
     }
     /// Coalesced reads (7.2): sort by (pack, offset), merge gaps < 256 KiB, split at 8 MiB.
     pub async fn read_entries(
@@ -347,20 +625,19 @@ impl Bucket {
         locs: &[(ObjectId, ObjLoc)],
         budget: &mut ReqBudget,
     ) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
-        const GAP: u64 = 256 * 1024;
-        const SPAN: u64 = 8 << 20;
         const MAX_READ: u64 = 48 << 20; // a single call must fit inside the isolate
-        let mut sorted: Vec<&(ObjectId, ObjLoc)> = locs.iter().collect();
+        let mut sorted: Vec<&(ObjectId, ObjLoc)> = crate::try_grow::with_capacity(locs.len())?;
+        sorted.extend(locs.iter());
         sorted.sort_by(|a, b| (&a.1.pack.0, a.1.offset).cmp(&(&b.1.pack.0, b.1.offset)));
-        let (mut out, mut i, mut total) = (Vec::with_capacity(locs.len()), 0usize, 0u64);
+        let (mut out, mut i, mut total) = (crate::try_grow::with_capacity(locs.len())?, 0usize, 0u64);
         while let Some(first) = sorted.get(i) {
             let (start, mut end, mut j) =
                 (first.1.offset, first.1.offset.saturating_add(u64::from(first.1.len)), i + 1);
             while let Some(n) = sorted.get(j) {
                 let n_end = n.1.offset.saturating_add(u64::from(n.1.len));
                 if n.1.pack.0 != first.1.pack.0
-                    || n.1.offset.saturating_sub(end) >= GAP
-                    || n_end.saturating_sub(start) > SPAN
+                    || n.1.offset.saturating_sub(end) >= READ_GAP
+                    || n_end.saturating_sub(start) > READ_SPAN
                 {
                     break;
                 }
@@ -374,15 +651,7 @@ impl Bucket {
             let key = keys::pack(&self.repo, &first.1.pack);
             let bytes = self.read_range(&key, start, end.saturating_sub(start), budget).await?;
             for e in sorted.iter().take(j).skip(i) {
-                let lo = usize::try_from(e.1.offset.saturating_sub(start))
-                    .map_err(|_| Error::Internal("offset".into()))?;
-                let hi = lo
-                    .checked_add(usize::try_from(e.1.len).map_err(|_| Error::Internal("len".into()))?)
-                    .ok_or_else(|| Error::Internal("len overflow".into()))?;
-                let entry = bytes
-                    .get(lo..hi)
-                    .ok_or_else(|| Error::Storage(format!("entry outside span in {key}")))?;
-                out.push((e.0, entry.to_vec()));
+                out.push(located_entry(&bytes, e, start, &key)?);
             }
             i = j;
         }
@@ -409,6 +678,46 @@ impl Bucket {
             }
         }
         Ok(out)
+    }
+
+    /// Peak heap `read_entries(locs)` adds, sized BEFORE the call allocates:
+    /// every loc's entry copy (`loc.len` wire bytes) stays alive in the
+    /// returned Vec, and ONE merged-span range buffer is live at a time —
+    /// the largest group's [start, end) under read_entries' own merge rules
+    /// (READ_GAP/READ_SPAN, same pack only). The walk below is that merge
+    /// minus the reads — keep it in step with read_entries. The sorted/out
+    /// vec headers and request plumbing ride in the per-loc term + READ_SLACK.
+    pub fn read_entries_bound(locs: &[(ObjectId, ObjLoc)]) -> usize {
+        let copies = locs.iter().fold(0usize, |n, (_, l)| n.saturating_add(l.len as usize));
+        let vecs = locs.len().saturating_mul(
+            std::mem::size_of::<(ObjectId, Vec<u8>)>()
+                .saturating_add(std::mem::size_of::<&ObjLoc>()),
+        );
+        let mut sorted: Vec<&ObjLoc> = locs.iter().map(|(_, l)| l).collect();
+        sorted.sort_by(|a, b| (&a.pack.0, a.offset).cmp(&(&b.pack.0, b.offset)));
+        let mut max_span = 0u64;
+        let mut i = 0usize;
+        while let Some(first) = sorted.get(i) {
+            let (start, mut end, mut j) =
+                (first.offset, first.offset.saturating_add(u64::from(first.len)), i + 1);
+            while let Some(n) = sorted.get(j) {
+                let n_end = n.offset.saturating_add(u64::from(n.len));
+                if n.pack.0 != first.pack.0
+                    || n.offset.saturating_sub(end) >= READ_GAP
+                    || n_end.saturating_sub(start) > READ_SPAN
+                {
+                    break;
+                }
+                end = end.max(n_end);
+                j += 1;
+            }
+            max_span = max_span.max(end.saturating_sub(start));
+            i = j;
+        }
+        copies
+            .saturating_add(usize::try_from(max_span).unwrap_or(usize::MAX))
+            .saturating_add(vecs)
+            .saturating_add(READ_SLACK)
     }
     /// <= 1000 keys per call (R2 delete_multiple).
     pub async fn delete(&self, keys: &[String]) -> Result<(), Error> {
@@ -437,12 +746,14 @@ impl RawWriter {
         let mpu = bucket.inner.create_multipart_upload(&key).execute().await?;
         Ok(Self { mpu, part: Vec::new(), parts: Vec::new() })
     }
-    pub fn append(&mut self, bytes: &[u8]) {
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        room(&mut self.part, PART, bytes.len())?;
         self.part.extend_from_slice(bytes);
+        Ok(())
     }
     pub async fn flush_if_full(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
         while self.part.len() >= PART {
-            let chunk: Vec<u8> = self.part.drain(..PART).collect();
+            let chunk = split_part(&mut self.part, PART)?;
             let n = u16::try_from(self.parts.len().saturating_add(1))
                 .map_err(|_| Error::Limit("too many parts".into()))?;
             budget.charge(1)?;
@@ -458,7 +769,12 @@ impl RawWriter {
             let _ = self.mpu.abort().await;
             return Err(e);
         }
-        budget.charge(1)?;
+        if let Err(e) = budget.charge(1) {
+            // same orphan rule as finish_inner: dropping the writer without
+            // abort leaves the MPU and its parts in R2
+            let _ = self.mpu.abort().await;
+            return Err(e);
+        }
         self.mpu
             .complete(std::mem::take(&mut self.parts))
             .await
@@ -478,6 +794,39 @@ impl RawWriter {
     pub async fn abort(self) {
         let _ = self.mpu.abort().await;
     }
+}
+
+/// The raw byte sink pass A streams `pending/` into — `RawWriter` (R2
+/// multipart) in production, an in-memory Vec under tests.
+pub trait RawOut {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Error>;
+    fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> impl std::future::Future<Output = Result<(), Error>> + 'a;
+}
+impl RawOut for RawWriter {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        RawWriter::append(self, bytes)
+    }
+    async fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> Result<(), Error> {
+        RawWriter::flush_if_full(self, budget).await
+    }
+}
+
+/// The output-pack write surface pass B drives — `PackWriter` (R2 multipart)
+/// in production, an in-memory Vec under tests. Only the incremental
+/// append/flush calls the resolve loop makes are shared; finish/abort stay
+/// on the concrete type.
+pub trait PackOut {
+    fn offset(&self) -> u64;
+    fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error>;
+    fn raw_extend(&mut self, bytes: &[u8]) -> Result<(), Error>;
+    fn raw_entry_done(&mut self, kind: Kind, start: u64) -> Result<(u64, u32), Error>;
+    /// Capacity bytes `room` would add for `extra` incoming bytes — the
+    /// memory guard's preflight size for append paths (0 when it fits).
+    fn growth_bound(&self, extra: usize) -> usize;
+    /// Bytes one `flush_if_full` chunk allocates — the uploaded part the
+    /// guard preflights before the split can grow unchecked.
+    fn chunk_bound(&self) -> usize;
+    fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> impl std::future::Future<Output = Result<(), Error>> + 'a;
 }
 
 /// One normalized pack: one multipart upload, running hash for the trailer (1.2, 6.4).
@@ -549,6 +898,7 @@ impl PackWriter {
     /// Sync; buffers. Returns (offset, len): the `objects` row and the range a reader asks for.
     pub fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error> {
         let start = self.part.len();
+        room(&mut self.part, self.part_size, encoded_bound(data.len()))?;
         codec::encode_entry(kind, data, &mut self.part)?;
         let entry = self.part.get(start..).ok_or_else(|| Error::Internal("part buffer".into()))?;
         let len = u32::try_from(entry.len()).map_err(|_| Error::Limit("entry too long".into()))?;
@@ -578,23 +928,28 @@ impl PackWriter {
     /// GC resume counterpart of `buffered_bytes`: load a persisted tail back into
     /// the buffer. `extra`/`lo`/`hi` fold the tail's already-completed entries back
     /// into the writer's counters (their `ObjRow`s were posted at the yield).
-    pub fn resume_tail(&mut self, bytes: &[u8], extra: u32, lo: u64, hi: u64) {
-        self.offset = self
-            .offset
-            .saturating_sub(self.part.len() as u64)
-            .saturating_add(bytes.len() as u64);
-        self.part.clear();
-        self.part.extend_from_slice(bytes);
-        self.count = self.count.saturating_add(extra);
-        self.commit_lo = self.commit_lo.min(lo);
-        self.commit_hi = self.commit_hi.max(hi);
+    pub fn resume_tail(&mut self, bytes: &[u8], extra: u32, lo: u64, hi: u64) -> Result<(), Error> {
+        let st = TailState {
+            offset: self.offset,
+            count: self.count,
+            commit_lo: self.commit_lo,
+            commit_hi: self.commit_hi,
+        };
+        let st = resume_tail_apply(&mut self.part, self.part_size, bytes, st, extra, lo, hi)?;
+        self.offset = st.offset;
+        self.count = st.count;
+        self.commit_lo = st.commit_lo;
+        self.commit_hi = st.commit_hi;
+        Ok(())
     }
     /// Append raw pack bytes verbatim: any chunk of an entry's `varint header + zlib
     /// body`, exactly as it appeared in the source pack. The caller ends each logical
     /// entry with `raw_entry_done` — checkpoints and index rows must never split one.
-    pub fn raw_extend(&mut self, bytes: &[u8]) {
+    pub fn raw_extend(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        room(&mut self.part, self.part_size, bytes.len())?;
         self.part.extend_from_slice(bytes);
         self.offset = self.offset.saturating_add(bytes.len() as u64);
+        Ok(())
     }
     /// Seal an entry appended via `raw_extend`; `start` was `offset()` before its first
     /// chunk. Returns (offset, len) for the index row — same contract as append_entry.
@@ -611,7 +966,7 @@ impl PackWriter {
     /// Uploads whole uniform parts while the buffer holds that much.
     pub async fn flush_if_full(&mut self, budget: &mut ReqBudget) -> Result<(), Error> {
         while self.part.len() >= self.part_size {
-            let chunk: Vec<u8> = self.part.drain(..self.part_size).collect();
+            let chunk = split_part(&mut self.part, self.part_size)?;
             let n = u16::try_from(self.parts.len().saturating_add(1))
                 .map_err(|_| Error::Limit("too many parts".into()))?;
             budget.charge(1)?;
@@ -620,8 +975,16 @@ impl PackWriter {
         }
         Ok(())
     }
+    /// The memory guard's preflight for `finish` (see `finish_growth`).
+    /// The edge push runs it before finish, while it can still abort the
+    /// upload cleanly; the growth itself is also fallible.
+    pub fn finish_bound(&self) -> usize {
+        finish_growth(&self.part, self.part_size, self.kind.len_in_bytes())
+    }
     /// Trailer, last part, complete. When this returns the pack is durable: section 3 step 1.
-    pub async fn finish(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+    /// Private: the edge push finishes only through `finish_writer` (the
+    /// "grow:writer-finish" preflight), the GC build through `finish_pack`.
+    async fn finish(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
         if let Err(e) = self.finish_inner(budget).await {
             // a dropped MultipartUpload leaves the upload and its parts orphaned in
             // R2 — abort on any mid-finish failure. A failed complete() consumes the
@@ -629,21 +992,27 @@ impl PackWriter {
             let _ = self.mpu.abort().await;
             return Err(e);
         }
-        self.seal(budget).await
+        self.seal(budget, Finish::Ordinary).await
     }
     /// finish() for a resumable caller (the import job): a mid-finish failure —
-    /// a transient part-upload error, a fixed-in-a-later-build check — leaves
-    /// the MPU and its parts alive so the retry resumes the checkpoint and
-    /// re-finishes instead of rebuilding gigabytes of output from scratch.
+    /// a transient part-upload error, a fixed-in-a-later-build check, or a
+    /// budget failure right before complete() — leaves the MPU and its parts
+    /// alive so the retry resumes the checkpoint and re-finishes instead of
+    /// rebuilding gigabytes of output from scratch.
     pub async fn finish_resumable(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
         self.finish_inner(budget).await?;
-        self.seal(budget).await
+        self.seal(budget, Finish::Resumable).await
     }
-    async fn seal(mut self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+    async fn seal(mut self, budget: &mut ReqBudget, mode: Finish) -> Result<PackMeta, Error> {
         let bytes = self
             .offset
             .saturating_add(u64::try_from(self.kind.len_in_bytes()).map_err(|_| Error::Internal("ds".into()))?);
-        budget.charge(1)?;
+        if let Err((e, abort)) = seal_charge(budget, mode) {
+            if abort {
+                let _ = self.mpu.abort().await;
+            }
+            return Err(e);
+        }
         let obj = self
             .mpu
             .complete(std::mem::take(&mut self.parts))
@@ -676,7 +1045,9 @@ impl PackWriter {
             h.update(&self.part);
             h.fin()
         };
-        self.part.extend_from_slice(&trailer);
+        // fallible: a failed trailer growth or split returns the in-band
+        // Limit, and the caller's finish path decides abort vs keep
+        trailer_append(&mut self.part, self.part_size, &trailer)?;
         self.flush_if_full(budget).await?;
         if !self.part.is_empty() {
             let last = std::mem::take(&mut self.part);
@@ -702,6 +1073,7 @@ impl PackWriter {
     pub fn append_stored(&mut self, entry: &[u8]) -> Result<(u64, u32), Error> {
         let (kind, _size, _hlen) = codec::entry_header(entry)?;
         let len = u32::try_from(entry.len()).map_err(|_| Error::Limit("entry too long".into()))?;
+        room(&mut self.part, self.part_size, entry.len())?;
         self.part.extend_from_slice(entry);
         let offset = self.offset;
         self.offset = offset.saturating_add(u64::from(len));
@@ -726,7 +1098,7 @@ impl PackWriter {
         if self.part.len() < self.part_size {
             return Ok(None);
         }
-        let chunk: Vec<u8> = self.part.drain(..self.part_size).collect();
+        let chunk = split_part(&mut self.part, self.part_size)?;
         let n = u16::try_from(self.parts.len().saturating_add(1))
             .map_err(|_| Error::Limit("too many parts".into()))?;
         budget.charge(1)?;
@@ -834,6 +1206,58 @@ impl PackWriter {
     }
 }
 
+/// The GC build's finish — the ordinary abort-on-failure contract, without
+/// the edge push's memory preflight. GC-only: the edge push finishes
+/// through `finish_writer` (the "grow:writer-finish" preflight). The permit
+/// is minted only inside crate::jobs, so this cannot be named from
+/// pack::run.
+pub(crate) async fn finish_pack(out: PackWriter, _permit: crate::jobs::GcPermit, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+    out.finish(budget).await
+}
+
+/// The writer-finish seam, sealed inside this module: `finish_writer` is
+/// the only caller of `finish`, so the "grow:writer-finish" preflight
+/// cannot be skipped by naming the trait's method from outside store.
+mod finish_sealed {
+    use super::{Error, PackMeta, PackWriter};
+    use crate::ReqBudget;
+
+    /// The writer steps `finish_writer` needs: PackWriter in production,
+    /// an in-memory fake in native tests.
+    pub trait FinishWriter {
+        fn finish_bound(&self) -> usize;
+        async fn abort(self);
+        async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error>;
+    }
+    impl FinishWriter for PackWriter {
+        fn finish_bound(&self) -> usize {
+            PackWriter::finish_bound(self)
+        }
+        async fn abort(self) {
+            PackWriter::abort(self).await
+        }
+        async fn finish(self, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+            PackWriter::finish(self, budget).await
+        }
+    }
+
+    /// Finish the pack writer. finish_inner grows the part buffer for the
+    /// trailer and splits one part off it: the "grow:writer-finish" preflight
+    /// prices both while the upload can still abort cleanly. The growth
+    /// itself is fallible too, and finish aborts on its failure. run() needs
+    /// the PackMeta; PackWriter::finish is private, so this preflighted
+    /// wrapper is the only finish run() can reach.
+    #[allow(private_bounds)] // the seal is the point: callers never name FinishWriter
+    pub async fn finish_writer<W: FinishWriter>(out: W, budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+        if let Err(e) = crate::pack::ingest::mem_preflight(budget.lease.as_ref(), out.finish_bound(), "grow:writer-finish") {
+            out.abort().await;
+            return Err(e);
+        }
+        out.finish(budget).await
+    }
+}
+pub(crate) use finish_sealed::finish_writer;
+
 fn i(n: u64) -> Result<V, Error> {
     Ok(V::from(i64::try_from(n).map_err(|_| Error::Internal("u64 to i64".into()))?))
 }
@@ -849,6 +1273,30 @@ pub fn check_params(n: usize) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+impl PackOut for PackWriter {
+    fn offset(&self) -> u64 {
+        self.offset()
+    }
+    fn append_entry(&mut self, kind: Kind, data: &[u8]) -> Result<(u64, u32), Error> {
+        self.append_entry(kind, data)
+    }
+    fn raw_extend(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.raw_extend(bytes)
+    }
+    fn raw_entry_done(&mut self, kind: Kind, start: u64) -> Result<(u64, u32), Error> {
+        self.raw_entry_done(kind, start)
+    }
+    fn growth_bound(&self, extra: usize) -> usize {
+        room_growth(&self.part, self.part_size, extra)
+    }
+    fn chunk_bound(&self) -> usize {
+        self.part_size
+    }
+    async fn flush_if_full<'a>(&'a mut self, budget: &'a mut ReqBudget) -> Result<(), Error> {
+        PackWriter::flush_if_full(self, budget).await
+    }
 }
 
 /// The one `SqlStorage::exec` wrapper — every call site in the crate routes
@@ -1510,5 +1958,462 @@ mod tests {
         let json = r#"{"pos":12,"sha":{"h":[1732584193,4023233417,2562383102,271733878,3285377520],"len":0,"buf":[]},"count":0,"expected":0,"commit_lo":0,"commit_hi":0}"#;
         let ck: WriterCkpt = serde_json::from_str(json).unwrap();
         assert!(matches!(ck.hash().unwrap(), CkptHash::Sha1(_)));
+    }
+
+    /// split_part hands the head off exact-size and keeps the tail in the
+    /// buffer's existing allocation — the chunk held across upload_part
+    /// never retains a part-sized-plus allocation for one part of data,
+    /// and neither branch holds capacity + a second full-size copy.
+    #[test]
+    fn split_part_preserves_bytes_and_tight_tail() {
+        let mut buf: Vec<u8> = (0..41u8).collect();
+        buf.reserve_exact(64); // the part buffer's spare capacity
+        let mut flat = Vec::new();
+        while buf.len() >= 8 {
+            let head = split_part(&mut buf, 8).unwrap();
+            assert_eq!(head.len(), head.capacity(), "uploaded chunk is exact-size");
+            flat.extend_from_slice(&head);
+        }
+        flat.extend_from_slice(&buf);
+        assert_eq!(flat, (0..41u8).collect::<Vec<_>>(), "bytes and order preserved");
+        // buf keeps its allocation — it is the reusable part buffer, not a
+        // leak: the tightness contract is on the returned head
+    }
+
+    /// One branch for every split: the head is always an exact-size copy,
+    /// the tail memmoves down inside the same allocation. A small tail
+    /// (the split_off case the old code special-cased) gets the same tight
+    /// head — the donor's spare capacity never rides along on the upload.
+    #[test]
+    fn split_part_branches_on_tail_vs_head() {
+        // tail (15) > head (8): head exact-size, tail keeps the buffer
+        let mut buf: Vec<u8> = (0..23u8).collect();
+        let cap = buf.capacity();
+        let head = split_part(&mut buf, 8).unwrap();
+        assert_eq!(head, (0..8u8).collect::<Vec<_>>());
+        assert_eq!(head.len(), head.capacity(), "head copy is exact-size");
+        assert_eq!(buf.as_slice(), &(8..23u8).collect::<Vec<_>>()[..]);
+        assert_eq!(buf.capacity(), cap, "tail keeps the part buffer");
+        // tail (2) <= head (8): same form — head exact-size, tail tight
+        let mut buf: Vec<u8> = (0..10u8).collect();
+        let head = split_part(&mut buf, 8).unwrap();
+        assert_eq!(head, (0..8u8).collect::<Vec<_>>());
+        assert_eq!(head.len(), head.capacity(), "head is exact-size, never the donor's spare");
+        assert_eq!(buf.as_slice(), &[8u8, 9]);
+    }
+
+    /// `read_entries_bound` prices the fetch before it allocates: every
+    /// loc's entry copy (`loc.len` each — they all stay alive in the
+    /// result) plus the LARGEST merged-span range buffer under the same
+    /// READ_GAP/READ_SPAN rules read_entries merges by.
+    #[test]
+    fn read_entries_bound_counts_copies_and_max_span() {
+        let id = oid(&"ab".repeat(20)).unwrap();
+        let loc = |pack: &str, off: u64, len: u32| ObjLoc {
+            pack: PackId(pack.into()),
+            idx: 0,
+            offset: off,
+            len,
+            kind: Kind::Blob,
+            size: 1,
+        };
+        // the per-loc vec term: result tuples + the sorted ref vec
+        let per_loc =
+            std::mem::size_of::<(ObjectId, Vec<u8>)>() + std::mem::size_of::<&ObjLoc>();
+        // nothing to read: slack only
+        assert_eq!(Bucket::read_entries_bound(&[]), READ_SLACK);
+        // one loc: its copy + its own span + vec space + slack
+        let one = [(id, loc("p", 100, 1 << 20))];
+        assert_eq!(Bucket::read_entries_bound(&one), (2 << 20) + per_loc + READ_SLACK);
+        // neighbors under READ_GAP merge into ONE span that includes the
+        // gap: 512 KiB + 512 KiB copies, a 1112 KiB range buffer
+        let near = [(id, loc("p", 0, 512 << 10)), (id, loc("p", 600 << 10, 512 << 10))];
+        let far = [(id, loc("p", 0, 512 << 10)), (id, loc("p", 100 << 20, 512 << 10))];
+        assert_eq!(
+            Bucket::read_entries_bound(&near),
+            (1024 << 10) + (1112 << 10) + 2 * per_loc + READ_SLACK
+        );
+        // the same locs far apart never merge: the buffer is one loc's span
+        assert_eq!(
+            Bucket::read_entries_bound(&far),
+            (1024 << 10) + (512 << 10) + 2 * per_loc + READ_SLACK
+        );
+        // a merge candidate whose span would pass READ_SPAN splits: the
+        // buffer stays one <= READ_SPAN span, not the whole 8.1 MiB extent
+        let split = [
+            (id, loc("p", 0, 4 << 20)),
+            (id, loc("p", (4 << 20) + (100 << 10), 4 << 20)),
+        ];
+        assert_eq!(Bucket::read_entries_bound(&split), (12 << 20) + 2 * per_loc + READ_SLACK);
+        // different packs never merge even when their ranges overlap:
+        // two 1 MiB copies, one 1 MiB buffer — a wrong merge would read 1.5 MiB
+        let packs = [(id, loc("a", 0, 1 << 20)), (id, loc("b", 512 << 10, 1 << 20))];
+        assert_eq!(Bucket::read_entries_bound(&packs), (3 << 20) + 2 * per_loc + READ_SLACK);
+    }
+
+    /// room grows capacity in whole-part steps — never Vec's doubling past
+    /// one part plus the pending append.
+    #[test]
+    fn room_bounds_capacity_to_part_multiple() {
+        let mut buf = vec![0u8; 16];
+        room(&mut buf, 8, 1).unwrap(); // need 17 -> target 24, doubling would give 32
+        assert!(buf.capacity() >= 17 && buf.capacity() < 32, "cap={}", buf.capacity());
+        let mut buf = Vec::new();
+        room(&mut buf, 8, 3).unwrap(); // small need -> one whole part
+        assert!(buf.capacity() >= 3 && buf.capacity() <= 16, "cap={}", buf.capacity());
+        room(&mut buf, 8, 5).unwrap(); // need 5 still fits the reserved part -> no regrow
+        assert!(buf.capacity() <= 16, "cap={}", buf.capacity());
+    }
+
+    /// A budget failure at the seal aborts an ordinary finish's
+    /// upload but KEEPS a resumable finish's checkpointed upload, so the
+    /// import retry resumes instead of rebuilding its output.
+    #[test]
+    fn seal_budget_failure_aborts_only_ordinary_finish() {
+        let spent = || {
+            let mut b = ReqBudget::paid();
+            b.used = b.max_subrequests;
+            b
+        };
+        let (e, abort) = seal_charge(&mut spent(), Finish::Ordinary).unwrap_err();
+        assert!(matches!(e, Error::Budget));
+        assert!(abort, "an ordinary finish aborts its upload");
+        let (e, abort) = seal_charge(&mut spent(), Finish::Resumable).unwrap_err();
+        assert!(matches!(e, Error::Budget));
+        assert!(!abort, "a resumable finish keeps its checkpointed upload");
+        let mut fresh = ReqBudget::paid();
+        assert!(seal_charge(&mut fresh, Finish::Resumable).is_ok());
+        assert!(seal_charge(&mut fresh, Finish::Ordinary).is_ok());
+        assert_eq!(fresh.used, 2, "the seal charges exactly one subrequest");
+    }
+
+    /// The preflight is the NEW block. A retained 16 MiB
+    /// buffer growing to 24 MiB allocates the full 24 MiB before it frees
+    /// the old 16 MiB, so the bound is 24 MiB plus overhead — not the
+    /// 8 MiB net delta. The old 16 MiB is already in the live reading, so
+    /// counting it again would reject growth that fits.
+    #[test]
+    fn room_growth_counts_only_the_new_block() {
+        const MIB: usize = 1 << 20;
+        let mut buf: Vec<u8> = vec![0; 16 * MIB];
+        let cap = buf.capacity();
+        // need 16 MiB + 1 -> target 24 MiB in 8 MiB parts
+        assert_eq!(room_target(buf.len(), cap, 8 * MIB, 1), 24 * MIB);
+        assert_eq!(room_growth(&buf, 8 * MIB, 1), 24 * MIB + ALLOC_OVERHEAD);
+        // the bound covers the new block room really allocates; the old
+        // block is already in the live reading the guard adds this to
+        let want = room_growth(&buf, 8 * MIB, 1);
+        room(&mut buf, 8 * MIB, 1).unwrap();
+        assert!(buf.capacity() <= want, "new block {} > bound {want}", buf.capacity());
+        assert!(want < cap + buf.capacity(), "the old block must not be counted twice");
+        // a fit allocates nothing and preflights nothing
+        buf.truncate(MIB);
+        assert_eq!(room_growth(&buf, 8 * MIB, MIB), 0);
+        // an empty buffer pays its first part plus overhead only
+        assert_eq!(room_growth(&Vec::new(), 8 * MIB, 3), 8 * MIB + ALLOC_OVERHEAD);
+        assert_eq!(growth_incoming(7), 7 + ALLOC_OVERHEAD);
+    }
+
+    /// encoded_bound stays above the encoder's real output at the object
+    /// cap: 16 MiB of incompressible bytes is deflate's worst case, and a
+    /// bound that lands short lets `room` under-reserve so `extend` falls
+    /// back to Vec's doubling — a part-buffer spike the guard can't see.
+    /// The finish path's growth. An 8 MiB buffer holding just
+    /// under one part grows to 16 MiB for a 20-byte trailer, then splits
+    /// one 8 MiB part off. The bound names both blocks. A tail that stays
+    /// under one part with the trailer needs neither.
+    #[test]
+    fn finish_growth_counts_trailer_growth_and_split() {
+        const MIB: usize = 1 << 20;
+        let mut part: Vec<u8> = Vec::with_capacity(8 * MIB);
+        part.resize(8 * MIB - 1, 0);
+        assert_eq!(part.capacity(), 8 * MIB);
+        assert_eq!(
+            finish_growth(&part, 8 * MIB, 20),
+            growth_incoming(16 * MIB) + growth_incoming(8 * MIB)
+        );
+        // the real finish allocations stay inside the bound
+        let want = finish_growth(&part, 8 * MIB, 20);
+        room(&mut part, 8 * MIB, 20).unwrap();
+        part.extend_from_slice(&[1u8; 20]);
+        let grown = part.capacity();
+        let head = split_part(&mut part, 8 * MIB).unwrap();
+        assert!(grown + head.capacity() <= want, "{} > {want}", grown + head.capacity());
+        // a small tail: the trailer fits the capacity and no split runs
+        let mut small: Vec<u8> = Vec::with_capacity(8 * MIB);
+        small.resize(MIB, 0);
+        assert_eq!(finish_growth(&small, 8 * MIB, 20), 0);
+        // exactly one part with the trailer: no growth, one split
+        let mut exact: Vec<u8> = Vec::with_capacity(8 * MIB);
+        exact.resize(8 * MIB - 20, 0);
+        assert_eq!(finish_growth(&exact, 8 * MIB, 20), growth_incoming(8 * MIB));
+    }
+
+    /// The writer's growth and split fail in-band, never panic, when the
+    /// allocator refuses the block — and leave the buffer as it was.
+    #[test]
+    fn writer_growth_and_split_fail_in_band() {
+        let _guard = crate::try_grow::HookGuard;
+        let mut part: Vec<u8> = vec![7u8; 100];
+        crate::try_grow::fail_above(Some(150));
+        let grow = room(&mut part, 64, 100);
+        crate::try_grow::fail_above(Some(10));
+        let split_refused = split_part(&mut part, 50);
+        crate::try_grow::fail_above(Some(150));
+        let split = split_part(&mut part, 99);
+        assert!(crate::try_grow::is_retry(&grow.unwrap_err()), "a 256-byte block over a 150-byte cap");
+        assert!(crate::try_grow::is_retry(&split_refused.unwrap_err()));
+        assert_eq!(split.unwrap().len(), 99, "a 99-byte head fits the cap, the refused split left all 100 bytes");
+        assert_eq!(part, vec![7u8; 1]);
+    }
+
+    #[test]
+    fn encoded_bound_covers_incompressible_max_obj() {
+        let mut data = vec![0u8; MAX_OBJECT as usize];
+        // xorshift64* — deterministic and incompressible to deflate
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for b in &mut data {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *b = (x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as u8;
+        }
+        let mut enc = Vec::new();
+        codec::encode_entry(Kind::Blob, &data, &mut enc).unwrap();
+        assert!(
+            encoded_bound(data.len()) >= enc.len(),
+            "bound {} < encoded {}",
+            encoded_bound(data.len()),
+            enc.len()
+        );
+    }
+
+    impl BodyChunk for Vec<u8> {
+        fn len(&self) -> usize {
+            self.as_slice().len()
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            dst.copy_from_slice(self);
+        }
+    }
+    impl BodyChunk for &[u8] {
+        fn len(&self) -> usize {
+            <[u8]>::len(self)
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            dst.copy_from_slice(self);
+        }
+    }
+
+    /// A chunk that counts its copies, so a test can see that none ran.
+    struct Counted(Vec<u8>, std::rc::Rc<std::cell::Cell<usize>>);
+    impl BodyChunk for Counted {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn copy_into(&self, dst: &mut [u8]) {
+            self.1.set(self.1.get() + 1);
+            dst.copy_from_slice(&self.0);
+        }
+    }
+
+    /// A body stream that counts its polls and can panic when polled.
+    struct Probe<C> {
+        items: std::collections::VecDeque<C>,
+        polls: std::rc::Rc<std::cell::Cell<usize>>,
+        panic_on_poll: bool,
+    }
+    impl<C: Unpin> futures_util::Stream for Probe<C> {
+        type Item = Result<C, Error>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            assert!(!self.panic_on_poll, "the body stream must not be polled");
+            self.polls.set(self.polls.get() + 1);
+            std::task::Poll::Ready(self.items.pop_front().map(Ok))
+        }
+    }
+    fn probe<C>(items: Vec<C>) -> (Probe<C>, std::rc::Rc<std::cell::Cell<usize>>) {
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+        (Probe { items: items.into(), polls: polls.clone(), panic_on_poll: false }, polls)
+    }
+    fn ready<F: std::future::Future>(f: F) -> F::Output {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(f).poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("fill_exact over a ready stream must not pend"),
+        }
+    }
+
+    /// The R2 read reserves `want` BEFORE it touches the body: with the
+    /// fail hook just below `want`, the answer is the in-band memory
+    /// Limit, the stream is never polled, and no chunk is copied. Draining
+    /// chunks first, as the old reader did, panics in the probe.
+    #[test]
+    fn fill_exact_reserves_before_polling_the_body() {
+        let _guard = crate::try_grow::HookGuard;
+        let want = 4096;
+        let copies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (mut s, polls) = probe(vec![Counted(vec![7; want], copies.clone())]);
+        s.panic_on_poll = true;
+        crate::try_grow::fail_above(Some(want - 1));
+        let r = ready(fill_exact(want, s));
+        let err = r.unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert_eq!(polls.get(), 0, "the stream must not be polled");
+        assert_eq!(copies.get(), 0, "no chunk may be copied");
+    }
+
+    /// An over-length body fails at the first chunk that passes `want`:
+    /// that chunk is not copied and later chunks are not polled.
+    #[test]
+    fn fill_exact_rejects_an_over_length_body_at_once() {
+        let copies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let c = |b: &[u8]| Counted(b.to_vec(), copies.clone());
+        let (s, polls) = probe(vec![c(&[1, 2]), c(&[3, 4, 5]), c(&[6]), c(&[7])]);
+        let err = ready(fill_exact(4, s)).unwrap_err();
+        assert!(matches!(&err, Error::Storage(m) if m == "r2 body longer than 4"), "{err}");
+        assert_eq!(polls.get(), 2, "the stream must stop at the overflowing chunk");
+        assert_eq!(copies.get(), 1, "the overflowing chunk must not be copied");
+    }
+
+    /// A body that ends short of `want` is the Storage error.
+    #[test]
+    fn fill_exact_rejects_a_short_body() {
+        let (s, _) = probe(vec![vec![1u8, 2], vec![3]]);
+        let err = ready(fill_exact(5, s)).unwrap_err();
+        assert!(matches!(&err, Error::Storage(m) if m == "r2 body 3 bytes, wanted 5"), "{err}");
+    }
+
+    /// An exact multi-chunk body returns its bytes in order, an empty
+    /// chunk included.
+    #[test]
+    fn fill_exact_joins_an_exact_multi_chunk_body() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let parts: Vec<&[u8]> = vec![&data[..1], &data[1..4096], &data[4096..4096], &data[4096..]];
+        let (s, polls) = probe(parts);
+        assert_eq!(ready(fill_exact(data.len(), s)).unwrap(), data);
+        assert_eq!(polls.get(), 5, "four chunks, then the end");
+    }
+
+    /// want == 0: an empty stream, or one with only empty chunks, is an
+    /// empty body. Any byte is over-length.
+    #[test]
+    fn fill_exact_handles_a_zero_length_body() {
+        let (s, _) = probe(Vec::<Vec<u8>>::new());
+        assert!(ready(fill_exact(0, s)).unwrap().is_empty());
+        let (s, _) = probe(vec![Vec::<u8>::new()]);
+        assert!(ready(fill_exact(0, s)).unwrap().is_empty());
+        let (s, _) = probe(vec![vec![1u8]]);
+        assert!(matches!(ready(fill_exact(0, s)), Err(Error::Storage(_))));
+    }
+
+    /// resume_tail_apply reserves the cleared buffer's room BEFORE
+    /// clearing: a refused reservation is the in-band Limit and the part
+    /// bytes stay exactly as they were — the writer's offset/count/commit
+    /// counters, which the caller only writes on Ok, are untouched by
+    /// construction. On success the returned tuple carries the folded
+    /// counters and the part holds only the new tail.
+    #[test]
+    fn resume_tail_reserves_before_clearing() {
+        let _guard = crate::try_grow::HookGuard;
+        // a buffer with a live tail to lose if the order were wrong
+        let mut part: Vec<u8> = Vec::with_capacity(4 * 1024);
+        part.extend_from_slice(&[9u8; 100]);
+        let (offset, count, lo, hi) = (500u64, 3u32, 10u64, 20u64);
+        let tail = vec![7u8; 5 * 1024]; // bigger than the 4 KiB capacity -> must reserve
+        // the cleared buffer needs one whole 8 KiB part — over capacity —
+        // refuse anything under it
+        let st = TailState { offset, count, commit_lo: lo, commit_hi: hi };
+        crate::try_grow::fail_above(Some(2 * 1024));
+        let e = resume_tail_apply(&mut part, 8 * 1024, &tail, st, 1, 5, 30).unwrap_err();
+        crate::try_grow::fail_above(None);
+        assert!(crate::try_grow::is_retry(&e), "{e}");
+        assert_eq!(part, vec![9u8; 100], "a refused reservation must not clear the part");
+        // success: part holds only the tail; counters fold correctly
+        let st = resume_tail_apply(&mut part, 8 * 1024, &tail, st, 1, 5, 30).unwrap();
+        assert_eq!(part, tail);
+        assert_eq!(
+            (st.offset, st.count, st.commit_lo, st.commit_hi),
+            (offset - 100 + tail.len() as u64, 4, 5, 30)
+        );
+    }
+    /// The per-entry copy `read_entries` makes is fallible: a refused
+    /// reservation is the in-band Limit.
+    #[test]
+    fn located_entry_copies_fallibly() {
+        let _guard = crate::try_grow::HookGuard;
+        let e = (
+            ObjectId::from_bytes_or_panic(&[9u8; 20]),
+            ObjLoc {
+                pack: PackId("p".into()),
+                idx: 0,
+                offset: 4,
+                len: 3,
+                kind: gix_object::Kind::Blob,
+                size: 3,
+            },
+        );
+        let bytes = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
+        crate::try_grow::fail_above(Some(2));
+        let err = located_entry(&bytes, &&e, 0, "k").unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        crate::try_grow::fail_above(None);
+        assert_eq!(located_entry(&bytes, &&e, 0, "k").unwrap().1, vec![4, 5, 6]);
+    }
+
+    /// A writer that records whether finish or abort ran.
+    struct FakeOut {
+        bound: usize,
+        done: std::rc::Rc<std::cell::Cell<&'static str>>,
+    }
+    impl super::finish_sealed::FinishWriter for FakeOut {
+        fn finish_bound(&self) -> usize {
+            self.bound
+        }
+        async fn abort(self) {
+            self.done.set("abort");
+        }
+        async fn finish(self, _budget: &mut ReqBudget) -> Result<PackMeta, Error> {
+            self.done.set("finish");
+            Ok(PackMeta::EMPTY)
+        }
+    }
+
+    /// A refused finish preflight aborts the upload and never finishes;
+    /// the refusal still records the "grow:writer-finish" tag priced at
+    /// the writer's finish_bound — deleting the preflight inside
+    /// finish_writer fails both halves here.
+    #[test]
+    fn finish_writer_refusal_aborts_the_upload() {
+        let _guard = crate::try_grow::HookGuard;
+        crate::mem::set_live_override(Some(std::rc::Rc::new(|| 200 << 20)));
+        crate::pack::ingest::clear_preflights();
+        let done = std::rc::Rc::new(std::cell::Cell::new(""));
+        let mut budget = ReqBudget::paid();
+        let res = ready(super::finish_writer(FakeOut { bound: 1 << 20, done: done.clone() }, &mut budget));
+        assert!(matches!(res, Err(Error::Limit(_))), "a refused finish preflight is the Limit");
+        assert_eq!(done.get(), "abort");
+        assert_eq!(
+            crate::pack::ingest::preflight_sites(),
+            vec![("grow:writer-finish", 1 << 20)],
+            "the finish preflight records its tag and the writer's finish_bound"
+        );
+    }
+
+    /// The trailer's room check is fallible: without it the append would
+    /// grow the part buffer infallibly past the part bound.
+    #[test]
+    fn trailer_append_reserves_fallibly() {
+        let _guard = crate::try_grow::HookGuard;
+        let trailer = vec![0u8; 100];
+        let mut part = vec![0u8; 64];
+        crate::try_grow::fail_above(Some(50));
+        let err = trailer_append(&mut part, 8 << 20, &trailer).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        crate::try_grow::fail_above(None);
+        trailer_append(&mut part, 8 << 20, &trailer).unwrap();
+        assert_eq!(part.len(), 164);
     }
 }

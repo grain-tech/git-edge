@@ -189,6 +189,10 @@ footprint.
   failpoints, server-side fsck over index+R2. Dev server needs
   `GE_TEST_HOOKS=1 GE_TEST_MANUAL_JOBS=1 GE_GC_QUIET_MS=0 GE_GC_GRACE_MS=0`;
   see tests/harness/README.md.
+- Compiled-worker edge test (no Cloudflare): `tests/worker/run.sh` —
+  `worker-build --release` in `server/`, then Node drives the real `fetch`
+  entrypoint over a pull-based request stream; `GE_SKIP_BUILD=1` reuses
+  `server/build`.
 - **Workflow rules**: commit/push/PR via `/atlas-engineering:commit-push-pr`;
   no PR template → fallback Summary/Changes/Testing format. Do NOT run
   `cargo fmt` globally — repo is not rustfmt-clean, it creates noise. Never
