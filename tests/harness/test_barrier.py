@@ -451,12 +451,18 @@ class Barrier(unittest.TestCase):
         """§11.4 / §4.7 M4: a stray gc_mark while the chain sits at phase=sweep
         must be a no-op — marked untouched, phase unmoved, no second
         consolidate. Legacy then aborts on moved refs at the sweep fence;
-        barrier mode has no walk fence, so the chain survives."""
+        barrier mode has no walk fence, so the chain survives.
+
+        Each arm sets the gc_barrier knob. Without a 0 on the legacy arms
+        the chain takes the server's GE_GC_BARRIER default, and a server
+        started with GE_GC_BARRIER=1 runs a barrier chain for both."""
         for barrier in (False, True):
             with self.subTest(barrier=barrier):
                 r = repo("phase-%s" % ("barrier" if barrier else "legacy"))
                 if barrier:
                     barrier_on(r)
+                else:
+                    ge.knob(r.name, "gc_barrier", 0)
                 seed(r, 2)
                 step_until(r, "gc_mark", {"done"})
                 step_until(r, "gc_consolidate", {"done"}, limit=10)
@@ -484,6 +490,7 @@ class Barrier(unittest.TestCase):
         # legacy arm: refs moved between build and sweep -> the sweep fence
         # aborts the chain and wipes gc.*
         r = repo("phase-legacy-moved")
+        ge.knob(r.name, "gc_barrier", 0)
         seed(r, 2)
         step_until(r, "gc_mark", {"done"})
         step_until(r, "gc_consolidate", {"done"}, limit=10)
@@ -603,8 +610,14 @@ class Barrier(unittest.TestCase):
 
     def test_keep_flagoff_abort_deadmarks_newpack(self):
         """Flag OFF, ordinary refs-moved sweep abort: gc.new_pack is
-        dead-marked exactly like PR4 — the keep rule changes nothing here."""
+        dead-marked exactly like PR4 — the keep rule changes nothing here.
+
+        The knob pins the mode to off. Without it the chain takes the
+        server's GE_GC_BARRIER default, and a server started with
+        GE_GC_BARRIER=1 runs a barrier chain, which has no walk fence
+        and does not abort the sweep on moved refs."""
         r = repo("keep-flagoff")
+        ge.knob(r.name, "gc_barrier", 0)
         seed(r, 2)
         step_until(r, "gc_mark", {"done"})
         step_until(r, "gc_consolidate", {"done"}, limit=10)
@@ -837,8 +850,14 @@ class Barrier(unittest.TestCase):
     def test_flagoff_pending_and_gen1_stay_empty(self):
         """§1: with the barrier knob OFF a full push+GC cycle writes no
         gc_pending rows and no gen=1 frontier rows — the schema additions
-        are inert."""
+        are inert.
+
+        The knob pins the mode to off. Without it the chain takes the
+        server's GE_GC_BARRIER default, and a server started with
+        GE_GC_BARRIER=1 runs a barrier chain, whose pending and gen-1
+        rows are the opposite of this contract."""
         r = repo("flagoff")
+        ge.knob(r.name, "gc_barrier", 0)
         seed(r, 2)
         ge.knob(r.name, "slice_subreqs", 1)
         s = ge.step(r.name, "gc_mark")
