@@ -281,7 +281,9 @@ class Swap(unittest.TestCase):
         tb.barrier_on(r)
         tb.seed(r, 2)
         b = orphan_commit(r, "b")
+        before = live_ids(r)
         ge.git("push", "-q", r.url, "%s:refs/heads/b0" % b, cwd=r.dir)
+        p0 = next(p["id"] for p in tgs.live_packs(r) if p["id"] not in before)
         a = orphan_commit(r, "a", parent=b)
         c = orphan_commit(r, "c")
         before = live_ids(r)
@@ -297,9 +299,16 @@ class Swap(unittest.TestCase):
             r.name, [(ZERO, c, "refs/heads/c")], ge.empty_pack())
         self.assertIn(b"ok refs/heads/c", body,
                       "%r" % ge.redact(body[:300].decode("utf-8", "replace")))
+        epoch0 = epoch(r)
         finish_chain(r, limit=60)
         self.assertEqual(packs_by_id(r)[p1]["state"], "live",
                          "resurrected pack was retired: %r" % packs_by_id(r)[p1])
+        # B's lossy pack is held back while P1 stays, and nothing left the
+        # live set, so pushes in flight stay valid
+        self.assertEqual(packs_by_id(r)[p0]["state"], "live",
+                         "lossy pack retired beside a kept one: %r" % packs_by_id(r)[p0])
+        self.assertFalse(ge.last_swap(r.name)["lossy"], "%r" % ge.last_swap(r.name))
+        self.assertEqual(epoch(r), epoch0, "a swap that dropped nothing moved gc_epoch")
         f = ge.fsck(r.name, "all")
         self.assertTrue(f["ok"], "a live pack references a dead object: %r" % f)
         st, body = ge.receive_pack(
