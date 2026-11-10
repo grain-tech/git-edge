@@ -269,6 +269,49 @@ class Swap(unittest.TestCase):
         tgs.gc_drain(r, limit=120)
         assert_clean(self, r)
 
+    def test_partial_retire_keeps_live_closure(self):
+        """§2.5 across a partial swap: cohort pack P1 holds A (parent B) and
+        C, cohort pack P0 holds B; all three are garbage at the snapshot.
+        After the build a ref to C lands, so P1 is kept, and P0 is lossy.
+        A swap that still retires P0 leaves A in a live pack pointing at a
+        dead B: a later ref-only create of A passes the tip check and
+        publishes a broken history. Every live pack must stay closed, so the
+        ref to A must either be refused or read back whole."""
+        r = repo("partial-closure")
+        tb.barrier_on(r)
+        tb.seed(r, 2)
+        b = orphan_commit(r, "b")
+        ge.git("push", "-q", r.url, "%s:refs/heads/b0" % b, cwd=r.dir)
+        a = orphan_commit(r, "a", parent=b)
+        c = orphan_commit(r, "c")
+        before = live_ids(r)
+        # b0 is still advertised, so this pack carries A without B
+        ge.git("push", "-q", r.url, "%s:refs/heads/a0" % a,
+               "%s:refs/heads/c0" % c, cwd=r.dir)
+        p1 = next(p["id"] for p in tgs.live_packs(r) if p["id"] not in before)
+        ge.git("push", "-q", r.url, ":refs/heads/a0", ":refs/heads/b0",
+               ":refs/heads/c0", cwd=r.dir)
+        cutoff_now(r)
+        tb.to_stage(r, "presweep")
+        st, body = ge.receive_pack(
+            r.name, [(ZERO, c, "refs/heads/c")], ge.empty_pack())
+        self.assertIn(b"ok refs/heads/c", body,
+                      "%r" % ge.redact(body[:300].decode("utf-8", "replace")))
+        finish_chain(r, limit=60)
+        self.assertEqual(packs_by_id(r)[p1]["state"], "live",
+                         "resurrected pack was retired: %r" % packs_by_id(r)[p1])
+        f = ge.fsck(r.name, "all")
+        self.assertTrue(f["ok"], "a live pack references a dead object: %r" % f)
+        st, body = ge.receive_pack(
+            r.name, [(ZERO, a, "refs/heads/a")], ge.empty_pack())
+        if b"ok refs/heads/a" in body:
+            clone = r.clone("-a")
+            self.assertEqual(ge.git("rev-parse", "refs/remotes/origin/a",
+                                    cwd=clone).stdout.strip(), a)
+            ge.git("fsck", "--strict", cwd=clone)
+        tgs.gc_drain(r, limit=120)
+        assert_clean(self, r)
+
     # -- §6.3: lossless keeps the epoch, lossy bumps it; in-flight push -----
 
     def test_lossless_swap_keeps_epoch(self):
