@@ -1792,6 +1792,31 @@ mod tests {
         assert!(body.buffered().is_empty(), "a refused growth buffers nothing");
     }
 
+    /// A refused buffer growth must leave the pending chunk on the
+    /// reader: the retried fill resumes it and the body arrives whole,
+    /// in order — a dropped pending chunk would hole the body.
+    #[test]
+    fn body_fill_refused_growth_keeps_the_pending_chunk() {
+        let _guard = crate::try_grow::HookGuard;
+        let data: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+        let chunks = vec![data[..100].to_vec(), data[100..].to_vec()];
+        let mut reader = BodyReader::from_chunks(chunks, None);
+        crate::try_grow::fail_above(Some(50));
+        let err = block_on(reader.fill(1)).unwrap_err();
+        assert!(crate::try_grow::is_retry(&err), "{err}");
+        assert!(
+            reader.buffered().is_empty(),
+            "a refused growth buffers nothing"
+        );
+        crate::try_grow::fail_above(None);
+        assert!(block_on(reader.fill(data.len())).unwrap());
+        assert_eq!(
+            reader.buffered(),
+            &data[..],
+            "the retried fill lost the pending chunk"
+        );
+    }
+
     /// A chunked upload-pack body (no Content-Length) is capped WHILE it
     /// streams: 64 x 64 KiB refuses with the Limit error after ~1 MiB has
     /// been pulled — reader.total proves the refusal did not wait for EOF.
