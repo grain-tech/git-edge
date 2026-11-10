@@ -413,6 +413,9 @@ fn pick_row(d: &RepoDo, pick: Pick) -> Result<Option<JobRow>, Error> {
 
 async fn dispatch_inner(d: &RepoDo, pick: Pick) -> Result<Option<Report>, Error> {
     let Some(r) = pick_row(d, pick)? else { return Ok(None) };
+    // Build the budget before claiming the row. A hooks-on knob read error
+    // in fresh() must not leave the job running with no outcome span.
+    let mut budget = SliceBudget::fresh(d)?;
     let now = platform::now_ms();
     // mark running + record started_at (A12) + a lease token in one sync span. The
     // lease survives heartbeats (which rewrite started_at) and fences the outcome
@@ -440,7 +443,6 @@ async fn dispatch_inner(d: &RepoDo, pick: Pick) -> Result<Option<Report>, Error>
     let repo = platform::do_id_name(&d.state).unwrap_or_else(|| "-".into());
     let attempt = job.attempts.saturating_add(1);
     platform::job_event(&d.env, &repo, job.kind.as_str(), "start", "ok", attempt, 0, false, "");
-    let mut budget = SliceBudget::fresh(d)?;
     let out = run_slice(d, &job, &mut budget).await;
     // a "crash" failpoint is a simulated isolate death (testhooks.rs): return
     // now, WITHOUT the outcome span — the row stays 'running' holding its lease

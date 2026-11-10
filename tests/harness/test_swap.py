@@ -1021,6 +1021,7 @@ class Swap(unittest.TestCase):
                                      % packs[new_pack1])
                 # a later quiesced chain swaps — the counter resets
                 tb.to_stage(r, "presweep")
+                th.assert_barrier(self, r, True)
                 finish_chain(r, limit=80)
                 swap = ge.last_swap(r.name)
                 self.assertIsNotNone(swap, "no post-fallback swap")

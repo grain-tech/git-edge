@@ -464,7 +464,7 @@ pub fn jobs_view(d: &RepoDo) -> Result<Response, Error> {
     json(view(d)?)
 }
 
-/// Lazily created by set_knob — deliberately NOT in the production schema list.
+/// Lazily created by knob() on read and by set_knob — deliberately NOT in the production schema list.
 const KNOBS_DDL: &str = "CREATE TABLE IF NOT EXISTS test_knobs(name TEXT PRIMARY KEY, value INTEGER)";
 
 /// Named integer knobs (slice_subreqs, gc_part_bytes, max_live_packs, gc_barrier).
