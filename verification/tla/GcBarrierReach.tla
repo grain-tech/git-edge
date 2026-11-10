@@ -1,0 +1,47 @@
+-------------------------- MODULE GcBarrierReach --------------------------
+(***************************************************************************)
+(* Vacuity guards for GcBarrier. Each Reach_* is the negation of a state   *)
+(* the clean model must be able to reach, so verify.sh expects TLC to      *)
+(* report each one as violated. If a model edit makes a hazard            *)
+(* unreachable, the clean checks would still pass; these fail instead.     *)
+(***************************************************************************)
+EXTENDS GcBarrier
+
+(* the thin push landed main -> c2, and a later sweep still retired P0:
+   c1 and b were copied into a build pack first *)
+Reach_LandThenRetire ==
+  ~(refs["main"] = "c2" /\ packs["P0"] = "dead" /\ phase = "idle")
+
+(* a non-atomic push lost its CAS, its pack went live, and P0 was still
+   retired safely afterwards *)
+Reach_LoserThenRetire ==
+  ~(push.st = "committed" /\ ~push.cas /\ packs["P0"] = "dead")
+
+(* barrier drain: b was marked after the built snapshot, so the swap
+   must keep P0 *)
+Reach_DrainMarksNew ==
+  ~(phase = "sweep" /\ "b" \in marked /\ "b" \notin built)
+
+(* the bare push landed g -> b while a chain stood *)
+Reach_BareLandsMidChain ==
+  ~(refs["g"] = "b" /\ phase \in {"walking", "build", "sweep"})
+
+(* a sweep hit an Err after its dead-mark, and the chain still ended with
+   a live build pack as the surviving copy *)
+Reach_ErrThenSurvivor ==
+  ~(errs = 1 /\ phase = "idle" /\ packs["P0"] = "dead"
+    /\ \E n \in {"N1", "N2", "N3"} : packs[n] = "live")
+
+(* the gc_epoch check rejected the push *)
+Reach_EpochReject ==
+  ~(push.st = "rejected")
+
+(* an in-flight fetch planned a pack that has since died *)
+Reach_FetchOutlivesPack ==
+  ~(fetch.st = "planned" /\ \E p \in fetch.plan : packs[p] = "dead")
+
+(* the barrier delta arm handed off to build with the frontier not empty *)
+Reach_DeltaHandoff ==
+  ~(phase = "build" /\ ~FrontierEmpty)
+
+=============================================================================
