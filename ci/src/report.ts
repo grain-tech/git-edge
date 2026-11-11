@@ -6,8 +6,8 @@
 export const MAX_LOG_CHARS = 10 * 1024 * 1024;
 
 /** A report body over this many bytes is refused. readTail keeps only the
- * tail, so memory stays near MAX_LOG_CHARS whatever the body size; the cap
- * only bounds how long one report can stream. */
+ * tail, so memory is a few copies of MAX_LOG_CHARS whatever the body size
+ * (see ci/README.md); the cap only bounds how long one report can stream. */
 export const MAX_REPORT_BYTES = 256 * 1024 * 1024;
 
 const marker = (keep: number) => `[log truncated to its last ${keep} characters]\n`;
