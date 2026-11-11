@@ -39,7 +39,11 @@ d = pathlib.Path(sys.argv[1])
 sys.path.insert(0, str(d))
 names = sorted(p.stem for p in d.glob("test_*.py") if p.stem != "test_hooks_off")
 loader = unittest.TestLoader()
-suite = loader.loadTestsFromNames(names)
+try:
+    suite = loader.loadTestsFromNames(names)
+except Exception as e:
+    print("cannot load the harness tests: %r" % e, file=sys.stderr)
+    sys.exit(1)
 if loader.errors or not names:
     print("cannot load the harness tests: %r" % (loader.errors or "none found"), file=sys.stderr)
     sys.exit(1)
@@ -49,10 +53,17 @@ PY
 
 # check_harness_output <file> <expected>: the unittest summary in file shows
 # exactly expected tests, at least HARNESS_MIN_TESTS, and a bare OK.
+# Test stdout is block-buffered and can land after unittest's stderr
+# summary, so the file must hold exactly one "Ran N tests" line, and the
+# status is the first non-empty line after it, never just the last match.
 check_harness_output() {
-  local out="$1" want="$2" ran status
-  ran="$(sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' "$out" | tail -n 1)"
-  status="$(grep -E '^(OK|FAILED)( \(.*\))?$' "$out" | tail -n 1)"
+  local out="$1" want="$2" ran status runs
+  runs="$(grep -cE '^Ran [0-9]+ tests? in ' "$out")"
+  if [ "$runs" -gt 1 ]; then
+    echo "harness count: $runs 'Ran N tests' lines, want exactly one"; return 1
+  fi
+  ran="$(sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' "$out")"
+  status="$(awk 'f && NF { print; exit } /^Ran [0-9]+ tests? in /{ f = 1 }' "$out")"
   if ! [[ "$want" =~ ^[0-9]+$ ]]; then
     echo "harness count: no expected count"; return 1
   fi

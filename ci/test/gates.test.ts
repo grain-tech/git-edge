@@ -35,6 +35,8 @@ test("gates: a harness run passes only with every expected test run and a bare O
     ["Ran 90 tests in 12.3s\n\nOK\n", "90", /fewer than the minimum/],
     ["OK\n", "97", /no 'Ran N tests'/],
     ["Ran 97 tests in 12.3s\n\nOK\n", "", /no expected count/],
+    ["Ran 97 tests in 12.3s\n\nFAILED (failures=1)\nOK\n", "97", /bare OK/],
+    ["Ran 97 tests in 12.3s\n\nFAILED (failures=1)\nRan 97 tests in 1s\n\nOK\n", "97", /exactly one/],
   ] as const) {
     const r = check(summary, want);
     assert.equal(r.ok, false, summary);
