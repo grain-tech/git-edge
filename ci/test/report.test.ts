@@ -32,6 +32,27 @@ test("readTail: keeps only the tail while streaming, across many chunks", async 
   assert.equal(await readTail(body(["0123456789".repeat(10)]), 1 << 20, 100), "0123456789".repeat(10), "exactly keep is not truncated");
 });
 
+test("readTail: one chunk longer than the tail is cut, and the result is marked", async () => {
+  const t = (await readTail(body(["x".repeat(1000) + "END"]), 1 << 20, 100))!;
+  assert.equal(t.length, 100);
+  assert.match(t, /^\[log truncated/);
+  assert.ok(t.endsWith("END"));
+  const u = (await readTail(body(["y".repeat(500), "z".repeat(60)]), 1 << 20, 200))!;
+  assert.equal(u.length, 200);
+  assert.ok(u.endsWith("z".repeat(60)));
+});
+
+test("keepTail: never starts the tail on half of a surrogate pair", () => {
+  const m = "[log truncated to its last 100 characters]\n".length;
+  for (let shift = 0; shift < 2; shift++) {
+    const log = "a".repeat(shift) + "😀".repeat(200);
+    const t = keepTail(log, 100);
+    const first = t.charCodeAt(m);
+    assert.ok(!(first >= 0xdc00 && first <= 0xdfff), `shift ${shift}`);
+    assert.ok(t.length <= 100);
+  }
+});
+
 test("readTail: a multi-byte character split across chunks decodes intact", async () => {
   const euro = new TextEncoder().encode("a€b"); // € is 3 bytes
   const t = await readTail(body([euro.slice(0, 2), euro.slice(2)]), 1 << 20, 100);

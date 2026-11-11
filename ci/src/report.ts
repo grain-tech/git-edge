@@ -12,16 +12,23 @@ export const MAX_REPORT_BYTES = 256 * 1024 * 1024;
 
 const marker = (keep: number) => `[log truncated to its last ${keep} characters]\n`;
 
-/** The last `keep` characters of log, marker included. Idempotent. */
-export function keepTail(log: string, keep = MAX_LOG_CHARS): string {
-  if (log.length <= keep) return log;
+/** The last `keep` characters of log, marker included. Idempotent.
+ * `cut` marks a log that already lost its head, even if it now fits. The
+ * cut never splits a surrogate pair. */
+export function keepTail(log: string, keep = MAX_LOG_CHARS, cut = false): string {
+  if (log.length <= keep && !cut) return log;
+  if (log.startsWith(marker(keep)) && log.length <= keep) return log;
   const m = marker(keep);
-  return m + log.slice(log.length - (keep - m.length));
+  let from = Math.max(0, log.length - (keep - m.length));
+  const c = log.charCodeAt(from);
+  if (from > 0 && c >= 0xdc00 && c <= 0xdfff) from++;
+  return m + log.slice(from);
 }
 
 /** Reads a body, decoding as it streams, and keeps only its tail (see
  * keepTail). Whole decoded pieces are dropped from the front once the rest
- * already covers `keep`, so the peak is about two tails, never the whole body.
+ * already covers `keep`, and a piece longer than `keep` is cut to its end,
+ * so the peak is a few tails plus one read chunk, never the whole body.
  * Null when the body is over `cap` bytes, by Content-Length or by count. */
 export async function readTail(req: Request, cap = MAX_REPORT_BYTES, keep = MAX_LOG_CHARS): Promise<string | null> {
   if (Number(req.headers.get("content-length") ?? "0") > cap) return null;
@@ -31,11 +38,22 @@ export async function readTail(req: Request, cap = MAX_REPORT_BYTES, keep = MAX_
   const parts: string[] = [];
   let chars = 0;
   let bytes = 0;
+  let cut = false;
   const add = (s: string) => {
     if (!s) return;
+    if (s.length > keep) {
+      // One piece larger than the tail: keep its end only, never the whole.
+      parts.length = 0;
+      chars = 0;
+      s = s.slice(s.length - keep);
+      cut = true;
+    }
     parts.push(s);
     chars += s.length;
-    while (parts.length > 1 && chars - parts[0].length > keep) chars -= parts.shift()!.length;
+    while (parts.length > 1 && chars - parts[0].length > keep) {
+      chars -= parts.shift()!.length;
+      cut = true;
+    }
   };
   for (;;) {
     const { done, value } = await reader.read();
@@ -48,7 +66,7 @@ export async function readTail(req: Request, cap = MAX_REPORT_BYTES, keep = MAX_
     add(dec.decode(value, { stream: true }));
   }
   add(dec.decode());
-  return keepTail(parts.join(""), keep);
+  return keepTail(parts.join(""), keep, cut);
 }
 
 const enc = new TextEncoder();
