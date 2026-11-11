@@ -301,6 +301,19 @@ test("runner: a new run never drops the previous run's unpublished result", asyn
   assert.equal(last.body.conclusion, "success");
 });
 
+test("runner: a log that cannot be read still completes the check", async () => {
+  const s = setup();
+  const calls = githubMock();
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  s.logs.get = async () => { throw new Error("r2 down"); };
+  await s.runner.alarm(); // not due: nothing happens
+  advance(75 * 60_000);
+  await s.runner.alarm();
+  const done = calls.filter((c) => c.method === "PATCH").at(-1)!;
+  assert.equal(done.body.conclusion, "timed_out");
+  assert.match(done.body.output.text, /could not be read/);
+});
+
 test("runner: a slow /done after a fast container exit still completes the run", async () => {
   const s = setup();
   const calls = githubMock();

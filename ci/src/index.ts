@@ -227,8 +227,17 @@ export class CiRunner extends DurableObject<CiEnv> {
   private async finish(st: RunState, exitCode: number, note?: string, force?: Conclusion): Promise<void> {
     st.finished = true;
     await this.ctx.storage.put("run", st);
-    const obj = await this.env.LOGS.get(logKey(st.runId));
-    const log = obj ? await obj.text() : "";
+    // The run is already stored as finished, so nothing after this point may
+    // throw before publish() stores the completion: a log that cannot be read
+    // completes the check without it.
+    let log = "";
+    try {
+      const obj = await this.env.LOGS.get(logKey(st.runId));
+      log = obj ? await obj.text() : "";
+    } catch (e) {
+      console.log(`log read failed: ${String(e).slice(0, 300)}`);
+      log = "[the run log could not be read]\n";
+    }
     const gates = parseGates(log);
     const { conclusion, missing } = conclude(exitCode, gates);
     const payload = completePayload({

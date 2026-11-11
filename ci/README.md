@@ -93,8 +93,9 @@ Enforced in code:
   clean environment, so the code under test cannot read the nonce or post a
   result. Root owns the log file and keeps it in `/root`, which `ci` cannot
   enter. The Worker decodes each report as it streams in and keeps only its
-  last 10 Mi characters, so memory stays near that size for any log. A
-  report over 256 MiB is refused.
+  last 10 Mi characters. Memory therefore depends on that tail, a few
+  copies of it, not on the size of the log. A report over 256 MiB is
+  refused.
 - Root owns the toolchain, worker-build's tool cache, the JRE and
   `tla2tools.jar`, and the gate script. Code under test cannot swap one of
   those binaries to fake a pass. The image build fails if `ci` can write to
