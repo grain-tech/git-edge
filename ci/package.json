@@ -1,0 +1,20 @@
+{
+  "name": "git-edge-ci",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --import ./test/register.mjs --test \"test/*.test.ts\"",
+    "typecheck": "wrangler types >/dev/null && tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "types": "wrangler types",
+    "gates": "./gates.sh .."
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.160.0"
+  },
+  "engines": {
+    "node": ">=23.6"
+  }
+}

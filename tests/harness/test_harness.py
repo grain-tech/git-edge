@@ -436,8 +436,6 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(ge.git("rev-parse", "main", cwd=clone).stdout.strip(), tip)
         ge.git("fsck", "--strict", cwd=clone)
 
-
-
     def test_l_fresh_knob_error_leaves_job_queued(self):
         """A SliceBudget::fresh failure (hooks on, knob read error) must
         leave the job queued, never running — the budget is built before
@@ -452,6 +450,12 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(st, 500, "step should fail on a knob read error: %s"
                          % ge.redact(body[:400].decode("utf-8", "replace")))
         after = ge.jobs(r.name)
+        fp = next((f for f in after["failpoints"]
+                   if f["name"] == "knob.read"), None)
+        self.assertIsNotNone(fp, "knob.read failpoint row missing: %r"
+                             % after["failpoints"])
+        self.assertEqual(fp["remaining"], 0,
+                         "knob.read failpoint was never consumed: %r" % fp)
         running = [j for j in after["jobs"] if j["state"] == "running"]
         self.assertEqual(running, [],
                          "fresh() failure left a job running: %r" % running)
