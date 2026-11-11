@@ -12,6 +12,7 @@ ARG WORKER_BUILD_VERSION=0.8.7
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl git python3 xz-utils util-linux procps \
+      pkg-config libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # Node from the official tarball, checked against the release SHASUMS.
@@ -23,7 +24,8 @@ RUN set -eu; cd /tmp; \
     tar -xJf "$f" -C /usr/local --strip-components=1 --no-same-owner; \
     rm -f "$f" SHASUMS256.txt; node --version
 
-# Toolchain and worker-build stay root-owned under /usr/local.
+# Toolchain and worker-build stay root-owned under /usr/local. worker-build
+# links openssl-sys, found through pkg-config and libssl-dev above.
 RUN rustup target add wasm32-unknown-unknown \
  && cargo install worker-build --version "${WORKER_BUILD_VERSION}" --locked \
  && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
