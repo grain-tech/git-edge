@@ -1,0 +1,34 @@
+// CI runner for this repository: a Dev-account-only Worker that receives
+// GitHub webhooks and runs ci/gates.sh in a Container. This file is separate
+// from server/wrangler.jsonc and deploys nothing in server/.
+// Secrets (set with `wrangler secret put`, never committed):
+//   WEBHOOK_SECRET   GitHub App webhook secret
+//   APP_ID           GitHub App id
+//   APP_PRIVATE_KEY  GitHub App private key, PEM
+//   LOG_URL_KEY      random 32+ byte key that signs log links
+//   CI_REPO          owner/name of the one repository this runner serves
+{
+  "name": "git-edge-ci",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    "RUN_TIMEOUT_MIN": "75",
+    "LOG_TTL_DAYS": "14",
+    "INSTANCE": "standard-3"
+  },
+  "r2_buckets": [{ "binding": "LOGS", "bucket_name": "git-edge-ci-logs" }],
+  "containers": [
+    {
+      "class_name": "CiRunner",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "base": { "dockerfile": "./container/Dockerfile", "build_context": ".." }
+      }
+    }
+  ],
+  "durable_objects": { "bindings": [{ "name": "CI_RUNNER", "class_name": "CiRunner" }] },
+  "exports": { "CiRunner": { "type": "durable-object", "storage": "sqlite" } },
+  "observability": { "enabled": true }
+}
