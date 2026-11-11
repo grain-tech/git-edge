@@ -1,7 +1,9 @@
 // Short-lived log links: /logs/<runId>?exp=<unix seconds>&sig=<hex HMAC>.
 
 const enc = new TextEncoder();
-const RUN_ID_RE = /^[0-9a-f]{40}-[0-9]{13}$/;
+// <sha>-<13-digit ms>-<8 hex>: the random suffix keeps two runs that start
+// in the same millisecond apart.
+const RUN_ID_RE = /^[0-9a-f]{40}-[0-9]{13}-[0-9a-f]{8}$/;
 
 export function isRunId(s: string): boolean {
   return RUN_ID_RE.test(s);

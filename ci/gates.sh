@@ -12,7 +12,82 @@
 # GE_CI_PORT (default 8795) picks the local dev server port. GE_CI_GATES
 # (default "cargo harness-barrier-0 harness-barrier-1 tla") picks gates for a
 # local run; the CI container always runs all of them.
+#
+# A harness gate passes only when run.sh exits 0 AND its unittest summary
+# shows every expected test ran and passed: "Ran N tests" with N equal to the
+# number of test cases unittest loads from tests/harness/test_*.py (all but
+# test_hooks_off.py, which needs a hooks-off server), N at least
+# HARNESS_MIN_TESTS, and a final status line of exactly "OK" (no skips, no
+# expected failures). This catches a module dropped from run.sh, a test that
+# skips, and a deleted test. Raise HARNESS_MIN_TESTS when tests are added;
+# lowering it is a reviewed change to this file, and the CI image carries its
+# own copy (see ci/README.md).
+#
+# Two helper modes, used by the gate and by ci/test/gates.test.ts:
+#   ci/gates.sh --harness-expected [repo-dir]       prints the expected N
+#   ci/gates.sh --check-harness-output FILE N       0 when FILE shows N/N OK
 set -uo pipefail
+
+HARNESS_MIN_TESTS=97
+
+# harness_expected <repo>: test cases unittest loads from the modules run.sh
+# runs on a hooks-on server. Importing them touches no server.
+harness_expected() {
+  python3 - "$1/tests/harness" <<'PY'
+import pathlib, sys, unittest
+d = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(d))
+names = sorted(p.stem for p in d.glob("test_*.py") if p.stem != "test_hooks_off")
+loader = unittest.TestLoader()
+try:
+    suite = loader.loadTestsFromNames(names)
+except Exception as e:
+    print("cannot load the harness tests: %r" % e, file=sys.stderr)
+    sys.exit(1)
+if loader.errors or not names:
+    print("cannot load the harness tests: %r" % (loader.errors or "none found"), file=sys.stderr)
+    sys.exit(1)
+print(suite.countTestCases())
+PY
+}
+
+# check_harness_output <file> <expected>: the unittest summary in file shows
+# exactly expected tests, at least HARNESS_MIN_TESTS, and a bare OK.
+# Test stdout is block-buffered and can land after unittest's stderr
+# summary, so the file must hold exactly one "Ran N tests" line, and the
+# status is the first non-empty line after it, never just the last match.
+check_harness_output() {
+  local out="$1" want="$2" ran status runs
+  runs="$(grep -cE '^Ran [0-9]+ tests? in ' "$out")"
+  if [ "$runs" -gt 1 ]; then
+    echo "harness count: $runs 'Ran N tests' lines, want exactly one"; return 1
+  fi
+  ran="$(sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' "$out")"
+  status="$(awk 'f && NF { print; exit } /^Ran [0-9]+ tests? in /{ f = 1 }' "$out")"
+  if ! [[ "$want" =~ ^[0-9]+$ ]]; then
+    echo "harness count: no expected count"; return 1
+  fi
+  if [ "$want" -lt "$HARNESS_MIN_TESTS" ]; then
+    echo "harness count: only $want tests found, fewer than the minimum $HARNESS_MIN_TESTS"; return 1
+  fi
+  if [ -z "$ran" ]; then
+    echo "harness count: no 'Ran N tests' line"; return 1
+  fi
+  if [ "$ran" != "$want" ]; then
+    echo "harness count: ran $ran of $want tests"; return 1
+  fi
+  if [ "$status" != "OK" ]; then
+    echo "harness count: status '${status:-missing}', want a bare OK"; return 1
+  fi
+  echo "harness count: $ran/$want passed"
+}
+
+case "${1:-}" in
+  --harness-expected)
+    harness_expected "$(cd "${2:-$(dirname "${BASH_SOURCE[0]}")/..}" && pwd)"; exit ;;
+  --check-harness-output)
+    check_harness_output "$2" "$3"; exit ;;
+esac
 
 REPO="$(cd "${1:-$(dirname "${BASH_SOURCE[0]}")/..}" && pwd)"
 PORT="${GE_CI_PORT:-8795}"
@@ -84,10 +159,14 @@ harness_run() {
     log "dev server not ready after 600s"; tail -n 60 "$slog"; stop_server; return 1
   fi
   log "dev server up after ~$((i * 2))s (GE_GC_BARRIER=$barrier)"
-  local rc=0
+  local rc=0 want out="$WORK/harness-$barrier.out"
   (cd "$REPO" && GE_URL="http://test:write-test-token@127.0.0.1:$PORT" \
-     GE_SERVER_LOG="$slog" tests/harness/run.sh) || rc=$?
+     GE_SERVER_LOG="$slog" tests/harness/run.sh) 2>&1 | tee "$out" || rc=$?
   stop_server
+  if [ "$rc" = 0 ]; then
+    want="$(harness_expected "$REPO")" || want=""
+    check_harness_output "$out" "$want" || rc=1
+  fi
   if [ "$rc" != 0 ]; then
     log "dev server log tail (GE_GC_BARRIER=$barrier):"; tail -n 40 "$slog"
   fi
