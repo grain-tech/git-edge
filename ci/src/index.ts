@@ -73,14 +73,20 @@ export class CiRunner extends DurableObject<CiEnv> {
   constructor(ctx: DurableObjectState, env: CiEnv) {
     super(ctx, env);
     const c = ctx.container;
-    if (c?.running) {
-      // A restarted object (e.g. after a deploy) must re-arm both.
-      ctx.blockConcurrencyWhile(async () => {
+    if (!c) return;
+    // A restarted object (e.g. after a deploy) must re-arm the watch on a
+    // running container. A container that stopped while the object was
+    // away never reaches monitor(), so treat it as exited: the run then
+    // fails after the exit grace, not at the full timeout.
+    ctx.blockConcurrencyWhile(async () => {
+      const st = await this.state();
+      if (c.running) {
         await c.setInactivityTimeout(this.inactivityMs());
-        const st = await this.state();
         if (st) this.watch(st.runId);
-      });
-    }
+      } else if (st && !st.finished && st.exited === undefined) {
+        await this.onExit(st.runId, "not running after restart");
+      }
+    });
   }
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
@@ -123,7 +129,9 @@ export class CiRunner extends DurableObject<CiEnv> {
     // The previous run's unpublished completion, if any, keeps its own
     // pending entry and alarm retries; replacing "run" does not touch it.
     const env = this.env;
-    const runId = `${plan.sha}-${String(Date.now()).padStart(13, "0")}`;
+    // The random suffix keeps two runs begun in the same millisecond from
+    // sharing a log key or a pending entry.
+    const runId = `${plan.sha}-${String(Date.now()).padStart(13, "0")}-${randomHex(4)}`;
     const ttlSec = Number(env.LOG_TTL_DAYS) * 86400;
     const detailsUrl = await signLogUrl(origin, env.LOG_URL_KEY, runId, nowSec() + ttlSec);
     await env.LOGS.put(logKey(runId), `run ${runId} for ${plan.trigger}: starting\n`);
@@ -225,24 +233,12 @@ export class CiRunner extends DurableObject<CiEnv> {
   }
 
   private async finish(st: RunState, exitCode: number, note?: string, force?: Conclusion): Promise<void> {
+    // Build the completion first, and never throw while doing it. Once
+    // "run" is stored as finished, only the pending entry that publish()
+    // stores keeps the check from staying in progress forever.
+    const payload = await this.completion(st, exitCode, note, force);
     st.finished = true;
     await this.ctx.storage.put("run", st);
-    // The run is already stored as finished, so nothing after this point may
-    // throw before publish() stores the completion: a log that cannot be read
-    // completes the check without it.
-    let log = "";
-    try {
-      const obj = await this.env.LOGS.get(logKey(st.runId));
-      log = obj ? await obj.text() : "";
-    } catch (e) {
-      console.log(`log read failed: ${String(e).slice(0, 300)}`);
-      log = "[the run log could not be read]\n";
-    }
-    const gates = parseGates(log);
-    const { conclusion, missing } = conclude(exitCode, gates);
-    const payload = completePayload({
-      conclusion: force ?? conclusion, gates, missing, log, detailsUrl: st.detailsUrl, note, now: new Date(),
-    });
     const c = this.ctx.container;
     try {
       if (c?.running && (force || note)) await c.destroy();
@@ -254,6 +250,37 @@ export class CiRunner extends DurableObject<CiEnv> {
       payload, tries: 0, due: 0,
     });
     await this.rearm();
+  }
+
+  /** The completed check for a run. A log that cannot be read, or one that
+   * cannot be summarised, still yields a failing completion. */
+  private async completion(st: RunState, exitCode: number, note?: string, force?: Conclusion): Promise<object> {
+    let log = "";
+    try {
+      const obj = await this.env.LOGS.get(logKey(st.runId));
+      log = obj ? await obj.text() : "";
+    } catch (e) {
+      console.log(`log read failed: ${String(e).slice(0, 300)}`);
+      log = "[the run log could not be read]\n";
+    }
+    try {
+      const gates = parseGates(log);
+      const { conclusion, missing } = conclude(exitCode, gates);
+      return completePayload({
+        conclusion: force ?? conclusion, gates, missing, log, detailsUrl: st.detailsUrl, note, now: new Date(),
+      });
+    } catch (e) {
+      console.log(`summary failed: ${String(e).slice(0, 300)}`);
+      return {
+        status: "completed",
+        conclusion: force ?? "failure",
+        completed_at: new Date().toISOString(),
+        output: {
+          title: note ?? "Failed",
+          summary: `${note ? `${note}\n\n` : ""}The result could not be summarised. Full log: ${st.detailsUrl}`,
+        },
+      };
+    }
   }
 
   /** Completes one check run. A GitHub failure leaves the check in progress,

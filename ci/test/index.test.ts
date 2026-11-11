@@ -81,7 +81,7 @@ function setup() {
   const ctx: any = {
     storage, container,
     waitUntil: (p: Promise<unknown>) => waits.push(p),
-    blockConcurrencyWhile: (f: () => Promise<unknown>) => f(),
+    blockConcurrencyWhile: (f: () => Promise<unknown>) => { const p = f(); waits.push(p); return p; },
     exports: {
       CiReport: (o: unknown) => ({ entry: "CiReport", ...(o as object) }),
       GitEgress: (o: unknown) => ({ entry: "GitEgress", ...(o as object) }),
@@ -141,14 +141,14 @@ test("webhook -> runner: check run in progress, locked-down container, then succ
   const calls = githubMock();
   const res = await worker.fetch(hook(prBody, "pull_request"), s.env);
   assert.equal(res.status, 202);
-  assert.match(await res.text(), /^started f{40}-\d{13}/);
+  assert.match(await res.text(), /^started f{40}-\d{13}-[0-9a-f]{8}\n$/);
   assert.equal((s.begun[0] as any).name, SHA, "one Durable Object per head sha");
 
   const create = calls.find((c) => c.url.endsWith("/check-runs"))!;
   assert.equal(create.body.name, "git-edge-ci");
   assert.equal(create.body.status, "in_progress");
   assert.equal(create.body.head_sha, SHA);
-  assert.match(create.body.details_url, /^https:\/\/ci\.example\/logs\/f{40}-\d{13}\?exp=\d+&sig=[0-9a-f]{64}$/);
+  assert.match(create.body.details_url, /^https:\/\/ci\.example\/logs\/f{40}-\d{13}-[0-9a-f]{8}\?exp=\d+&sig=[0-9a-f]{64}$/);
 
   const opts = s.container.startOpts!;
   assert.equal(opts.enableInternet, false);
@@ -257,12 +257,13 @@ test("runner: a result racing the alarm completes the check once", async () => {
 test("runner: the old container's exit never fails a newer run", async () => {
   const s = setup();
   const calls = githubMock();
+  const run1Watch = s.waits.length;
   await worker.fetch(hook(prBody, "pull_request"), s.env);
   const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
   await s.runner.report(nonce, "done", "::gate:: cargo fail 1s", 1); // finished, container still up
   advance(1); // a new run id
   await worker.fetch(hook(prBody.replace("synchronize", "reopened"), "pull_request"), s.env); // destroys it, starts run 2
-  await s.waits[0]; // run 1's monitor settled when its container was destroyed
+  await s.waits[run1Watch]; // run 1's monitor settled when its container was destroyed
   assert.equal(calls.filter((c) => c.method === "PATCH").length, 1, "run 2 is still in progress");
   const st = (await s.storage.get("run")) as any;
   assert.equal(st.finished, false);
@@ -299,6 +300,70 @@ test("runner: a new run never drops the previous run's unpublished result", asyn
   const last = calls.filter((c) => c.method === "PATCH").at(-1)!;
   assert.equal(last.url.split("/").at(-1), "43");
   assert.equal(last.body.conclusion, "success");
+});
+
+test("runner: two runs begun in the same millisecond keep apart", async () => {
+  const s = setup();
+  const calls = githubMock(1); // run 1's completion fails once
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  const run1 = (await s.storage.get("run")) as any;
+  await s.runner.report((s.container.startOpts!.env as Record<string, string>).CI_NONCE, "done", "::gate:: cargo fail 1s", 1);
+  // no advance(): run 2 starts in the same millisecond
+  await worker.fetch(hook(prBody.replace("synchronize", "reopened"), "pull_request"), s.env);
+  const run2 = (await s.storage.get("run")) as any;
+  assert.notEqual(run2.runId, run1.runId);
+  assert.equal(run2.runId.split("-")[1], run1.runId.split("-")[1], "same millisecond");
+  const log = ["cargo", "harness-barrier-0", "harness-barrier-1", "tla"].map((g) => `::gate:: ${g} pass 1s`).join("\n");
+  await s.runner.report((s.container.startOpts!.env as Record<string, string>).CI_NONCE, "done", log, 0);
+  assert.deepEqual([...(await s.storage.list({ prefix: "pending/" })).keys()], [`pending/${run1.runId}`], "run 2's publish kept run 1's retry");
+  assert.match(s.logs.m.get(`runs/${run1.runId}.log`)!, /cargo fail/, "run 2 did not overwrite run 1's log");
+  assert.equal(calls.filter((c) => c.method === "PATCH").at(-1)!.body.conclusion, "success");
+});
+
+test("runner: a log that cannot be summarised still completes the check as failed", async () => {
+  const s = setup();
+  const calls = githubMock();
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
+  s.logs.get = async () => ({ text: async () => 42 as unknown as string, body: "" }); // parseGates throws
+  const log = ["cargo", "harness-barrier-0", "harness-barrier-1", "tla"].map((g) => `::gate:: ${g} pass 1s`).join("\n");
+  assert.equal(await s.runner.report(nonce, "done", log, 0), 204);
+  const done = calls.filter((c) => c.method === "PATCH").at(-1)!;
+  assert.equal(done.body.conclusion, "failure");
+  assert.match(done.body.output.summary, /could not be summarised/);
+  assert.equal(((await s.storage.get("run")) as any).finished, true);
+  assert.equal(s.storage.alarm, null);
+});
+
+test("runner: a container that stopped while the object was away fails after the grace", async () => {
+  const s = setup();
+  const calls = githubMock();
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  s.container.running = false; // stopped; the old object never saw monitor() settle
+  const restarted = new CiRunner(s.ctx, s.env);
+  await s.waits.at(-1); // the constructor's blockConcurrencyWhile
+  const st = (await s.storage.get("run")) as any;
+  assert.equal(st.exited, "not running after restart");
+  assert.equal(s.storage.alarm, Date.now() + EXIT_GRACE_MS, "not the full timeout");
+  advance(EXIT_GRACE_MS);
+  await restarted.alarm();
+  const done = calls.filter((c) => c.method === "PATCH").at(-1)!;
+  assert.equal(done.body.conclusion, "failure");
+  assert.match(done.body.output.summary, /without a result \(not running after restart\)/);
+});
+
+test("runner: a restarted object with its container still running re-watches it", async () => {
+  const s = setup();
+  githubMock();
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  const restarted = new CiRunner(s.ctx, s.env);
+  await s.waits.at(-1);
+  const st = (await s.storage.get("run")) as any;
+  assert.equal(st.exited, undefined, "a running container is not an exit");
+  s.container.exit!.resolve();
+  await s.waits.at(-1); // the new watch
+  assert.equal(((await s.storage.get("run")) as any).exited, "exit code 0");
+  void restarted;
 });
 
 test("runner: a log that cannot be read still completes the check", async () => {
