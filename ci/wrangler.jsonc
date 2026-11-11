@@ -9,6 +9,10 @@
 //   CI_REPO          owner/name of the one repository this runner serves
 {
   "name": "git-edge-ci",
+  // The development account. Pinned so `wrangler deploy` can never land on
+  // whichever account the operator happens to be logged into; a token for
+  // any other account fails instead.
+  "account_id": "75a254b12342776d9ed2f87503b52472",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
   "workers_dev": true,

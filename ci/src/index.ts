@@ -7,6 +7,7 @@ import { completePayload, conclude, createPayload, parseGates, rejectPayload, ty
 import { createCheckRun, installationToken, updateCheckRun } from "./github.ts";
 import { ALLOWED_HTTPS_HOSTS, egressDecision } from "./egress.ts";
 import { signLogUrl, verifyLogUrl } from "./logurl.ts";
+import { keepTail, readTail, sameSecret } from "./report.ts";
 
 export interface CiEnv extends Env {
   WEBHOOK_SECRET: string;
@@ -17,8 +18,11 @@ export interface CiEnv extends Env {
 }
 
 const REPORT_HOST = "ci.internal";
-const MAX_LOG_BYTES = 20 * 1024 * 1024;
-const MAX_REPORT_BYTES = 2 * MAX_LOG_BYTES;
+/** How long a run whose container exited waits for its /done report before
+ * it fails. Longer than the 60 s curl timeout in container/entry.sh, so a
+ * slow /done that is still streaming in always lands first. */
+export const EXIT_GRACE_MS = 90_000;
+const MAX_PUBLISH_TRIES = 10;
 
 interface RunState {
   runId: string;
@@ -27,9 +31,27 @@ interface RunState {
   nonce: string;
   detailsUrl: string;
   finished: boolean;
-  /** A completion GitHub has not accepted yet; the alarm retries it. */
-  pending?: { payload: object; tries: number };
+  /** When the alarm fails the run if it is still unfinished: the timeout,
+   * or the end of the exit grace once the container has exited. */
+  deadline: number;
+  /** How the container exited, when it exited before reporting a result. */
+  exited?: string;
 }
+
+/** A completion GitHub has not accepted yet. Each run keeps its own entry,
+ * so a later run for the same commit never replaces it; the alarm retries
+ * every entry that is due. */
+interface Pending {
+  runId: string;
+  repo: string;
+  installationId: number;
+  checkRunId: number;
+  payload: object;
+  tries: number;
+  due: number;
+}
+
+const PENDING_PREFIX = "pending/";
 
 function configured(env: CiEnv): boolean {
   return Boolean(env.WEBHOOK_SECRET && env.APP_ID && env.APP_PRIVATE_KEY && env.LOG_URL_KEY && env.CI_REPO);
@@ -40,10 +62,6 @@ const logKey = (runId: string) => `runs/${runId}.log`;
 
 function randomHex(bytes: number): string {
   return [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function keepTail(log: string): string {
-  return log.length <= MAX_LOG_BYTES ? log : `[log truncated to the last ${MAX_LOG_BYTES} bytes]\n${log.slice(-MAX_LOG_BYTES)}`;
 }
 
 export class CiRunner extends DurableObject<CiEnv> {
@@ -80,6 +98,20 @@ export class CiRunner extends DurableObject<CiEnv> {
     return this.ctx.storage.get<RunState>("run");
   }
 
+  private async pendings(): Promise<Pending[]> {
+    return [...(await this.ctx.storage.list<Pending>({ prefix: PENDING_PREFIX })).values()];
+  }
+
+  /** One alarm serves the run deadline and every pending retry: set it to
+   * the earliest of them, or clear it when nothing is left. */
+  private async rearm(): Promise<void> {
+    const st = await this.state();
+    const times = (await this.pendings()).map((p) => p.due);
+    if (st && !st.finished) times.push(st.deadline);
+    if (times.length) await this.ctx.storage.setAlarm(Math.min(...times));
+    else await this.ctx.storage.deleteAlarm();
+  }
+
   /** Starts a run for plan.sha unless one is already in progress. */
   begin(plan: RunPlan, origin: string): Promise<string> {
     return this.serial(() => this.beginNow(plan, origin));
@@ -88,9 +120,8 @@ export class CiRunner extends DurableObject<CiEnv> {
   private async beginNow(plan: RunPlan, origin: string): Promise<string> {
     const prev = await this.state();
     if (prev && !prev.finished) return `already running ${prev.runId}`;
-    // A new run replaces the stored state and the alarm, so try the previous
-    // run's unpublished completion once before it is dropped.
-    if (prev?.pending) await this.publish(prev, prev.pending.payload, prev.pending.tries);
+    // The previous run's unpublished completion, if any, keeps its own
+    // pending entry and alarm retries; replacing "run" does not touch it.
     const env = this.env;
     const runId = `${plan.sha}-${String(Date.now()).padStart(13, "0")}`;
     const ttlSec = Number(env.LOG_TTL_DAYS) * 86400;
@@ -98,9 +129,12 @@ export class CiRunner extends DurableObject<CiEnv> {
     await env.LOGS.put(logKey(runId), `run ${runId} for ${plan.trigger}: starting\n`);
     const token = await installationToken(env.APP_ID, env.APP_PRIVATE_KEY, plan.installationId, plan.repo, nowSec());
     const checkRunId = await createCheckRun(token, plan.repo, createPayload(plan.sha, detailsUrl, plan.trigger, new Date()));
-    const st: RunState = { runId, plan, checkRunId, nonce: randomHex(32), detailsUrl, finished: false };
+    const st: RunState = {
+      runId, plan, checkRunId, nonce: randomHex(32), detailsUrl, finished: false,
+      deadline: Date.now() + Number(env.RUN_TIMEOUT_MIN) * 60_000,
+    };
     await this.ctx.storage.put("run", st);
-    await this.ctx.storage.setAlarm(Date.now() + Number(env.RUN_TIMEOUT_MIN) * 60_000);
+    await this.rearm();
     try {
       await this.startContainer(st, token);
     } catch (e) {
@@ -148,11 +182,19 @@ export class CiRunner extends DurableObject<CiEnv> {
     );
   }
 
+  /** The container posts /done and then exits, but the exit can reach this
+   * object first: the /done body may still be streaming into CiReport, or
+   * curl may have timed out on a slow reply. So an exit does not fail the run
+   * at once. It starts a grace period; a /done that lands in it completes the
+   * run as usual, and the alarm fails the run when the grace ends. */
   private onExit(runId: string, how: string): Promise<void> {
     return this.serial(async () => {
       const st = await this.state();
-      if (!st || st.finished || st.runId !== runId) return;
-      await this.finish(st, 1, `Runner stopped without a result (${how.slice(0, 200)})`);
+      if (!st || st.finished || st.runId !== runId || st.exited !== undefined) return;
+      st.exited = how.slice(0, 200);
+      st.deadline = Math.min(st.deadline, Date.now() + EXIT_GRACE_MS);
+      await this.ctx.storage.put("run", st);
+      await this.rearm();
     });
   }
 
@@ -160,7 +202,7 @@ export class CiRunner extends DurableObject<CiEnv> {
   report(nonce: string, kind: "log" | "done", log: string, exitCode: number): Promise<number> {
     return this.serial(async () => {
       const st = await this.state();
-      if (!st || st.finished || nonce !== st.nonce) return 403;
+      if (!st || st.finished || !sameSecret(nonce, st.nonce)) return 403;
       await this.env.LOGS.put(logKey(st.runId), keepTail(log));
       if (kind === "done") await this.finish(st, exitCode);
       return 204;
@@ -172,19 +214,19 @@ export class CiRunner extends DurableObject<CiEnv> {
   }
 
   private async alarmNow(): Promise<void> {
+    const now = Date.now();
     const st = await this.state();
-    if (!st) return;
-    if (st.finished) {
-      if (st.pending) await this.publish(st, st.pending.payload, st.pending.tries);
-      return;
+    if (st && !st.finished && now >= st.deadline) {
+      if (st.exited !== undefined) await this.finish(st, 1, `Runner stopped without a result (${st.exited})`);
+      else await this.finish(st, 1, `Timed out after ${this.env.RUN_TIMEOUT_MIN} minutes`, "timed_out");
     }
-    await this.finish(st, 1, `Timed out after ${this.env.RUN_TIMEOUT_MIN} minutes`, "timed_out");
+    for (const p of await this.pendings()) if (p.due <= now) await this.publish(p);
+    await this.rearm();
   }
 
   private async finish(st: RunState, exitCode: number, note?: string, force?: Conclusion): Promise<void> {
     st.finished = true;
     await this.ctx.storage.put("run", st);
-    await this.ctx.storage.deleteAlarm();
     const obj = await this.env.LOGS.get(logKey(st.runId));
     const log = obj ? await obj.text() : "";
     const gates = parseGates(log);
@@ -198,47 +240,34 @@ export class CiRunner extends DurableObject<CiEnv> {
     } catch (e) {
       console.log(`container destroy failed: ${String(e).slice(0, 300)}`);
     }
-    await this.publish(st, payload, 0);
+    await this.publish({
+      runId: st.runId, repo: st.plan.repo, installationId: st.plan.installationId, checkRunId: st.checkRunId,
+      payload, tries: 0, due: 0,
+    });
+    await this.rearm();
   }
 
-  /** Completes the check run. A GitHub failure leaves the check in progress,
-   * so keep the payload and retry from the alarm, up to 10 times. */
-  private async publish(st: RunState, payload: object, tries: number): Promise<void> {
+  /** Completes one check run. A GitHub failure leaves the check in progress,
+   * so keep the payload under the run's own key and let the alarm retry it,
+   * up to MAX_PUBLISH_TRIES times in all, backing off from 1 to 16 minutes.
+   * The caller re-arms the alarm. */
+  private async publish(p: Pending): Promise<void> {
     const env = this.env;
+    const key = PENDING_PREFIX + p.runId;
     try {
-      const token = await installationToken(env.APP_ID, env.APP_PRIVATE_KEY, st.plan.installationId, st.plan.repo, nowSec());
-      await updateCheckRun(token, st.plan.repo, st.checkRunId, payload);
-      st.pending = undefined;
+      const token = await installationToken(env.APP_ID, env.APP_PRIVATE_KEY, p.installationId, p.repo, nowSec());
+      await updateCheckRun(token, p.repo, p.checkRunId, p.payload);
+      await this.ctx.storage.delete(key);
     } catch (e) {
-      console.log(`check run ${st.checkRunId} update failed (try ${tries + 1}): ${String(e).slice(0, 300)}`);
-      st.pending = tries + 1 < 10 ? { payload, tries: tries + 1 } : undefined;
-      if (st.pending) await this.ctx.storage.setAlarm(Date.now() + 60_000 * 2 ** Math.min(tries, 4));
+      console.log(`check run ${p.checkRunId} update failed (try ${p.tries + 1}): ${String(e).slice(0, 300)}`);
+      const tries = p.tries + 1;
+      if (tries < MAX_PUBLISH_TRIES) {
+        await this.ctx.storage.put(key, { ...p, tries, due: Date.now() + 60_000 * 2 ** Math.min(p.tries, 4) });
+      } else {
+        await this.ctx.storage.delete(key);
+      }
     }
-    await this.ctx.storage.put("run", st);
   }
-}
-
-/** Reads a body up to cap bytes, with or without Content-Length; null when larger. */
-async function readCapped(req: Request, cap: number): Promise<string | null> {
-  if (Number(req.headers.get("content-length") ?? "0") > cap) return null;
-  if (!req.body) return "";
-  const reader = req.body.getReader();
-  const parts: Uint8Array[] = [];
-  let n = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    n += value.byteLength;
-    if (n > cap) {
-      await reader.cancel();
-      return null;
-    }
-    parts.push(value);
-  }
-  const all = new Uint8Array(n);
-  let o = 0;
-  for (const p of parts) { all.set(p, o); o += p.byteLength; }
-  return new TextDecoder().decode(all);
 }
 
 /** Receives the container's HTTP calls to http://ci.internal/{log,done}. */
@@ -247,11 +276,10 @@ export class CiReport extends WorkerEntrypoint<CiEnv, { name: string }> {
     const url = new URL(req.url);
     const kind = url.pathname === "/done" ? "done" : url.pathname === "/log" ? "log" : null;
     if (req.method !== "POST" || !kind) return new Response("not found", { status: 404 });
-    const body = await readCapped(req, MAX_REPORT_BYTES);
-    if (body === null) return new Response("log too large", { status: 413 });
+    const log = await readTail(req);
+    if (log === null) return new Response("log too large", { status: 413 });
     const nonce = req.headers.get("x-ci-nonce") ?? "";
     const exitCode = Number(req.headers.get("x-ci-exit") ?? "1");
-    const log = keepTail(body);
     const stub = this.env.CI_RUNNER.getByName(this.ctx.props.name) as unknown as DurableObjectStub<CiRunner>;
     const status = await stub.report(nonce, kind, log, Number.isInteger(exitCode) ? exitCode : 1);
     return new Response(null, { status });

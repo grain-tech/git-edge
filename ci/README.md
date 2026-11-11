@@ -3,8 +3,9 @@
 This directory holds the CI runner for this repository. A Worker receives
 GitHub webhooks, and a Container runs the three merge gates on the pushed
 commit. The result appears on the pull request as one check run named
-`git-edge-ci`. The runner deploys to a development Cloudflare account only.
-It uses no production credentials and no GitHub Actions.
+`git-edge-ci`. The runner deploys to a development Cloudflare account only:
+`wrangler.jsonc` pins its `account_id`, so a deploy with a token or login for
+any other account fails instead of landing there. It uses no production credentials and no GitHub Actions.
 
 ## The gates
 
@@ -19,6 +20,15 @@ It uses no production credentials and no GitHub Actions.
 
 The check passes only when the script exits 0 and prints a `pass` line for all
 four gates. A missing gate line fails the check.
+
+A harness gate needs more than `run.sh` exiting 0. Its unittest summary must
+say `Ran N tests` and end in a bare `OK`, so a skip or an expected failure
+fails the gate. N must equal the number of test cases unittest loads from
+`tests/harness/test_*.py`, leaving out `test_hooks_off.py`, which needs a
+hooks-off server. A module that `run.sh` no longer runs therefore fails the
+gate. N must also be at least `HARNESS_MIN_TESTS` in `gates.sh`, 97 today, so
+deleting tests fails too. Raise the minimum when you add harness tests.
+`ci/gates.sh --harness-expected` prints the expected N.
 
 Run the gates locally from the repository root:
 
@@ -49,7 +59,10 @@ server runs without `CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_ACCOUNT_ID`.
    `git-edge-ci-logs`.
 6. The Durable Object completes the check as `success` or `failure`, with a
    gate table and the log tail. A timeout completes it as `timed_out`. A
-   Container that stops without a result completes it as `failure`.
+   Container that stops without a result completes it as `failure`, 90
+   seconds after the exit. The wait lets a `/done` report that is still
+   arriving complete the run, since the exit can reach the Durable Object
+   before the report does.
 
 The Container runs the copy of `gates.sh` that is in the image. A pull
 request that edits `ci/gates.sh` changes the check only after a redeploy.
@@ -74,18 +87,23 @@ Enforced in code:
   short-lived installation token to allowed git fetches only. The token is
   scoped to `CI_REPO` with `checks:write` and `contents:read`.
 - `http://ci.internal` is the only way to report. Each report needs the run
-  nonce. Root holds the nonce and passes it to curl from a root-only file,
-  never on a command line. The clone and the gates run as user `ci` with a
+  nonce, which the Durable Object compares in constant time. Root holds the
+  nonce and passes it to curl from a root-only file, never on a command
+  line. The clone and the gates run as user `ci` with a
   clean environment, so the code under test cannot read the nonce or post a
   result. Root owns the log file and keeps it in `/root`, which `ci` cannot
-  enter. A report larger than 40 MiB is refused while it streams in.
+  enter. The Worker decodes each report as it streams in and keeps only its
+  last 10 Mi characters, so memory stays near that size for any log. A
+  report over 256 MiB is refused.
 - Root owns the toolchain, worker-build's tool cache, the JRE and
   `tla2tools.jar`, and the gate script. Code under test cannot swap one of
   those binaries to fake a pass. The image build fails if `ci` can write to
   any of them.
 - The Durable Object handles one state change at a time. Two deliveries for
   one commit start one run. A result and the timeout complete the check
-  once. A failed check update is retried from the alarm, up to 10 times.
+  once. A failed check update is stored for its own run and retried from
+  the alarm, up to 10 times. A later run for the same commit does not
+  replace it.
 - The dev server in the harness gets no Cloudflare account variables.
 
 Not enforced:

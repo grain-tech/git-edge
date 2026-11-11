@@ -3,10 +3,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, generateKeyPairSync } from "node:crypto";
-import worker, { CiReport, CiRunner, GitEgress } from "../src/index.ts";
+import worker, { CiReport, CiRunner, EXIT_GRACE_MS, GitEgress } from "../src/index.ts";
+import { MAX_LOG_CHARS } from "../src/report.ts";
 
 const REPO = "owner/git-edge";
 const SHA = "f".repeat(40);
+// The runner reads Date.now() for deadlines and retry times. Tests freeze
+// it at setup() and move it with advance().
+const realNow = Date.now;
+let clock = realNow();
+Date.now = () => clock;
+const advance = (ms: number) => { clock += ms; };
+
 const pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey
   .export({ type: "pkcs1", format: "pem" }).toString();
 
@@ -24,6 +32,10 @@ class FakeStorage {
   alarm: number | null = null;
   async get(k: string) { return structuredClone(this.m.get(k)); }
   async put(k: string, v: unknown) { this.m.set(k, structuredClone(v)); }
+  async delete(k: string) { return this.m.delete(k); }
+  async list(o: { prefix: string }) {
+    return new Map([...this.m].filter(([k]) => k.startsWith(o.prefix)).map(([k, v]) => [k, structuredClone(v)]));
+  }
   async setAlarm(t: number) { this.alarm = t; }
   async deleteAlarm() { this.alarm = null; }
 }
@@ -45,17 +57,19 @@ class FakeContainer {
 
 function githubMock(failPatches = 0) {
   const calls: Array<{ url: string; method: string; body: any }> = [];
+  let nextId = 42;
   globalThis.fetch = (async (url: string, init: RequestInit = {}) => {
     calls.push({ url: String(url), method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
     if (init.method === "PATCH" && failPatches-- > 0) return new Response("{}", { status: 502 });
     if (String(url).endsWith("/access_tokens")) return new Response(JSON.stringify({ token: "ghs_test" }), { status: 201 });
-    if (String(url).endsWith("/check-runs")) return new Response(JSON.stringify({ id: 42 }), { status: 201 });
+    if (String(url).endsWith("/check-runs")) return new Response(JSON.stringify({ id: nextId++ }), { status: 201 });
     return new Response("{}", { status: 200 });
   }) as typeof fetch;
   return calls;
 }
 
 function setup() {
+  clock = realNow();
   const logs = new FakeR2();
   const storage = new FakeStorage();
   const container = new FakeContainer();
@@ -170,8 +184,13 @@ test("runner: a gate failure, a silent exit and a timeout each fail the check", 
     await worker.fetch(hook(prBody, "pull_request"), s.env);
     const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
     if (mode === "gate") await s.runner.report(nonce, "done", "::gate:: cargo fail 9s", 1);
-    if (mode === "exit") { s.container.exit!.reject(Object.assign(new Error("x"), { exitCode: 137 })); await Promise.all(s.waits); }
-    if (mode === "timeout") await s.runner.alarm();
+    if (mode === "exit") {
+      s.container.exit!.reject(Object.assign(new Error("x"), { exitCode: 137 }));
+      await Promise.all(s.waits);
+      advance(EXIT_GRACE_MS);
+      await s.runner.alarm();
+    }
+    if (mode === "timeout") { advance(75 * 60_000); await s.runner.alarm(); }
     const done = calls.filter((c) => c.method === "PATCH").at(-1)!;
     assert.equal(done.body.conclusion, mode === "timeout" ? "timed_out" : "failure", mode);
     if (mode === "exit") assert.match(done.body.output.summary, /without a result \(137\)/);
@@ -188,10 +207,26 @@ test("runner: a failed check update is retried from the alarm", async () => {
   assert.equal(calls.filter((c) => c.method === "PATCH").length, 1);
   assert.ok(s.storage.alarm! > Date.now(), "retry alarm set");
   await s.runner.alarm();
+  assert.equal(calls.filter((c) => c.method === "PATCH").length, 1, "not retried before it is due");
+  advance(60_000);
+  await s.runner.alarm();
   const patches = calls.filter((c) => c.method === "PATCH");
   assert.equal(patches.length, 2);
   assert.equal(patches[1].body.conclusion, "failure");
-  assert.equal(((await s.storage.get("run")) as any).pending, undefined);
+  assert.equal((await s.storage.list({ prefix: "pending/" })).size, 0);
+  assert.equal(s.storage.alarm, null, "nothing left to wake for");
+});
+
+test("runner: a failed check update is given up after 10 tries", async () => {
+  const s = setup();
+  const calls = githubMock(100);
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
+  await s.runner.report(nonce, "done", "::gate:: cargo fail 9s", 1);
+  for (let i = 0; i < 12; i++) { advance(16 * 60_000); await s.runner.alarm(); }
+  assert.equal(calls.filter((c) => c.method === "PATCH").length, 10);
+  assert.equal((await s.storage.list({ prefix: "pending/" })).size, 0);
+  assert.equal(s.storage.alarm, null);
 });
 
 test("runner: concurrent deliveries for one sha start one run and one check", async () => {
@@ -225,22 +260,94 @@ test("runner: the old container's exit never fails a newer run", async () => {
   await worker.fetch(hook(prBody, "pull_request"), s.env);
   const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
   await s.runner.report(nonce, "done", "::gate:: cargo fail 1s", 1); // finished, container still up
+  advance(1); // a new run id
   await worker.fetch(hook(prBody.replace("synchronize", "reopened"), "pull_request"), s.env); // destroys it, starts run 2
   await s.waits[0]; // run 1's monitor settled when its container was destroyed
   assert.equal(calls.filter((c) => c.method === "PATCH").length, 1, "run 2 is still in progress");
-  assert.equal(((await s.storage.get("run")) as any).finished, false);
+  const st = (await s.storage.get("run")) as any;
+  assert.equal(st.finished, false);
+  assert.equal(st.exited, undefined, "run 1's exit did not start run 2's grace");
 });
 
-test("runner: a new run first retries the previous run's unpublished result", async () => {
+test("runner: a new run never drops the previous run's unpublished result", async () => {
   const s = setup();
-  const calls = githubMock(1);
+  const calls = githubMock(2); // run 1's completion fails twice
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  const nonce1 = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
+  await s.runner.report(nonce1, "done", "::gate:: cargo fail 1s", 1); // PATCH 42 fails, pending kept
+  advance(1);
+  await worker.fetch(hook(prBody.replace("synchronize", "reopened"), "pull_request"), s.env); // run 2, check 43
+  const run2 = (await s.storage.get("run")) as any;
+  assert.equal(run2.checkRunId, 43);
+  assert.equal(s.storage.alarm, Date.now() - 1 + 60_000, "the alarm still serves run 1's retry, the earlier of the two");
+
+  advance(60_000);
+  await s.runner.alarm(); // fails again
+  advance(120_000);
+  await s.runner.alarm(); // lands
+  const patches = calls.filter((c) => c.method === "PATCH");
+  assert.deepEqual(patches.map((p) => p.url.split("/").at(-1)), ["42", "42", "42"]);
+  assert.equal(patches[2].body.conclusion, "failure");
+  assert.equal((await s.storage.list({ prefix: "pending/" })).size, 0);
+  const st = (await s.storage.get("run")) as any;
+  assert.equal(st.finished, false, "the retries did not time out run 2");
+  assert.equal(s.storage.alarm, st.deadline, "back to run 2's timeout");
+
+  const nonce2 = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
+  const log = ["cargo", "harness-barrier-0", "harness-barrier-1", "tla"].map((g) => `::gate:: ${g} pass 1s`).join("\n");
+  assert.equal(await s.runner.report(nonce2, "done", log, 0), 204);
+  const last = calls.filter((c) => c.method === "PATCH").at(-1)!;
+  assert.equal(last.url.split("/").at(-1), "43");
+  assert.equal(last.body.conclusion, "success");
+});
+
+test("runner: a slow /done after a fast container exit still completes the run", async () => {
+  const s = setup();
+  const calls = githubMock();
   await worker.fetch(hook(prBody, "pull_request"), s.env);
   const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
-  await s.runner.report(nonce, "done", "::gate:: cargo fail 1s", 1); // PATCH fails, pending kept
-  await worker.fetch(hook(prBody.replace("synchronize", "reopened"), "pull_request"), s.env);
+  s.container.exit!.resolve(); // exit reaches the object first
+  await Promise.all(s.waits);
+  assert.equal(calls.filter((c) => c.method === "PATCH").length, 0, "an exit alone does not fail the run");
+  assert.equal(s.storage.alarm, Date.now() + EXIT_GRACE_MS);
+  advance(EXIT_GRACE_MS - 1);
+  await s.runner.alarm(); // an early wake-up inside the grace changes nothing
+  assert.equal(calls.filter((c) => c.method === "PATCH").length, 0);
+  const log = ["cargo", "harness-barrier-0", "harness-barrier-1", "tla"].map((g) => `::gate:: ${g} pass 1s`).join("\n");
+  assert.equal(await s.runner.report(nonce, "done", log, 0), 204);
+  advance(EXIT_GRACE_MS);
+  await s.runner.alarm();
   const patches = calls.filter((c) => c.method === "PATCH");
-  assert.equal(patches.length, 2, "the old completion was retried before the new run");
-  assert.equal(patches[1].body.conclusion, "failure");
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].body.conclusion, "success");
+  assert.equal(s.storage.alarm, null);
+});
+
+test("runner: an exit with no /done fails once the grace ends", async () => {
+  const s = setup();
+  const calls = githubMock();
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
+  s.container.exit!.resolve();
+  await Promise.all(s.waits);
+  advance(EXIT_GRACE_MS);
+  await s.runner.alarm();
+  const patches = calls.filter((c) => c.method === "PATCH");
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].body.conclusion, "failure");
+  assert.match(patches[0].body.output.summary, /without a result \(exit code 0\)/);
+  assert.equal(await s.runner.report(nonce, "done", "::gates:: pass", 0), 403, "too late");
+});
+
+test("runner: a nonce that differs only in its last character is refused", async () => {
+  const s = setup();
+  githubMock();
+  await worker.fetch(hook(prBody, "pull_request"), s.env);
+  const nonce = (s.container.startOpts!.env as Record<string, string>).CI_NONCE;
+  const near = nonce.slice(0, -1) + (nonce.endsWith("0") ? "1" : "0");
+  assert.equal(await s.runner.report(near, "log", "x", 0), 403);
+  assert.equal(await s.runner.report("", "log", "x", 0), 403);
+  assert.equal(await s.runner.report(nonce, "log", "x", 0), 204);
 });
 
 test("webhook: a fork pull request gets a completed failure check and no run", async () => {
@@ -295,10 +402,23 @@ test("CiReport: forwards nonce, kind and exit code to the run's Durable Object",
   assert.equal(res.status, 204);
   assert.deepEqual(got[0], [SHA, "n", "done", "LOG", 3]);
   assert.equal((await r.fetch(post("/other", ""))).status, 404);
-  // a body over the cap is refused while streaming, with no Content-Length
-  const big = new ReadableStream({ start(c) { for (let i = 0; i < 41; i++) c.enqueue(new Uint8Array(1024 * 1024)); c.close(); } });
-  const streamed = new Request("http://ci.internal/log", { method: "POST", body: big, duplex: "half" } as RequestInit);
+  // a body larger than the kept log streams through, and only its tail is forwarded
+  let sent = 0;
+  const big = new ReadableStream({
+    pull(c) {
+      if (sent++ === 41) { c.enqueue(new TextEncoder().encode("\n::gates:: pass\n")); c.close(); return; }
+      c.enqueue(new Uint8Array(1024 * 1024).fill(0x61));
+    },
+  });
+  const streamed = new Request("http://ci.internal/done", { method: "POST", body: big, duplex: "half", headers: { "x-ci-nonce": "n" } } as RequestInit);
   assert.equal(streamed.headers.get("content-length"), null);
-  assert.equal((await r.fetch(streamed)).status, 413);
-  assert.equal(got.length, 1);
+  assert.equal((await r.fetch(streamed)).status, 204);
+  const fwd = (got[1] as unknown[])[3] as string;
+  assert.equal(fwd.length, MAX_LOG_CHARS);
+  assert.match(fwd, /^\[log truncated to its last \d+ characters\]\n/);
+  assert.ok(fwd.endsWith("\n::gates:: pass\n"));
+  // a declared length over the hard cap is refused before reading
+  const huge = post("/log", "x", { "content-length": String(512 * 1024 * 1024) });
+  assert.equal((await r.fetch(huge)).status, 413);
+  assert.equal(got.length, 2);
 });
